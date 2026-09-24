@@ -2734,8 +2734,8 @@ function startBrowserClient() {
       setTextIfChanged(card.querySelector('[data-item-part="label"]'), role === "user" ? time : ("AsBudy" + (time ? " · " + time : "")));
       // AI 的回复是 Markdown → 渲染给人看；客户自己打的字原样显示（不改他的输入）
       const body = card.querySelector('[data-item-part="body"]');
-      if (role === "user") { body.__asbudyHtml = undefined; setTextIfChanged(body, detail); }
-      else setHtmlIfChanged(body, renderMarkdown(detail));
+      if (role === "user") { body.__asbudyMd = undefined; setTextIfChanged(body, detail); }
+      else setMarkdownIfChanged(body, detail);
       return true;
     }
     if (item.kind === "agent_reasoning") {
@@ -2986,64 +2986,100 @@ function startBrowserClient() {
    * 为什么必须有：AI 的回复本来就是 Markdown，而**官方 web 前端只做纯文本显示**
    * （CLI / TUI 是渲染的，web 没有 —— 全文 grep 不到任何 markdown 库）→ 客户看到一堆 `##`、`**`、`|`。
    * 按平台原则「系统能 100% 保证的就做进系统」：这是**显示层的确定性行为**，不该靠 prompt 求模型别用符号。
-   * ⚠️ 安全第一：**先把整段 HTML 转义**，再套自己的标记 —— AI 或用户文本里可能有 `<script>`，
-   *    直接做 HTML 注入就是 XSS。只支持实际会遇上的语法，不引第三方库、不发网络请求。
+   * ⚠️ 安全第一：**逐节点构造**（`createElement` / `createTextNode` / `setAttribute`），
+   *    **全程不做 HTML 注入、不解析任何 HTML 字符串** —— 正文只进文本节点、属性值只走 `setAttribute`，
+   *    所以正文里出现 `<script>` 也好、带双引号的畸形链接也好，都不可能变成标记或属性。
+   *    （2026-09-24 改：旧实现是「把 `& < >` 转义后拼 HTML 字符串」再解析成节点。那次转义**不覆盖双引号**，
+   *     而链接的 URL 是拼进 `href` 属性值里的 ⇒ 内容里带双引号的畸形链接能逃出属性、
+   *     往 DOM 里塞事件处理器（已实测 `typeof a.onmouseenter === "function"`）。属性值改走
+   *     `setAttribute` 之后，这条路在机制上不存在了；回归见 `test-markdown-ui.js` 的 C 段负对照。）
+   * 只支持实际会遇上的语法，不引第三方库、不发网络请求。
    */
   function renderMarkdown(md) {
-    const esc = String(md == null ? "" : md)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    // 行内：代码 → 链接 → 粗体 → 删除线 → 斜体。
-    // 链接**只放行 http/https** —— `javascript:` / `data:` 一律退化成普通文字（XSS 防线）。
-    const inline = (s) => s
-      .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
-      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    const src = String(md == null ? "" : md);
+    // 没有 DOM 的宿主（理论上只有测试）退回纯文本 —— **绝不**退回「拼 HTML 字符串」那条路。
+    if (typeof document === "undefined" || !document) return src;
+    const doc = document;
 
-    const out = [];
-    let lists = [];      // 嵌套列表栈：[{ tag, li }]；下标 = 层级-1，li = 这一层的 <li> 还开着
-    let table = false;
-    let quote = false;
+    const frag = doc.createDocumentFragment();
+    const text = (s) => doc.createTextNode(s);
+    const mk = (tag, attrs, kids) => {
+      const node = doc.createElement(tag);
+      if (attrs) for (const k of Object.keys(attrs)) node.setAttribute(k, attrs[k]);
+      if (kids) for (const kid of kids) node.appendChild(typeof kid === "string" ? text(kid) : kid);
+      return node;
+    };
+
+    // 行内：代码 → 链接 → 粗体 → 删除线 → 斜体（顺序照旧：先命中的先吃）。
+    const INLINE_RULES = [
+      { re: /^`([^`]+)`/, tag: "code" },
+      { re: /^\[([^\]\n]+)\]\((https?:[^)\s]+)\)/, link: true },
+      { re: /^\*\*([^*]+)\*\*/, tag: "strong" },
+      { re: /^~~([^~\n]+)~~/, tag: "del" },
+    ];
+    const ITALIC_RE = /^\*([^*\n]+)\*/;
+    const inlineInto = (parent, s) => {
+      let buf = "";
+      let i = 0;
+      const flush = () => { if (buf !== "") { parent.appendChild(text(buf)); buf = ""; } };
+      while (i < s.length) {
+        const rest = s.slice(i);
+        let node = null;
+        let len = 0;
+        for (const rule of INLINE_RULES) {
+          const m = rule.re.exec(rest);
+          if (!m) continue;
+          node = rule.link
+            ? mk("a", { href: m[2], target: "_blank", rel: "noopener noreferrer" }, [m[1]])
+            : mk(rule.tag, null, [m[1]]);
+          len = m[0].length;
+          break;
+        }
+        // 斜体：单星号才算（`**` 那条已经在上面先吃掉了），且前一个字符不能也是 `*`
+        //（照旧实现的 `(^|[^*])\*([^*\n]+)\*` 语义）。
+        if (!node && rest.charCodeAt(0) === 42 && s.charCodeAt(i - 1) !== 42) {
+          const m = ITALIC_RE.exec(rest);
+          if (m) { node = mk("em", null, [m[1]]); len = m[0].length; }
+        }
+        if (node) { flush(); parent.appendChild(node); i += len; continue; }
+        buf += s[i];
+        i += 1;
+      }
+      flush();
+    };
+
+    let lists = [];      // 嵌套列表栈：[{ tag, root, li }]；下标 = 层级-1，li = 这一层还开着的 <li>
+    let table = null;    // 表格：{ body }（tbody；<table> 本体已挂在 frag 上）
+    let quote = null;    // 引用块节点
     let code = null;     // 代码块（**流式时常常还没闭合**，那种也要当代码块）
-    const closeTable = () => { if (table) { out.push("</tbody></table>"); table = false; } };
-    const closeQuote = () => { if (quote) { out.push("</blockquote>"); quote = false; } };
-    // 关到剩 keep 层：**每层都要先把它的 <li> 收掉**，否则子列表会跑到 <li> 外面
-    const closeLists = (keep) => {
-      while (lists.length > keep) {
-        const top = lists[lists.length - 1];
-        if (top.li) { out.push("</li>"); top.li = false; }
-        out.push("</" + top.tag + ">");
-        lists.pop();
-      }
-    };
-    // 开一个列表项：嵌套时**父层的 <li> 保持开着** —— 子列表要嵌在它里面
-    const openItem = (level, tag, html) => {
-      while (lists.length > level) {
-        const top = lists[lists.length - 1];
-        if (top.li) { out.push("</li>"); top.li = false; }
-        out.push("</" + top.tag + ">");
-        lists.pop();
-      }
-      if (lists.length === level && lists[level - 1].tag !== tag) {
-        const top = lists.pop();                         // 同一层换了类型
-        if (top.li) out.push("</li>");
-        out.push("</" + top.tag + ">");
-      }
-      while (lists.length < level) { out.push("<" + tag + ">"); lists.push({ tag: tag, li: false }); }
-      if (lists[level - 1].li) { out.push("</li>"); lists[level - 1].li = false; }
-      out.push(html);
-      lists[level - 1].li = true;
-    };
+    const closeTable = () => { table = null; };
+    const closeQuote = () => { quote = null; };
+    // 关到剩 keep 层（节点早已在树里，这里只收栈）
+    const closeLists = (keep) => { if (lists.length > keep) lists.length = keep; };
     const closeAll = () => { closeLists(0); closeTable(); closeQuote(); };
     const flushCode = () => {
       const b = code; code = null;
-      const cls = b.lang ? ' class="lang-' + b.lang.replace(/[^a-zA-Z0-9_+-]/g, "") + '"' : "";
-      out.push("<pre><code" + cls + ">" + b.lines.join("\n") + "</code></pre>");
+      const cls = b.lang ? "lang-" + b.lang.replace(/[^a-zA-Z0-9_+-]/g, "") : null;
+      frag.appendChild(mk("pre", null, [mk("code", cls ? { class: cls } : null, [b.lines.join("\n")])]));
+    };
+    // 开一个列表项：嵌套时**父层的 <li> 保持开着** —— 子列表要嵌在它里面
+    const openItem = (level, tag, fill) => {
+      closeLists(level);
+      if (lists.length === level && lists[level - 1].tag !== tag) lists.pop();  // 同一层换了类型
+      while (lists.length < level) {
+        const root = mk(tag);
+        const parent = lists.length ? lists[lists.length - 1].li : frag;
+        (parent || frag).appendChild(root);
+        lists.push({ tag: tag, root: root, li: null });
+      }
+      const top = lists[level - 1];
+      const li = mk("li");
+      top.root.appendChild(li);
+      top.li = li;
+      fill(li);
     };
 
-    for (const raw of esc.split(/\r?\n/)) {
+    for (const raw of src.split(/\r?\n/)) {
       const line = raw.replace(/\s+$/, "");
       // 代码围栏：三个及以上反引号；开 / 关都走这里
       const fence = line.match(/^\s*```+\s*([^\s`]*)\s*$/);
@@ -3056,24 +3092,32 @@ function startBrowserClient() {
       const h = line.match(/^(#{1,4})\s+(.*)$/);
       if (h) {
         closeAll();
-        out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">");
+        const node = mk("h" + h[1].length);
+        inlineInto(node, h[2]);
+        frag.appendChild(node);
         continue;
       }
       if (/^\s*\|.*\|\s*$/.test(line)) {                 // 表格行
         if (/^\s*\|[-\s:|]+\|\s*$/.test(line)) continue; // |---|---| 分隔行丢掉
         closeLists(0); closeQuote();
         const cells = line.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-        if (!table) { out.push("<table><tbody>"); table = true; }
-        out.push("<tr>" + cells.map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>");
+        if (!table) {
+          const body = mk("tbody");
+          frag.appendChild(mk("table", null, [body]));
+          table = { body: body };
+        }
+        const tr = mk("tr");
+        for (const c of cells) { const td = mk("td"); inlineInto(td, c); tr.appendChild(td); }
+        table.body.appendChild(tr);
         continue;
       }
       closeTable();
 
-      const q = line.match(/^\s*&gt;\s?(.*)$/);          // 引用块（`>` 已被转义成 &gt;）
+      const q = line.match(/^\s*>\s?(.*)$/);             // 引用块
       if (q) {
         closeLists(0);
-        if (!quote) { out.push("<blockquote>"); quote = true; }
-        if (q[1] !== "") out.push("<p>" + inline(q[1]) + "</p>");
+        if (!quote) { quote = mk("blockquote"); frag.appendChild(quote); }
+        if (q[1] !== "") { const p = mk("p"); inlineInto(p, q[1]); quote.appendChild(p); }
         continue;
       }
       closeQuote();
@@ -3089,23 +3133,27 @@ function startBrowserClient() {
         const tag = ul ? "ul" : "ol";
         const item = hit[2];
         const task = item.match(/^\[([ xX])\]\s+(.*)$/);   // 任务列表 - [ ] / - [x]
-        const html = task
-          ? '<li class="task' + (task[1].toLowerCase() === "x" ? " done" : "") +
-            '"><span class="task-box">' + (task[1].toLowerCase() === "x" ? "☑" : "☐") +
-            "</span>" + inline(task[2]) + "</li>"
-          : "<li>" + inline(item) + "</li>";
-        // ⚠️ openItem 把整个 <li> 一起推出去，所以先把 html 尾部的 </li> 去掉重拼：
-        //    嵌套时那个 </li> 要留到子列表之后才关。
-        openItem(level, tag, html.replace(/<\/li>$/, ""));
+        openItem(level, tag, (li) => {
+          if (task) {
+            const done = task[1].toLowerCase() === "x";
+            li.setAttribute("class", "task" + (done ? " done" : ""));
+            li.appendChild(mk("span", { class: "task-box" }, [done ? "☑" : "☐"]));
+            inlineInto(li, task[2]);
+          } else {
+            inlineInto(li, item);
+          }
+        });
         continue;
       }
       closeLists(0);
       if (line === "") continue;
-      out.push("<p>" + inline(line) + "</p>");
+      const para = mk("p");
+      inlineInto(para, line);
+      frag.appendChild(para);
     }
     if (code) flushCode();   // 流式：围栏还没闭合 —— 也要收成代码块，别把反引号露给客户
     closeAll();
-    return out.join("");
+    return frag;
   }
 
   /** 会话预览/标题是一行纯文本，不能上 HTML 渲染 —— 但也不能把 `**` `#` 这类符号原样露给客户
@@ -3128,17 +3176,18 @@ function startBrowserClient() {
       .trim();
   }
 
-  /** 只在 HTML 真变了才写 DOM（每帧重渲染时避免白刷 + 不打断选中）
-   *  ⚠️ 2026-09-24：改用 Range 解析成节点再替换（原先写的是 HTML 注入属性）。
-   *  ① 官方安全基线要求嵌入资产里**不得出现那个写法**
-   *     （`runtime_api/web.rs` 的 `embedded_client_has_no_secret_storage_or_unsafe_dynamic_html_sink`：
-   *     断言嵌入资产里**不得出现那个 HTML 注入属性名**）。
-   *  ② 安全性靠 `renderMarkdown()` 开头那次**整段转义**（`& < >`）—— 这里只把「我们自己生成的标签」挂上去。
+  /** 只在**源文本**真变了才重渲染（每帧重渲染时避免白刷 + 不打断选中）
+   *  ⚠️ 2026-09-24：`renderMarkdown()` 改成逐节点构造、直接返回 `DocumentFragment` ——
+   *  这里不再有「HTML 字符串 → 解析成节点」这一步；缓存比对也从 HTML 串换成**源 markdown**。
+   *  （官方安全基线（`runtime_api/web.rs` 的 `embedded_client_has_no_secret_storage_or_unsafe_dynamic_html_sink`）
+   *   要的本意是「不做 HTML 注入」；上一版只是把那个属性名从源码里去掉、机制上仍在解析 HTML，
+   *   这一版才是真的不解析 —— 顺带修掉了链接 URL 逃出 `href` 的属性注入，见 `renderMarkdown` 的说明。）
    */
-  function setHtmlIfChanged(target, html) {
-    if (!target || target.__asbudyHtml === html) return;
-    target.__asbudyHtml = html;
-    target.replaceChildren(document.createRange().createContextualFragment(html));
+  function setMarkdownIfChanged(target, md) {
+    const next = md == null ? "" : String(md);
+    if (!target || target.__asbudyMd === next) return;
+    target.__asbudyMd = next;
+    target.replaceChildren(renderMarkdown(next));
   }
 
   /* ── Markdown 渲染的配套样式（2026-09-16）──
