@@ -267,7 +267,24 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
             endpoint_key: "responses".to_string(),
             default_for_provider: true,
             limits: documented_limits,
-            capabilities: documented_capabilities,
+            // AsBudy 定制（2026-09-24）：现名 `deepseek-flash` 收图片。
+            //
+            // 为什么必须在这里改，而不是改 `models_dev.bundled.json`：
+            // 本文件这张 curated 表在 `provider_lake.rs` 里是「覆盖」语义
+            // （原话 "Curated transport facts win ordinary Models.dev
+            // collisions"），Models.dev 资产里写的 image 事实会被这里压掉。
+            // 2026-09-22 第 44 轮只改了资产 ⇒ 2026-09-23 升到 0.10.0 后
+            // 图片输入被拒（真发图 HTTP 400："image inputs require a model
+            // with explicitly supported image input"）。
+            //
+            // 依据：① 同底座模型在 v0.9.13 下实测可收图（真发图 201，模型
+            // 准确描述图像）② 官方为旧名 `deepseek-v4-flash-vision-exp`
+            // 在下方就标了 Supported（"Image input is the one documented
+            // difference"），同一个模型的现名不该反而标成不支持。
+            capabilities: RouteCapabilities {
+                image_input: CapabilityState::Supported,
+                ..documented_capabilities
+            },
             pricing: PricingSku::UnknownOrStale,
         },
         ProviderModelOffering {
