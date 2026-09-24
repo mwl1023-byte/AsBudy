@@ -3192,7 +3192,9 @@
      *   · session 读数 = `App::cumulative_turn_duration`（**已完成轮次时长之和**）＋当前这一轮；
      *     注释原文 *"It is model work, not wall clock since launch — an idle TUI does not
      *     claim to have been working"* ⇒ **不是「挂着多久」，是这个对话真干了多久**；
-     *   · 门槛 `CLOCK_SESSION_FLOOR_SECS = 60`（不足 1 分钟不显示）· 空闲时用暗色（钟停了）。
+     *   · 门槛 `CLOCK_SESSION_FLOOR_SECS = 60`（不足 1 分钟不显示）。
+     *   · ⚠️ **2026-09-24 老板拍：只在干活时显示** —— 没干活的整段隐藏（官方 CLI 那边是暗色常驻，
+     *     老板嫌闲着一行读数挂着碍眼）。判据就是 `startedAt`（= `#interrupt-turn` 可见，这一轮在跑）。
      *   · 文案照官方语言包 `locales/zh-Hans.json:1229` —— 「已运行{duration}」。
      * 【数据从哪来】`GET /v1/threads/{id}` 的 turns（每轮 `duration_ms`）＝已完成轮次之和；
      *   正在跑的那一轮用本地秒表补（`startedAt`，由 `#interrupt-turn` 的显隐驱动）。
@@ -3239,16 +3241,15 @@
       var w = workedSec();
       // 只留累计这一个读数（本轮的「处理中 · 已用 N 秒」2026-09-24 老板拍去掉 —— 见上面那段注释）
       el.textContent = w >= 60 ? ('已运行 ' + fmt(w)) : '';
-      el.hidden = w < 60;                       // 官方门槛：不足 1 分钟不显示
-      // 空闲时暗一点（官方：钟停了；颜色降一档，但不隐藏）
-      el.style.opacity = startedAt ? '' : '.7';
+      // 两道门一起管显隐：官方门槛（不足 1 分钟不显示）＋ 2026-09-24 老板拍「只在干活时显示」。
+      // 空闲时整块隐藏 ⇒ 不占格，msgbar 那一行也不会因为多一个块而抖。
+      el.hidden = w < 60 || !startedAt;
     }
     function start() {
       startedAt = Date.now();
-      var el = ensureEl();
-      if (el) el.hidden = false;
+      ensureEl();
       loadDone();
-      paint();
+      paint();   // 显隐由 paint() 一处决定（门槛 ＋ 这一轮在跑），这里不直接对外观下判断
       if (tick) clearInterval(tick);
       tick = setInterval(paint, 500);
     }
