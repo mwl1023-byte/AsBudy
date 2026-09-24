@@ -577,15 +577,15 @@ jobs:
       # other one. We need both conclusions to diagnose and release safely.
       fail-fast: false
       matrix:
-        # Linux workspace tests run directly for pull requests. CNB remains
-        # the Linux lane for non-PR release/main pushes.
+        # AsBudy 改动（2026-09-24）：官方原本只在 PR 上跑 Linux，非 PR 的主干推送交给 CNB；
+        # 本 fork 没有 CNB 车道（见下方 "Linux test location" 那段说明）⇒ 改成**每个事件都跑**。
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Skip tests for light change
         if: needs.changes.outputs.heavy != 'true'
         run: echo "No executable Rust changes detected; preserving required Test context."
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - name: Test Windows installer PATH helper
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
         shell: pwsh
@@ -622,20 +622,20 @@ jobs:
         shell: pwsh
         run: ./scripts/installer/installer-path-regression.tests.ps1 -AllowUserPathMutation
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - uses: mozilla-actions/sccache-action@v0.0.11
         id: sccache
         continue-on-error: true
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - name: Enable sccache
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache.outcome == 'success'
         shell: bash
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
-        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest'
         run: |
           for i in 1 2 3 4 5; do
             sudo apt-get update && break
@@ -644,12 +644,12 @@ jobs:
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - name: Run tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one
         # process per test, all runner cores busy, slow tests named instead
@@ -657,7 +657,7 @@ jobs:
         # binary and bounds the integration binary that spawns the real
         # executable; retries are off, so a flake is a red run, not a hidden
         # one. nextest does not run doctests — the next step keeps them.
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         shell: bash
         run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
         env:
@@ -683,7 +683,7 @@ jobs:
           # stacks explicitly and never read this variable.
           RUST_MIN_STACK: '16777216'
       - name: Run doctests
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         shell: bash
         run: sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked --doc
         env:
@@ -696,7 +696,7 @@ jobs:
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
         run: python3 scripts/check-persistence-backlog-budget.py
       - name: Lockfile drift guard
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         run: git diff --exit-code -- Cargo.lock
       - name: Run Offline Eval Harness
         # The eval harness is OS-independent prompt/composition checking;
@@ -706,13 +706,17 @@ jobs:
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
         run: cargo run -p codewhale-tui --all-features -- eval
       - name: sccache stats
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: sccache --show-stats
-      - name: Linux test location (CNB)
-        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && github.event_name != 'workflow_dispatch' && github.event_name != 'pull_request'
-        run: echo "Linux workspace tests run on CNB for non-PR release/main pushes; pull requests run directly on Ubuntu."
+      - name: Linux test location
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest'
+        # AsBudy 改动（2026-09-24）：官方把非 PR 主干推送的 Linux 车道放在 CNB（国内镜像），
+        # 而本 fork 没有 CNB_GIT_TOKEN（`Sync to CNB` 一支持续失败）⇒ 那条车道是空的，
+        # Linux 全量测试在 push 路径上从来没人跑（而我们的生产就是 Linux）。
+        # 现在改成「Linux 也在 GitHub 上跑」：这一步只是把事实打出来，测试本身就在本 job 里跑。
+        run: echo "Linux workspace tests run on GitHub for every event in this fork (no CNB lane configured)."
 
   npm-wrapper-smoke:
     name: npm wrapper smoke
@@ -735,26 +739,26 @@ jobs:
         if: needs.changes.outputs.heavy != 'true'
         run: echo "No executable Rust changes detected; preserving required npm wrapper smoke context."
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - uses: mozilla-actions/sccache-action@v0.0.11
         id: sccache
         continue-on-error: true
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
       - name: Enable sccache
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache.outcome == 'success'
         shell: bash
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - uses: actions/setup-node@v7
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         with:
           node-version: 20
       - name: Install Linux system dependencies
-        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest'
         run: |
           for i in 1 2 3 4 5; do
             sudo apt-get update && break
@@ -763,12 +767,12 @@ jobs:
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build wrapper binaries
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         # The smoke validates wrapper install/delegation plumbing, not
         # codegen quality, so skip fat LTO + codegen-units=1 for a much
         # cheaper release build. Shipped binaries keep the real profile via
@@ -778,11 +782,11 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
         run: cargo build --release --locked -p codewhale-cli -p codewhale-tui
       - name: Smoke wrapper install and delegated entrypoints
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true'
         timeout-minutes: 5
         run: node scripts/release/npm-wrapper-smoke.js
       - name: sccache stats
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: sccache --show-stats
