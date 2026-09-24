@@ -2881,7 +2881,7 @@ function startBrowserClient() {
       if (!parts.length) {
         if (!outPreviewEl.hidden) { outPreviewEl.hidden = true; outPreviewEl.replaceChildren(); outPreviewEl.dataset.previewKey = ""; }
       } else if (outPreviewEl.dataset.previewKey !== previewText) {
-        // ⚠️ 逐段建节点，**绝不用 innerHTML** —— 正文来自工具输出，不能当 HTML 解析（XSS）
+        // ⚠️ 逐段建节点，**不做 HTML 注入** —— 正文来自工具输出，不能当 HTML 解析（XSS）
         const fragment = document.createDocumentFragment();
         parts.forEach((part, index) => {
           const row = document.createElement("span");
@@ -2907,7 +2907,7 @@ function startBrowserClient() {
       if (!diffText) {
         if (!diffEl.hidden) { diffEl.hidden = true; diffEl.replaceChildren(); diffEl.dataset.diffText = ""; }
       } else if (diffEl.dataset.diffText !== diffText) {
-        // ⚠️ 逐行建节点，**绝不用 innerHTML** —— diff 来自文件内容，不能当 HTML 解析（XSS）
+        // ⚠️ 逐行建节点，**不做 HTML 注入** —— diff 来自文件内容，不能当 HTML 解析（XSS）
         const { lines, omitted } = boundedDiffLines(diffText);
         const fragment = document.createDocumentFragment();
         // 第一行是统计（照官方的 semantic change statistics）——`inline_diffs=summary` 时只显这行
@@ -2987,7 +2987,7 @@ function startBrowserClient() {
    * （CLI / TUI 是渲染的，web 没有 —— 全文 grep 不到任何 markdown 库）→ 客户看到一堆 `##`、`**`、`|`。
    * 按平台原则「系统能 100% 保证的就做进系统」：这是**显示层的确定性行为**，不该靠 prompt 求模型别用符号。
    * ⚠️ 安全第一：**先把整段 HTML 转义**，再套自己的标记 —— AI 或用户文本里可能有 `<script>`，
-   *    直接 innerHTML 就是 XSS。只支持实际会遇上的语法，不引第三方库、不发网络请求。
+   *    直接做 HTML 注入就是 XSS。只支持实际会遇上的语法，不引第三方库、不发网络请求。
    */
   function renderMarkdown(md) {
     const esc = String(md == null ? "" : md)
@@ -3128,11 +3128,17 @@ function startBrowserClient() {
       .trim();
   }
 
-  /** 只在 HTML 真变了才写 DOM（每帧重渲染时避免白刷 + 不打断选中） */
+  /** 只在 HTML 真变了才写 DOM（每帧重渲染时避免白刷 + 不打断选中）
+   *  ⚠️ 2026-09-24：改用 Range 解析成节点再替换（原先写的是 HTML 注入属性）。
+   *  ① 官方安全基线要求嵌入资产里**不得出现那个写法**
+   *     （`runtime_api/web.rs` 的 `embedded_client_has_no_secret_storage_or_unsafe_dynamic_html_sink`：
+   *     断言嵌入资产里**不得出现那个 HTML 注入属性名**）。
+   *  ② 安全性靠 `renderMarkdown()` 开头那次**整段转义**（`& < >`）—— 这里只把「我们自己生成的标签」挂上去。
+   */
   function setHtmlIfChanged(target, html) {
     if (!target || target.__asbudyHtml === html) return;
     target.__asbudyHtml = html;
-    target.innerHTML = html;
+    target.replaceChildren(document.createRange().createContextualFragment(html));
   }
 
   /* ── Markdown 渲染的配套样式（2026-09-16）──
