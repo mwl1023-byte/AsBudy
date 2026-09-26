@@ -13,6 +13,20 @@ export const STREAM_EVENT_NAMES = [
   "turn.started",
   "turn.lifecycle",
   "turn.usage",
+  // ★ AsBudy（2026-09-26）：引擎每次「准备工具」都会推 `model.tools.snapshot`
+  //   （`runtime_threads.rs` 的 `EngineEvent::ToolRequestSnapshot` 分支，`emit_event(..., "model.tools.snapshot", json!({...}))`），
+  //   而官方这张表直到 0.10.0 都没列它 —— 于是：
+  //     前端根本没注册这个监听 ⇒ 收不到 ⇒ `state.latestSeq` **在它那一格断掉**
+  //     ⇒ 紧随其后的 `turn.completed` 的 `previous_seq` 对不上 ⇒ `runtimeEventContinuity` 判 **gap**
+  //     ⇒ 走 `recoverProjection()`；而它会 `await subscribe(新流)`，新流 `since_seq` 已是最新
+  //     ⇒ **引擎不 flush 响应头，实测要 15 秒才 open** ⇒ 界面要等这 15 秒才重画。
+  //   老板 2026-09-26 报的「AI 回复完了仍显示一段时间的『工作中 x 秒』」就是这个：
+  //   实测那一轮 **1.48 秒**就 `turn.completed` 了，而 `#interrupt-turn` **16.80 秒**才收起
+  //   （连官方自己的按钮都跟着晚 15 秒），我们注入的状态行又只能跟在按钮后面收。
+  //   加它之后：seq 不再断 → 事件正常进 `applyRuntimeEvent` → `renderAll` 当场重画。
+  //   ⚠️ 以后升级官方版本时，这张表要与引擎 `emit_event()` 的清单对齐 ——
+  //   `m0/scripts/tests/test-stream-events-parity.js` 就是钉这条的回归。
+  "model.tools.snapshot",
   "turn.steered",
   "turn.steer_dropped",
   "turn.interrupt_requested",
