@@ -341,14 +341,14 @@
     '.receipt{flex-wrap:wrap}',
     '.receipt-copy{flex:1 1 auto}',
     '.receipt .ab-out-preview,.receipt .ab-diff{flex:1 0 100%;min-width:0}',
-    '.ab-out-preview{margin:8px 0 0;padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--well-deep);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:13em;overflow-y:auto}',
+    '.ab-out-preview{margin:8px 0 0;padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-control);background:rgba(110,118,129,.15);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:13em;overflow-y:auto}',
     '.ab-out-preview[hidden]{display:none!important}',
     '.ab-out-line{white-space:pre-wrap}',
     '.ab-out-more{color:var(--text-faint);font-style:italic}',
     '.receipt:has(details[open]) .ab-out-preview{display:none!important}',
     // ── 文件改动的内联 diff（照官方 inline_diffs，默认 full，2026-09-19）──
     //   官方 Full = *"a bounded red/green unified diff"*，最多 14 行（app.mjs 的 MAX_INLINE_DIFF_LINES）
-    '.ab-diff{margin:8px 0 0;padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--well-deep);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto}',
+    '.ab-diff{margin:8px 0 0;padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-control);background:rgba(110,118,129,.15);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto}',
     '.ab-diff-line{white-space:pre-wrap}',
     '.ab-diff-add{color:var(--status-live)}',
     '.ab-diff-del{color:var(--status-danger)}',
@@ -356,6 +356,16 @@
     '.ab-diff-meta{color:var(--text-faint)}',
     '.ab-diff-more{color:var(--text-faint);font-style:italic}',
     '.ab-diff-stat{color:var(--text-muted)}',
+    // ── 工具卡的输出块**不再用官方那个纯黑井底**（2026-09-26 老板：「AI 回复里的纯黑色背景包裹的代码
+    //    到底怎么能关掉」）────────────────────────────────────────────────────────────
+    //   `.ab-out-preview`（工具输出预览）与 `.ab-diff`（文件改动红绿对照）都直接坐在 `.session` 的
+    //   #142747 上，而官方 `.receipt pre{background:var(--well-deep)}` = **#020711 纯黑** ⇒
+    //   整块死黑坐在偏亮的蓝底上，非常扎眼。
+    //   ⚠️ 为什么改的是**这一条**、而不是上面 `.ab-out-preview` 自己那条：官方 `.receipt pre` 权重
+    //     (0,1,1) ＞ 单类选择器 (0,1,0)，实测生效的 background / padding / font-size 全来自官方那条
+    //     （我们自己那条实际只剩 margin / max-height 在起作用 —— 改它不会有任何视觉变化）。
+    //   改成与正文代码块 `.message-body pre` 同一档 ⇒ 输出块 / diff / 正文代码块三处观感统一。
+    '.receipt pre{background:rgba(110,118,129,.15)}',
     // 文件改动显示的三个档（官方 inline_diffs: full / summary / off，默认 full）
     'html[data-ab-diffs="off"] .receipt .ab-diff{display:none!important}',
     'html[data-ab-diffs="summary"] .receipt .ab-diff-line:not(.ab-diff-stat){display:none!important}',
