@@ -4569,7 +4569,10 @@ impl SubAgentWorkflowDriver {
         self.ensure_admission_open()?;
         let workflow_child_index = self
             .child_counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            // 2026-10-04（AsBudy 补）：新 rustc 把 `fetch_update` 标成 deprecated
+            //（`renamed to try_update for consistency`），而 CI 带着 `-D warnings`
+            //⇒ 官方这两个调用点让**整个 codewhale-tui 编译不过**（与我们的改动无关）。
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 (count < self.max_children).then_some(count + 1)
             })
             .map_err(|_| DriverError::Rejected(format!(

@@ -1868,11 +1868,14 @@ impl SubAgentInput {
     /// Mark this input as consumed by the child loop.
     fn mark_taken(&self) {
         if let Some(pending) = self.pending.as_ref() {
-            let _ = pending.fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |value| Some(value.saturating_sub(1)),
-            );
+            let _ = pending
+                // 2026-10-04（AsBudy 补）：同 workflow/mod.rs —— 新 rustc 下 `fetch_update`
+                // 是 deprecated，`-D warnings` 会把它当错误。
+                .try_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |value| Some(value.saturating_sub(1)),
+                );
         }
     }
 }
