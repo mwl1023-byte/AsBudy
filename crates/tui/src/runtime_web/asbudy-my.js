@@ -3752,9 +3752,14 @@
       }
       return String(n);
     }
+    // ★ 2026-10-03（老板报「记性 —」）：记住「上一次是不是真显示出数了」——
+    //   没有它的话，引擎重启/忙碌的那几秒接口一失败，好好的「记性 N%」就被「—」顶掉，
+    //   而且**要等下一次 15 秒轮询**才能回来。客户看到的就是「数字突然没了」。
+    var ctxShown = false, ctxShownFor = null;
     async function loadCtx() {
       var el = document.getElementById('asbudy-ctx');
       if (!el) return;
+      if (ctxShownFor !== LAST_THREAD) { ctxShown = false; ctxShownFor = null; }   // 换会话就重来
       // ⚠️ 2026-09-16 老板：「界面只显示「压缩」，哪有百分比？」——
       //   病根：以前**没数据就把文字清空**（元素在、但空）→ 看着就是“没这功能”。
       //   现在**永远显示**：没数据就说「记性 —」，鼠标移上去告诉为什么。
@@ -3770,18 +3775,23 @@
       }
       try {
         var r = await fetch('/_gate/context?thread=' + encodeURIComponent(LAST_THREAD), { credentials: 'same-origin' });
-        if (!r.ok) { show('记性 —', '暂时读不到（接口 ' + r.status + '）'); return; }
+        if (!r.ok) {
+          // 引擎暂不可用（重启/忙）—— **别覆盖上次的好值**（门卫那边也会回上一次成功的读数值）
+          if (!ctxShown) show('记性 —', '暂时读不到（接口 ' + r.status + '）');
+          return;
+        }
         var d = await r.json();
         if (!d || !d.available) {
-          show('记性 —', '这条对话还没有用量记录' + ((d && d.model) ? '（模型 ' + d.model + '）' : ''));
+          if (!ctxShown) show('记性 —', '这条对话还没有用量记录' + ((d && d.model) ? '（模型 ' + d.model + '）' : ''));
           return;
         }
         var hot = d.percent >= 80;
+        ctxShown = true; ctxShownFor = LAST_THREAD;
         show('记性 ' + d.percent + '%',
           '这次对话占了模型「记忆」的 ' + d.percent + '%（' + fmtK(d.used) + ' / ' + fmtK(d.window) + '）'
           + '\n按当前对话内容估算'      // 口径：引擎按「现在要发给模型的消息」估的，不是计费数字
           + (hot ? '\n接近上限 —— 建议新建对话' : ''), hot);
-      } catch (e) { show('记性 —', '暂时读不到'); }
+      } catch (e) { if (!ctxShown) show('记性 —', '暂时读不到'); }
     }
     setInterval(loadCtx, 15000);
     setTimeout(loadCtx, 3000);
