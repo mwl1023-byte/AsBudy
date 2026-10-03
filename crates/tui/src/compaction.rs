@@ -1073,7 +1073,18 @@ pub fn report_compaction_failure(
         },
     };
 
-    format!("{prefix}: {detail}")
+    if detail == safe_raw {
+        format!("{prefix}: {detail}")
+    } else {
+        // 2026-10-03（AsBudy）：把**原始错误**一并带上。
+        //   为什么（真事）：客户 mayingzi 的压缩失败，引擎给的是分类后的固定文案
+        //   「provider authorization rejected compaction」—— 实测那次 turn 只跑了 **85ms、0 token**，
+        //   请求根本没发到 provider（真正的失败在本地：写 checkpoint 文件那一步，消息里含
+        //   "denied"/"permission" 就被 classify_error_message 归到 Authorization）。
+        //   分类文案可以留（它给的是可操作建议），但**原始错误不能丢** —— 丢了就没人查得下去。
+        //   代价：多几十个字符（已过 safe_error_text 脱敏）。
+        format!("{prefix}: {detail} [raw: {safe_raw}]")
+    }
 }
 
 /// Check if an error is transient and worth retrying. Categories that map to
