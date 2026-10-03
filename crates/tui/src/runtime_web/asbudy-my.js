@@ -3796,9 +3796,33 @@
     setInterval(loadCtx, 15000);
     setTimeout(loadCtx, 3000);
 
+    /** 把错误体读成人话（2026-10-03 老板报「压缩失败：[object Object]」）——
+     *  引擎的错误体是 `{"error":{"message":"…","status":422}}`（`runtime_api.rs` 的 `ApiError::into_response`），
+     *  而门卫自己产生的错误是 `{error:"…"}`（字符串）—— 两种形状都有。
+     *  原来直接 `'…失败：' + j.error` ⇒ 遇到对象就拼成 **[object Object]**，客户完全看不懂。 */
+    function errTextOf(j, status) {
+      var e = j && j.error;
+      if (typeof e === 'string' && e.trim()) return e.trim();
+      if (e && typeof e === 'object') {
+        var m = e.message || e.detail || e.code;
+        if (m) return String(m) + (e.status ? '（' + e.status + '）' : '');
+        return JSON.stringify(e);
+      }
+      if (j && typeof j.message === 'string' && j.message.trim()) return j.message.trim();
+      return 'HTTP ' + status;
+    }
+
     async function fire(kind) {
       if (!LAST_THREAD) { alert('请先发送一条消息'); return; }
       var labels = { compact: '压缩' };
+      // 这条对话还在跑时，引擎会直接拒（`compact_thread` 的 `bail!("Thread already has an active turn")`）
+      // —— 客户看到的是一句英文技术话。先在本地拦一道，说人话（2026-10-03）。
+      //   判据用官方那颗「停止」按钮的显隐（它就是「正在跑」）—— 不另造一套状态。
+      var stopBtn = document.getElementById('interrupt-turn');
+      if (stopBtn && !stopBtn.hidden) {
+        alert('这条对话正在处理中 —— 等它停下来再' + (labels[kind] || '操作') + '。');
+        return;
+      }
       if (kind === 'compact' && !confirm('压缩当前对话？\n\n将保留要点，超长历史会被总结 —— 可节省上下文，但部分细节会丢失。')) return;
       try {
         var r = await fetch('/v1/threads/' + encodeURIComponent(LAST_THREAD) + '/' + kind, {
@@ -3809,7 +3833,7 @@
         });
         if (!r.ok) {
           var j = await r.json().catch(function () { return {}; });
-          alert(labels[kind] + '失败：' + (j.error || r.status));
+          alert(labels[kind] + '失败：' + errTextOf(j, r.status));
           return;
         }
         // 压缩是后台跑一个 turn，给久一点再刷新（其余操作很快）
