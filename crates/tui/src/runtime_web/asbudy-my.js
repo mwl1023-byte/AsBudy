@@ -977,8 +977,8 @@
 
   var APPROVAL_OPTS = [
     { m: 'suggest', p: 'ask', a: false, t: '询问', d: '在可能造成重大更改的工具运行前询问（在项目文件夹里写文件不询问）' },
-    { m: 'auto', p: 'auto_review', a: false, t: '自动审核', d: '不问你；它自己判断，不行的直接拦下（默认）' },
-    { m: 'bypass', p: 'full_access', a: true, t: '完全访问', d: '无需审批提示即可运行工具' },
+    { m: 'auto', p: 'auto_review', a: false, t: '自动审核', d: '不问你；它自己判断，不行的直接拦下，且被拦下时不会停下来等你。想让它先问你，选「询问」' },
+    { m: 'bypass', p: 'full_access', a: true, t: '完全访问', d: '无需审批提示即可运行工具（默认）' },
   ];
   /* 推理级别（思考强度）—— 2026-09-20 搬表 M6（官方 CLI `/effort`，别名 `/thinking`；`Ctrl+T`）
    * ⚠️ **取值只照官方「DeepSeek 路由」那一档**（`tui/model_picker.rs:63` 的 `DEEPSEEK_PICKER_EFFORTS`
@@ -2633,7 +2633,7 @@
             esc(approvalTextOf(am)) +
           '</span><button class="ab-btn ghost sm" id="adv-approval" type="button" style="flex:0 0 auto">修改</button></div>' +
           '<div id="adv-approval-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
-          '<div class="ab-tip" style="margin:-4px 0 10px 78px">也可以直接点对话上方那排小标签里的「审批」—— 两处是同一个设置。改完当前会话立刻生效，以后新建的项目也按这个来。选「完全访问」后，AI 改文件、执行命令不再询问。</div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">也可以直接点对话上方那排小标签里的「审批」—— 两处是同一个设置。改完当前会话立刻生效，以后新建的项目也按这个来。选「完全访问」后，AI 改文件、执行命令不再询问。选「自动审核」时它不会弹窗，遇到它认为不安全的操作会直接拒绝且不等你 —— 那时改成「询问」再试即可。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">思考</div>' +
           '<div class="ab-row"><label>' + lbl('reasoning_effort','推理级别') + '</label><select class="ab-input" id="adv-effort">' +
             EFFORT_OPTS.map(function (o) {
@@ -3394,6 +3394,17 @@
       el.insertBefore(liveEl, el.firstChild);
       if (!abDockPlace(el, AB_RANK.msgbar)) return null;
       abDockTick(document.getElementById('asbudy-tick'));   // 「已运行」那条也要在同一行里
+      // ★ 建好就**立刻**取一次数 —— 别等下面那个 3 秒的定时器。
+      //   2026-10-03 老板报「对话窗口的『记性』又不显示了」：真浏览器实测（每 100ms 采样）
+      //     100ms → 连 msgbar 都没有；2115ms → msgbar 出现但 #asbudy-ctx 是**空字符串**；
+      //     5600ms → 才出现「记性 0%」。即打开窗口后约 5.6 秒内**什么都看不到**。
+      //   病根就是这一处：`loadCtx` 只被「3 秒后的定时器」驱动，而元素是当场建好的 ——
+      //   建好到有字之间留着一段真空。这跟上面 ensure() 的口径（**永远显示**：没数据就说
+      //   「记性 —」）是矛盾的：老板看到的空白，就是「不显示」。
+      //   这一行让元素一进 DOM 就有字（「记性 —」或「记性 N%」）。
+      //   ⚠️ 只在**真正创建**的那条分支里调 —— 元素已存在时函数在上面就 return 了，
+      //     不会变成每次 DOM 变动都打一发 /_gate/context。
+      try { loadCtx(); } catch (e0) { /* 取不到数字不影响对话 */ }
       return el;
     }
 
