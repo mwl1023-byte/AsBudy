@@ -34,7 +34,12 @@
     //   ③ 底色用 --well（官方搜索框同款深底）、边框透明（官方控件们就是 transparent，
     //      只靠底色区分）—— 原来我们用 --surface 亮底 + --line 实边框，像另一个系统；
     //   ④ 标题排版抄官方 .rail-section-title（13px / 700 / --text-dim / 字距 0.08em）。
-    '#asbudy-files{margin:0;display:flex;flex-direction:column;gap:8px;font-size:13.5px}',
+    // ⚠️ 2026-10-03 加 max-height + flex:none（配下面那行）：桌面窗口里卡片恢复显示后，
+    //   「项目文件」+「我的资料」两张卡的自然高度能吃掉 600+px，官方「最近会话」被压到
+    //   最小值 **144px**（真浏览器实测）—— 那正是老板 2026-09-17 要求过「让它多显示一些」的地方。
+    //   整块限高、内部滚动：卡片照样看得见、点得动，会话列表把空间拿回来。
+    '#asbudy-files{margin:0;display:flex;flex-direction:column;gap:8px;font-size:13.5px;max-height:30vh;overflow-y:auto}',
+    '#asbudy-files > *{flex:none}',
     '.asb-card{border:1px solid transparent;border-radius:var(--radius-control);background:var(--well);overflow:hidden}',
     // 手机上侧栏空间不够时，官方 .rail 是 grid，会把 auto 行一路压扁 —— 实测（390×700 真浏览器）：
     //   回收站那一行被压到 **6px**（退回那行还有 36px）⇒ 客户看到的就是「回收站没了」。
@@ -977,13 +982,58 @@
       }
       if (fileBox) fileBox.hidden = true;
     } else {
-      // 工作台：右栏看文件内容（点左栏文件就显示在这里）
+      // 工作台 / 没有系统页面的项目（含客户自己导入的代码，如 cs2分析系统）：右栏看文件内容
       if (frame) { frame.hidden = true; frame.src = 'about:blank'; frame.removeAttribute('data-pkey'); }
       if (fileBox) fileBox.hidden = false;
+      autoPreviewLatest();   // ★ 空着的时候自动摊开最近的一份产出（2026-10-03，见下面那个函数）
     }
     shell.classList.add('has-preview');
   }
   function hidePreview() { var s = shellEl(); if (s) s.classList.remove('has-preview'); }
+
+  /** 右栏空着的时候，自动摊开**最近的一份产出**（2026-10-03 老板报：
+   *  「点开工作台和任一项目……右侧栏也不实时预览项目产出（网页或项目）了」）。
+   *  为什么会空：没有系统页面的项目（工作台、以及**客户自己导入的代码**还没有服务的项目，
+   *  如 mayingzi 的 cs2分析系统）原来右栏就是一块**空白** —— 客户看不出这里能干什么，
+   *  也看不到自己做出来的东西长什么样。现在：有产出网页就摊最新那份，没有就给一句人话。
+   *  ⚠️ 只在「客户还没自己点过文件」时自动摊（lastPicked 空），他自己选了就听他的；
+   *     每个项目只自动摊一次（autoPreviewTried），不把接口打密。
+   *  摊开后 lastPicked 就设上了 ⇒ 上面那套「变才刷」（refreshCurrentPreview）照常生效：
+   *  AI 改完这一轮，右栏自己跟着更新（这就是老板要的「实时」）。 */
+  var autoPreviewTried = {};
+  function autoPreviewLatest() {
+    if (!pkey || lastPicked) return;
+    if (autoPreviewTried[pkey]) return;
+    autoPreviewTried[pkey] = true;
+    fetch('/_gate/artifacts?project=' + encodeURIComponent(pkey), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var list = (d && d.files) || [];
+        var webs = list.filter(function (a) { return /\.html?$/i.test(a.name || ''); });
+        if (!webs.length) { lonelyPreviewBox(); return; }
+        webs.sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });   // 最新的那份
+        lastPicked = { f: { name: webs[0].name, path: webs[0].path }, isMine: false };
+        openPreviewFor(lastPicked.f, false);
+      })
+      .catch(function () { lonelyPreviewBox(); });
+  }
+
+  /** 没有产出可摊时，右栏给一句人话 —— 别留一块空白，客户会以为坏了 */
+  function lonelyPreviewBox() {
+    var fb = document.getElementById('preview-file');
+    if (!fb || lastPicked) return;
+    fb.hidden = false;
+    fb.innerHTML = '';
+    var head = document.createElement('div'); head.className = 'pv-file-head';
+    var nm = document.createElement('span'); nm.className = 'pv-file-name'; nm.textContent = '我的项目';
+    head.appendChild(nm);
+    var w = document.createElement('div'); w.className = 'pv-file-body';
+    var tip = document.createElement('div');
+    tip.style.cssText = 'padding:16px;color:var(--text-dim);font-size:13px;line-height:1.7';
+    tip.textContent = '这里会显示你做出来的东西。说一句要什么，做好的网页、表格、文档就出现在这儿。';
+    w.appendChild(tip);
+    fb.appendChild(head); fb.appendChild(w);
+  }
 
   // 客户项目：右栏从「文件预览」切回「看系统页面」（iframe）
   function showSysPreview() {
