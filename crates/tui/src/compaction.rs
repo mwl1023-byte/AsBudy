@@ -1069,7 +1069,7 @@ pub fn report_compaction_failure(
                 "provider authorization rejected compaction — verify account access or switch provider/model"
                     .to_string()
             }
-            _ => safe_raw,
+            _ => safe_raw.clone(),
         },
     };
 
