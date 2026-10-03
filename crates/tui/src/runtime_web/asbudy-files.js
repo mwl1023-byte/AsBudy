@@ -14,6 +14,12 @@
   //   而「看我的项目」入口该不该在，判的是**有没有系统**（门卫给的 data-sys）。
   //   以前两者共用一个值 —— 项目一没跑起来，入口就跟着消失，客户在手机上就一个入口都摸不到。
   var projSys = host.getAttribute('data-sys') === '1' || projKind === 'proxy';
+  // 「全屏打开」要跟着**当前在看的东西**走（2026-10-03 老板实测修的）——
+  //   客户在预览栏里看产出网页 / 图片时点「全屏打开」，以前**一律**打开项目系统（`/_pv/<key>/`）：
+  //     ① 项目没有后端时那是一条 404（客户看到的就是老板报的那句乱码）；
+  //     ② 就算项目有后端，他想全屏看的也是**手上这份产出**（他刚生成的那个页面），不是项目首页。
+  //   ⇒ 看文件时记下它的独立地址（能内嵌渲染的才有），切回项目系统时清掉。
+  var curFile = null;   // { name, url } | null
   var body = document.getElementById('asbudy-files-body');        // 「项目文件」卡片内容区
   var mineBody = document.getElementById('asbudy-mine-body');     // 「我的资料」卡片内容区
   var refresh = document.getElementById('asbudy-files-refresh');
@@ -651,6 +657,9 @@
   // 后端两条链现在返回同一套 kind，所以渲染只写一份 —— 以前三处各写一遍 if，改一个格式要改三处。
   function showData(name, d) {
     var k = (d && d.kind) || '';
+    // 「全屏打开」跟着**当前看的东西**走 —— 只有能内嵌渲染的（网页/图片/PDF）才有「单独打开」地址
+    curFile = (d && d.url && (k === 'web' || k === 'image' || k === 'pdf')) ? { name: name || '', url: d.url } : null;
+    syncNewwinTitle();
     if (k === 'web') return showPanel(name, webBody(d), d.download);   // 网页：默认渲染出页面，可切「看代码」
     if (k === 'office' || k === 'html' || k === 'markdown') return showPanel(name, htmlBody(d.html || ''), d.download);
     if (k === 'table') return showPanel(name, tableBody(d), d.download);        // 后端不再发这个 kind 了，留着兼容
@@ -726,6 +735,11 @@
       return b;
     }
     var bWeb = mkBtn('看网页'), bCode = mkBtn('看代码');
+    // 「新窗口打开」（2026-10-03 加）：客户要的是「把做出来的页面当网站一样全屏看」——
+    //   右上角那个「全屏打开」离得远，而且它管的是整栏；这个就在页面上，一眼看得到。
+    var bOpen = mkBtn('新窗口打开');
+    bOpen.title = '在新窗口全屏看这个页面';
+    bOpen.onclick = function () { if (d.url) window.open(d.url, '_blank', 'noopener'); };
     function paint(web) {
       bWeb.style.color = web ? 'var(--text)' : 'var(--text-dim)';
       bCode.style.color = web ? 'var(--text-dim)' : 'var(--text)';
@@ -744,7 +758,7 @@
     bWeb.onclick = function () { paint(true); };
     bCode.onclick = function () { paint(false); };
     paint(true);
-    bar.appendChild(bWeb); bar.appendChild(bCode);
+    bar.appendChild(bWeb); bar.appendChild(bCode); bar.appendChild(bOpen);
     wrap.appendChild(bar); wrap.appendChild(stage);
     return wrap;
   }
@@ -973,6 +987,7 @@
 
   // 客户项目：右栏从「文件预览」切回「看系统页面」（iframe）
   function showSysPreview() {
+    curFile = null; syncNewwinTitle();   // 切回项目系统了 —— 「全屏打开」跟着回到「打开项目」
     var shell = shellEl();
     var pane = document.getElementById('preview-pane');
     if (!shell || !pane) return;
@@ -1007,6 +1022,37 @@
       //（inert 那套只能靠官方收，所以这里只是退而求其次）
       else shell.classList.remove('rail-visible');
     }
+  }
+
+  /** 右上角「全屏打开」该开哪个（2026-10-03 老板实测：客户点它看到乱码）——
+   *  ① 正在看某份产出物 / 我的资料（有独立地址的）→ 打开**它**；
+   *  ② 否则 = 正在看项目系统 → 打开项目，且**先探活**（跟「▶ 看我的项目」一个规矩，
+   *     打不开就说一句人话，不把客户送进错误页）。
+   *  探活那句提示复用下面的 aliveHint / showProjHint。 */
+  function openFullscreen() {
+    if (curFile && curFile.url) { window.open(curFile.url, '_blank', 'noopener'); return; }
+    if (!projSys || !pkey) return;
+    var u = previewUrl || ('/_pv/' + encodeURIComponent(pkey) + '/');
+    showProjHint('正在打开…');
+    var slow = setTimeout(function () { showProjHint('打开得有点慢，再等一下…'); }, 4000);
+    fetch('/_gate/proj-alive?project=' + encodeURIComponent(pkey), { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        clearTimeout(slow);
+        if (j && j.alive) { hideProjHint(); window.open(u, '_blank', 'noopener'); return; }
+        var box = document.getElementById('asbudy-openproj');
+        // 侧栏收着 / 那块盒子不在视口时，提示等于没说 —— 降级为开窗口，
+        // 让门卫那一页（「这个项目还没跑起来，暂时打不开页面。」）兜住，总之不让客户点了没反应
+        if (!box || !box.getBoundingClientRect().width) { hideProjHint(); window.open(u, '_blank', 'noopener'); return; }
+        showProjHint(aliveHint(j));
+      })
+      .catch(function () { clearTimeout(slow); window.open(u, '_blank', 'noopener'); });
+  }
+  /** 「全屏打开」按钮上那句悬停说明，跟着现在在看的东西变 —— 不然客户看着产出页面，
+   *  按钮却说「打开这个项目」，点下去才发现不是他要的。 */
+  function syncNewwinTitle() {
+    var b = document.getElementById('preview-newwin');
+    if (b) b.title = (curFile && curFile.url) ? '在新窗口全屏打开这个文件' : '在新窗口全屏打开这个项目';
   }
 
   /** 点「▶ 看我的项目」（2026-09-18 老板选②；同日按老板要求加探活）——
@@ -1119,12 +1165,10 @@
     else if (t.id === 'pv-back') { showSysPreview(); }   // 文件预览区里那个「← 回到我的项目」
     else if (t.id === 'asb-openproj') { openMySystem(); }   // 左侧栏顶上那个大按钮
     else if (t.id === 'preview-reveal') { showPreview(); }
-    // 「单独打开」（2026-09-16 老板：客户没法像网站一样打开自己的项目）——
+    // 「全屏打开」（2026-09-16 老板：客户没法像网站一样打开自己的项目）——
     // 门卫给的地址里已经带了一张短期票，开出去就是一个能全屏用、能给同事看的页面。
-    else if (t.id === 'preview-newwin') {
-      var u = previewUrl || (pkey ? ('/_pv/' + encodeURIComponent(pkey) + '/') : '');
-      if (u) window.open(u, '_blank', 'noopener');
-    }
+    // 2026-10-03 改成先看「现在看的是文件还是项目系统」：看文件就打开文件（见 openFullscreen）。
+    else if (t.id === 'preview-newwin') { openFullscreen(); }
     else if (t.id === 'preview-reload') { var f = frameEl(); if (f) f.src = f.src; }
     else if (t.id === 'asbudy-files-upload') { showUpMenu(t); }
     else if (t.id === 'asb-fold-proj') { setFold('proj', !isFolded('proj')); }
