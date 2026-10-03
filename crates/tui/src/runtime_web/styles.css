@@ -903,6 +903,17 @@ textarea::placeholder {
      `wasNearBottom` 长期为 false 且**不可恢复**。用户主动点的「回到最新」自带
      behavior:'smooth'，不依赖这一条。 */
   scroll-behavior: auto;
+  /* AsBudy：同理，**必须关掉浏览器的滚动锚定**（2026-10-03 老板报「跑着跑着就不自动跟随了」）。
+     浏览器默认开着 scroll anchoring —— 它在**上方内容变化**时自动调 `scrollTop` 来「保持视口稳定」（好功能，但不是我们要的）。
+     而流式回复会把同一条消息**反复重画**（markdown 从不完整到完整、工具卡/思考卡展开收起），
+     高度一变锚定就动手 ⇒ `app.mjs` 那个「这位置是不是我刚放的」的 **2px 容差**被打穿
+     ⇒ `handleTranscriptScroll` 误判成「用户自己往上翻了」⇒ `setTranscriptFollow(false)`
+     ⇒ **从那一刻起永久不再跟随**（与 170 同源：判据一旦被污染就没有出口）。
+     A/B 实测（同一条会话、真流式）：不关 = `atTail` 掉 false **2 次**、最大离底 146px；
+     关掉 = **0 次**、最大离底 28px（且 B 组内容更多、条件更苛刻）。
+     我们自己接管贴底（`scrollTranscriptToLatest`），本来就不需要锚定。
+     Safari 不认这个属性、忽略即可（它也没有同一套锚定）。 */
+  overflow-anchor: none;
   scrollbar-color: var(--text-faint) transparent;
   background: var(--stage-surface);
 }
