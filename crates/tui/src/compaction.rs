@@ -1,6 +1,11 @@
 //! Context compaction for long conversations.
 
 use anyhow::Result;
+// 2026-10-04（AsBudy 补）：压缩失败要能看到**是哪个文件**写不进去。
+//   背景：客户 mayingzi 的压缩一直失败，引擎只说 `[raw: Permission denied (os error 13)]`
+//   —— 连路径都没有，查不下去。（真正的错误还被 classify_error_message 误报成
+//   「provider authorization rejected」。）
+use anyhow::Context;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::Duration;
@@ -1031,7 +1036,7 @@ pub fn report_compaction_failure(
     auto: bool,
     error: &anyhow::Error,
 ) -> String {
-    let raw = error.to_string();
+    let raw = format!("{error:#}"); // 2026-10-04：完整错误链（带 with_context 的路径信息）
     let safe_raw = crate::safe_label::safe_error_text(&raw);
     tracing::warn!(
         compaction_id = %id,
@@ -1142,7 +1147,16 @@ pub async fn compact_messages_safe(
             &std::path::PathBuf::from("artifacts")
                 .join(format!("context-transfer-{checkpoint_id}.json")),
             &bytes,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "写压缩检查点 json（session={session_id}；HOME={}；codewhale_home={}）",
+                std::env::var("HOME").unwrap_or_else(|_| "<未设>".into()),
+                codewhale_config::codewhale_home()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("<{e}>")),
+            )
+        })?;
     }
 
     let config = &prepared.config;
@@ -1254,7 +1268,13 @@ pub async fn compact_messages_safe(
                         &std::path::PathBuf::from("artifacts")
                             .join(format!("context-transfer-{checkpoint_id}.md")),
                         redacted.as_str().unwrap_or_default().as_bytes(),
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "写压缩摘要 md（session={session_id}；HOME={}）",
+                            std::env::var("HOME").unwrap_or_else(|_| "<未设>".into()),
+                        )
+                    })?;
                 }
                 return Ok(CompactionResult {
                     messages: kept,
