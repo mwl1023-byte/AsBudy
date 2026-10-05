@@ -50,10 +50,10 @@
     //   很多完全可以收纳进「我的」里」）—— 它们改从「我的」菜单进、弹层里看。
     //   桌面侧栏照旧（地方够，多一个显眼入口比多一次点击好）。
     '@media (max-width:800px){#asbudy-recycle,#asbudy-undo{display:none!important}}',
-    // 「项目文件」卡在手机上也不摆侧栏（2026-09-19 老板：「项目文件收到「我的」里」）——
-    //   只用子选择器隐藏它在**侧栏里**的样子：弹层版是把这棵树画到别处，不受影响。
-    //   桌面侧栏照旧保留（地方够、鼠标操作树比弹层里舒服）。
-    '@media (max-width:800px){#asbudy-files > #asb-card-proj{display:none!important}}',
+    // 「项目文件」卡手机上**也显示**了（2026-10-05 老板：「放出来」）——
+    //   原来 2026-09-19 定的是「收到「我的」里」（那行子选择器隐藏已删）；老板现在要手机上
+    //   也能直接看到。侧栏本来就 overflow:auto、上面那张卡有 max-height:30vh 限高，挤了能滚。
+    //   ⚠️ 「回收站 / 退回」那两条**仍然**在手机上收起（老板本次只点了「项目文件」）。
     // 弹层里的树：不受侧栏那个 max-height 限制（地方大就该铺开）
     '.ab-layer-tree{padding:0 2px;max-height:none;overflow:visible}',
     // 标题行整条可点（2026-09-19 老板：「要点击横条就能弹出，而不是……去找那个折叠小图标才能折叠/弹出（反人类）」）
@@ -1001,18 +1001,27 @@
    *  摊开后 lastPicked 就设上了 ⇒ 上面那套「变才刷」（refreshCurrentPreview）照常生效：
    *  AI 改完这一轮，右栏自己跟着更新（这就是老板要的「实时」）。 */
   var autoPreviewTried = {};
+  /** 「这个项目里最新的一张网页产出」（.html/.htm，按 mtime 倒序）—— 找不到给 null。
+   *  ⚠️ 这是**唯一**一套选取口径：右栏「自动摊开最新产出」与侧栏「▶ 看我的项目」
+   *     在没有可跑服务时打开的东西，都走这里（2026-10-04 老板定，别再各写一遍）。 */
+  function latestWebArtifact() {
+    if (!pkey) return Promise.resolve(null);
+    return fetch('/_gate/artifacts?project=' + encodeURIComponent(pkey), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var webs = ((d && d.files) || []).filter(function (a) { return /\.html?$/i.test(a.name || ''); });
+        webs.sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });   // 最新的那份
+        return webs[0] || null;
+      });
+  }
   function autoPreviewLatest() {
     if (!pkey || lastPicked) return;
     if (autoPreviewTried[pkey]) return;
     autoPreviewTried[pkey] = true;
-    fetch('/_gate/artifacts?project=' + encodeURIComponent(pkey), { credentials: 'same-origin' })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) {
-        var list = (d && d.files) || [];
-        var webs = list.filter(function (a) { return /\.html?$/i.test(a.name || ''); });
-        if (!webs.length) { lonelyPreviewBox(); return; }
-        webs.sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });   // 最新的那份
-        lastPicked = { f: { name: webs[0].name, path: webs[0].path }, isMine: false };
+    latestWebArtifact()
+      .then(function (web) {
+        if (!web) { lonelyPreviewBox(); return; }
+        lastPicked = { f: { name: web.name, path: web.path }, isMine: false };
         openPreviewFor(lastPicked.f, false);
       })
       .catch(function () { lonelyPreviewBox(); });
@@ -1065,13 +1074,21 @@
     //   这一整套**只有官方的 `closeRail()` 会收**。自己改 class 的后果（实测）：
     //   侧栏看着是收起来了，对话区的 inert 却留着 → 预览一收起，剩下那块对话区
     //   点哪都没反应、输入框也进不去（老板说的「页面卡死」）。
-    if (shell.classList.contains('rail-visible')) {
-      var railClose = document.getElementById('rail-close');
-      if (railClose) railClose.click();
-      // 兜底：万一官方哪天把那个按钮改名/删了，至少别让侧栏盖在预览上
-      //（inert 那套只能靠官方收，所以这里只是退而求其次）
-      else shell.classList.remove('rail-visible');
-    }
+    collapseRailIfOpen();
+  }
+
+  /** 手机上侧栏是**模态**（盖在预览上）—— 从侧栏点完按钮，顺手把它收起来。
+   *  ⚠️ 必须走官方那条路（点官方 `#rail-close`，它绑着 closeRail）—— 见上面那段实测教训，
+   *  自己改 class 会把对话区的 inert 留下（「页面卡死」）。2026-10-04 从 showSysPreview 抽出来，
+   *  因为「没服务 → 打开最新网页」那条路也要收侧栏。 */
+  function collapseRailIfOpen() {
+    var shell = shellEl();
+    if (!shell || !shell.classList.contains('rail-visible')) return;
+    var railClose = document.getElementById('rail-close');
+    if (railClose) railClose.click();
+    // 兜底：万一官方哪天把那个按钮改名/删了，至少别让侧栏盖在预览上
+    //（inert 那套只能靠官方收，所以这里只是退而求其次）
+    else shell.classList.remove('rail-visible');
   }
 
   /** 右上角「全屏打开」该开哪个（2026-10-03 老板实测：客户点它看到乱码）——
@@ -1121,9 +1138,28 @@
       .then(function (j) {
         clearTimeout(slow);
         if (j && j.alive) { hideProjHint(); showSysPreview(); return; }
+        // 2026-10-04 老板定：「看我的项目」先看有没有能跑的服务；**没有就打开这个项目里最新的一张网页**。
+        //   为什么：客户做出来的网页本身**就是**他的项目页面（如 mayingzi 的 CS2分析页面.html）——
+        //   以前那把钥匙只开「项目网站」那个抽屉（只认 server.js），网页产出躺在「产出」抽屉里
+        //   ⇒ 客户点了只得到一句「还没跑起来」。现在没服务就直接翻产出，口径与右栏自动摊开**同一套**。
+        if (j && j.reason === 'no-port') { openLatestWebOrSayWhy(); return; }
         showProjHint(aliveHint(j));
       })
       .catch(function () { clearTimeout(slow); showProjHint('暂时打不开页面，稍后再试。'); });
+  }
+
+  /** 「看我的项目」的分支：没服务 → 打开最新网页产出；连产出也没有 → 说一句人话（不给空白） */
+  function openLatestWebOrSayWhy() {
+    showProjHint('正在打开…');
+    latestWebArtifact()
+      .then(function (web) {
+        if (!web) { showProjHint('这个项目还没做出网页 —— 跟它说一句要什么，做好了就出现在这儿。'); return; }
+        hideProjHint();
+        lastPicked = { f: { name: web.name, path: web.path }, isMine: false };
+        openPreviewFor(lastPicked.f, false);   // 与右栏「自动摊开最新产出」同一套渲染（kind=web → iframe）
+        collapseRailIfOpen();                  // 手机：侧栏是模态，不收起来会盖住刚打开的页面
+      })
+      .catch(function () { showProjHint('暂时打不开页面，稍后再试。'); });
   }
   /** 打不开的几种情形，各说一句人话（只讲「点了会怎样」，不讲我们怎么实现） */
   function aliveHint(j) {
