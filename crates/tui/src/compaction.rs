@@ -1044,6 +1044,19 @@ pub fn report_compaction_failure(
         error = %safe_raw,
         "context compaction failed"
     );
+    // 2026-10-06 (AsBudy): a local filesystem failure must not be reported as a
+    // provider verdict. Compaction writes its checkpoint into the engine's own
+    // session directory *before* it calls the provider, and when that write
+    // fails the error is `Permission denied (os error 13)` — whose "denied"
+    // matches `classify_error_message`'s Authorization rule, so the whole
+    // failure came back as "provider authorization rejected compaction" and
+    // sent the operator to the wrong system entirely (real case: customer
+    // mayingzi, 2026-10-04). Decide by the error's *type*, not by its text, and
+    // only for filesystem-class kinds: a refused TCP connection is an
+    // `io::Error` too, and that one really is a provider-side fault.
+    if let Some(kind) = local_filesystem_error(error) {
+        return format!("{prefix}: local filesystem error ({kind}) — {safe_raw}");
+    }
     let detail = match llm_error_in_chain(error) {
         Some(crate::llm_client::LlmError::QuotaExhausted(_)) => {
             "provider plan quota exhausted — switch provider/model or renew the provider plan"
@@ -1090,6 +1103,28 @@ pub fn report_compaction_failure(
         //   代价：多几十个字符（已过 safe_error_text 脱敏）。
         format!("{prefix}: {detail} [raw: {safe_raw}]")
     }
+}
+
+/// Filesystem-class `io::ErrorKind`s raised by the engine's own disk work.
+///
+/// Compaction is not only a provider call: it first writes a checkpoint into the
+/// engine's session directory (`write_session_relative_immutable`). Either side
+/// can fail, but `classify_error_message` classifies *provider* error text — for
+/// it "denied" means an HTTP 403, so a local `Permission denied (os error 13)`
+/// was reported as "provider authorization rejected …". Match the error's type
+/// first. Only filesystem kinds qualify here: a refused TCP connection is also
+/// an `io::Error`, and that one genuinely is a provider-side fault.
+fn local_filesystem_error(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error.chain().find_map(|cause| {
+        let io = cause.downcast_ref::<std::io::Error>()?;
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::AlreadyExists
+        )
+        .then_some(io.kind())
+    })
 }
 
 /// Check if an error is transient and worth retrying. Categories that map to

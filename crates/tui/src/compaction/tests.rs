@@ -5,6 +5,55 @@ fn report(error: &anyhow::Error) -> String {
 }
 
 #[test]
+fn local_write_failures_are_not_reported_as_provider_verdicts() {
+    // `write_session_relative_immutable` returns `io::Result`; a local write
+    // failure has to stay a local failure all the way into the message.
+    let error = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "Permission denied (os error 13)",
+    ))
+    .context("write compaction checkpoint for session s-1");
+
+    let message = report(&error);
+    assert!(
+        message.contains("local filesystem error"),
+        "a local write failure must be named as one: {message}"
+    );
+    assert!(
+        !message.contains("provider"),
+        "a local write failure must not be blamed on the provider: {message}"
+    );
+}
+
+#[test]
+fn refused_connections_stay_provider_side() {
+    // A refused TCP connection is an `io::Error` as well; it is not local disk.
+    let error = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "Connection refused (os error 111)",
+    ));
+
+    let message = report(&error);
+    assert!(
+        !message.contains("local filesystem error"),
+        "a refused connection is a transport fault, not disk: {message}"
+    );
+}
+
+#[test]
+fn provider_authorization_text_keeps_its_verdict() {
+    // Plain text (no `io::Error` anywhere in the chain) still classifies as it
+    // did before — the local-filesystem guard must not swallow provider faults.
+    let error = anyhow::Error::msg("403 Forbidden: provider authorization rejected");
+
+    let message = report(&error);
+    assert!(
+        message.contains("provider authorization"),
+        "provider authorization text keeps its verdict: {message}"
+    );
+}
+
+#[test]
 fn strip_compaction_summaries_removes_only_summary_blocks() {
     let base = SystemBlock {
         block_type: "text".to_string(),
