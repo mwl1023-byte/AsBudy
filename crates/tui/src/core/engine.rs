@@ -3462,6 +3462,17 @@ impl Engine {
                     Op::SetSearchProvider { provider } => {
                         self.config.search_provider = provider;
                     }
+                    Op::SetSystemPromptAppend { text } => {
+                        // Host banner: appended after the assembled stable
+                        // prompt, so instructions, workspace context, and
+                        // memory all survive. Never routed through
+                        // `system_prompt`, whose override flag silently drops
+                        // everything the assembly produced.
+                        self.session.system_prompt_append = text
+                            .map(|text| text.trim().to_string())
+                            .filter(|text| !text.is_empty());
+                        self.refresh_system_prompt();
+                    }
                     Op::Shutdown => {
                         break;
                     }
@@ -7189,6 +7200,24 @@ impl Engine {
                 },
                 prompt_host,
             );
+        // Host banner (see `Op::SetSystemPromptAppend`): appended *after* the
+        // assembled prompt. `system_prompt_override` stays untouched, so
+        // instructions, workspace context, and memory are all preserved.
+        // Appended at the tail so the cache-stable Blocks[0] prefix is
+        // unaffected and only the trailing bytes move.
+        let base = match self.session.system_prompt_append.as_deref() {
+            Some(append) if !append.trim().is_empty() => match base {
+                SystemPrompt::Text(text) => SystemPrompt::Text(format!("{text}\n\n{append}")),
+                SystemPrompt::Blocks(mut blocks) => {
+                    if let Some(last) = blocks.last_mut() {
+                        last.text.push_str("\n\n");
+                        last.text.push_str(append);
+                    }
+                    SystemPrompt::Blocks(blocks)
+                }
+            },
+            _ => base,
+        };
         Some(base)
     }
 

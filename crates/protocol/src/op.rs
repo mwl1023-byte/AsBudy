@@ -356,6 +356,13 @@ pub enum Op {
         provider: String,
     },
 
+    /// Host-supplied text appended after the assembled system prompt. Unlike
+    /// `SyncSession`'s `system_prompt` override, this preserves instructions,
+    /// workspace context, and memory.
+    SetSystemPromptAppend {
+        text: Option<String>,
+    },
+
     /// Replace the engine's merged Fleet roster. Only the roster's identity
     /// crosses: member ids in precedence order plus the load state.
     SetFleetRoster {
@@ -457,6 +464,7 @@ pub const OP_KINDS: &[&str] = &[
     "set_stream_chunk_timeout",
     "set_subagent_runtime_config",
     "set_search_provider",
+    "set_system_prompt_append",
     "set_fleet_roster",
     "sync_session",
     "compact_context",
@@ -501,6 +509,7 @@ impl Op {
             Self::SetStreamChunkTimeout { .. } => "set_stream_chunk_timeout",
             Self::SetSubagentRuntimeConfig { .. } => "set_subagent_runtime_config",
             Self::SetSearchProvider { .. } => "set_search_provider",
+            Self::SetSystemPromptAppend { .. } => "set_system_prompt_append",
             Self::SetFleetRoster { .. } => "set_fleet_roster",
             Self::SyncSession { .. } => "sync_session",
             Self::CompactContext { .. } => "compact_context",
@@ -665,6 +674,9 @@ mod tests {
             },
             Op::SetSearchProvider {
                 provider: "brave".into(),
+            },
+            Op::SetSystemPromptAppend {
+                text: Some("banner".into()),
             },
             Op::SetFleetRoster {
                 member_ids: vec!["scout".into()],

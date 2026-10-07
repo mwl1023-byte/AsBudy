@@ -173,6 +173,14 @@ pub struct Session {
     /// True when `system_prompt` is a persisted/runtime-supplied prefix that
     /// should not be replaced by mode/context refreshes.
     pub system_prompt_override: bool,
+    /// Host-supplied text appended *after* the assembled stable system prompt.
+    ///
+    /// Unlike `system_prompt` + `system_prompt_override`, this never replaces
+    /// the assembled prompt: instructions, workspace context, and memory stay
+    /// intact and the host banner is appended below them. Embedders that only
+    /// want to brief the model about their own context use this instead of the
+    /// override, which silently drops everything the assembly produced.
+    pub system_prompt_append: Option<String>,
     /// Hash of the last assembled stable system prompt. Used to avoid
     /// replacing `system_prompt` when unchanged.
     pub last_system_prompt_hash: Option<u64>,
@@ -312,6 +320,7 @@ impl Session {
             workspace,
             system_prompt: None,
             system_prompt_override: false,
+            system_prompt_append: None,
             compaction_summary_prompt: None,
             messages: AppendLog::new(),
             total_usage: SessionUsage::default(),

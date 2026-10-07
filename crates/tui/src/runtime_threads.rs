@@ -738,6 +738,11 @@ pub struct ThreadRecord {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Host text appended after the assembled system prompt. Independent of
+    /// `system_prompt`, whose override semantics drop the assembled prompt
+    /// (instructions, workspace context, memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     /// User-set title for the thread. When `None`, consumers fall back to a
@@ -849,6 +854,7 @@ fn thread_execution_state_matches(left: &ThreadRecord, right: &ThreadRecord) -> 
         && left.latest_response_bookmark == right.latest_response_bookmark
         && left.archived == right.archived
         && left.system_prompt == right.system_prompt
+        && left.system_prompt_append == right.system_prompt_append
         && left.task_id == right.task_id
         && left.session_id == right.session_id
         && left.saved_session_checkpoint == right.saved_session_checkpoint
@@ -3371,6 +3377,11 @@ pub struct CreateThreadRequest {
     pub archived: bool,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Host text appended after the assembled system prompt (see
+    /// `Op::SetSystemPromptAppend`). Deliberately separate from
+    /// `system_prompt`, which replaces the assembled prompt entirely.
+    #[serde(default)]
+    pub system_prompt_append: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -7401,6 +7412,7 @@ impl RuntimeThreadManager {
             latest_response_bookmark: None,
             archived: req.archived,
             system_prompt: req.system_prompt,
+            system_prompt_append: req.system_prompt_append,
             task_id: req.task_id,
             title: None,
             session_id: None,
@@ -11120,6 +11132,19 @@ impl RuntimeThreadManager {
                     })
                     .await
                     .map_err(|e| anyhow!("Failed to sync thread session: {e}"))?;
+            }
+
+            // Host banner: sent separately from SyncSession so the assembled
+            // prompt (instructions, workspace context, memory) survives and
+            // only the banner is appended. Re-sent on every (re)spawn, so a
+            // restarted engine gets it back.
+            if thread.system_prompt_append.is_some() {
+                engine
+                    .send(Op::SetSystemPromptAppend {
+                        text: thread.system_prompt_append.clone(),
+                    })
+                    .await
+                    .map_err(|e| anyhow!("Failed to set thread system prompt append: {e}"))?;
             }
 
             let mut active = self.active.lock().await;

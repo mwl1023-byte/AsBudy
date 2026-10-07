@@ -343,6 +343,16 @@ pub enum Op {
         roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
     },
 
+    /// Append host-supplied text after the assembled stable system prompt.
+    ///
+    /// Unlike `SyncSession`'s `system_prompt` (an override that replaces the
+    /// assembled prompt), this keeps instructions, workspace context, and
+    /// memory intact and appends a host banner below them. A host that only
+    /// wants to brief the model about its own framing uses this.
+    SetSystemPromptAppend {
+        text: Option<String>,
+    },
+
     /// Sync engine session state (used for resume/load)
     SyncSession {
         session_id: Option<String>,
