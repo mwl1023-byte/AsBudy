@@ -1103,9 +1103,9 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
         Op::SetSearchProvider { provider } => wire_op::Op::SetSearchProvider {
             provider: provider.as_str().to_string(),
         },
-        Op::SetSystemPromptAppend { text } => wire_op::Op::SetSystemPromptAppend {
-            text: text.clone(),
-        },
+        Op::SetSystemPromptAppend { text } => {
+            wire_op::Op::SetSystemPromptAppend { text: text.clone() }
+        }
         Op::SetFleetRoster { roster } => wire_op::Op::SetFleetRoster {
             member_ids: roster
                 .members()
