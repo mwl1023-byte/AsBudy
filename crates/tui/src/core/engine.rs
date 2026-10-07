@@ -7045,7 +7045,12 @@ impl Engine {
     /// Handle a turn using the DeepSeek API.
     #[allow(clippy::too_many_lines)]
     /// Refresh the stable system prompt based on current non-mode context.
-    #[cfg_attr(not(test), expect(dead_code))]
+    ///
+    /// ⚠️ 2026-10-07（第 80 轮）：官方原先在这儿挂了
+    /// `#[cfg_attr(not(test), expect(dead_code))]` —— 意思是「预期它只在测试里被用到」。
+    /// 我们给 `Op::SetSystemPromptAppend` 加处理分支后，它**在生产路径上真被调用了**
+    /// ⇒ 那个 `expect` 落空，而 CI 带 `-D warnings` ⇒ `unfulfilled-lint-expectations`
+    /// 直接把构建打红。按「预期已兑现」的正确处理**删掉该注解**（而不是改成 allow 把它压下去）。
     fn refresh_system_prompt(&mut self) {
         self.refresh_system_prompt_with_reason("system");
     }
