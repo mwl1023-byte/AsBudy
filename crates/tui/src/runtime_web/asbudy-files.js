@@ -80,6 +80,8 @@
     '.f-node .f-ic{flex:none;color:var(--text-soft);width:13px;text-align:center}',
     '.f-node .f-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}',
     '.f-node .f-sz{flex:none;color:var(--text-faint);font-size:12.5px}',
+    // 文件的「最新修改时间」（2026-10-08 老板）：年月日 时分秒
+    '.f-node .f-tm{flex:none;color:var(--text-faint);font-size:11.5px;opacity:.85;margin-left:8px}',
     // 固定文件夹的中文小注（老板 2026-09-16：客户看不懂 data / public）
     '.f-node .f-note{flex:none;color:var(--text-faint);font-size:12px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
     '.f-node .f-tag{flex:none;color:var(--text-faint);font-size:12.5px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
@@ -178,10 +180,15 @@
     if (n < 1048576) return Math.round(n / 1024) + ' KB';
     return (n / 1048576).toFixed(1) + ' MB';
   }
+  // 文件的「最新修改时间」（2026-10-08 老板）：**年月日 时分秒**都要有。
+  // 以前只给「月-日 时:分」—— 同一分钟里改过两版根本分不出来，跨年也看不出是哪年。
   function aTime(ts) {
+    if (!ts) return '';
     var t = new Date(ts);
+    if (isNaN(t.getTime())) return '';
     function p(n) { return String(n).padStart(2, '0'); }
-    return p(t.getMonth() + 1) + '-' + p(t.getDate()) + ' ' + p(t.getHours()) + ':' + p(t.getMinutes());
+    return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) + ' '
+      + p(t.getHours()) + ':' + p(t.getMinutes()) + ':' + p(t.getSeconds());
   }
   // 成品后缀（跟后端 server.js 的 ARTIFACT_EXT 对齐）—— 目录树里给这些文件标「可下载」
   var ART_EXT = ['pptx','ppt','xlsx','xls','docx','doc','pdf','csv','md','txt','png','jpg','jpeg','svg','zip','json'];
@@ -601,6 +608,7 @@
         '<span class="f-nm">' + aEsc(f.name) + '</span>' +
         (isArtifact(f.name) ? '<span class="f-tag">可下载</span>' : '') +
         (sz ? '<span class="f-sz">' + sz + '</span>' : '') +
+        (f.mtime ? '<span class="f-tm" title="最新修改时间">' + aTime(f.mtime) + '</span>' : '') +
         '<span class="f-del" title="删掉这个文件">×</span>';
       n.onclick = function () { onPick(f, isMine); };
       // 删除：文件池走 /_gate/file，项目文件走 /_gate/artifact（两个后端各管各的）
@@ -671,6 +679,8 @@
     if (k === 'text' || k === 'svg' || k === 'code') return showPanel(name, textBody(d.text || d.content || ''), d.download);
     if (k === 'image') return showPanel(name, imgBody(d.url), d.download);
     if (k === 'pdf') return showPanel(name, pdfBody(d.url), d.download);
+    if (k === 'video') return showPanel(name, mediaBody(d.url, 'video'), d.download);
+    if (k === 'audio') return showPanel(name, mediaBody(d.url, 'audio'), d.download);
     if (k === 'unsupported') return showPanel(name, textBody(d.note || '此格式暂不支持预览，请下载查看'), d.download);
     return showPanel(name, textBody((d && d.note) || '此格式暂不支持预览，请下载查看'), d.download);   // 没得预览也要说清楚，别给空面板
   }
@@ -796,6 +806,21 @@
     f.src = url; f.title = 'PDF 预览';
     f.style.cssText = 'width:100%;height:70vh;border:0;background:var(--action-contrast)';
     return f;
+  }
+  // 音视频（2026-10-08）：浏览器原生就能播 —— 以前这两种只给一句「此格式暂不支持预览」
+  function mediaBody(url, kind) {
+    if (!url) return textBody('这个文件没有能内嵌播放的地址。');
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;align-items:center;justify-content:center;min-height:160px';
+    var el = document.createElement(kind === 'audio' ? 'audio' : 'video');
+    el.src = url;
+    el.controls = true;
+    el.preload = 'metadata';
+    el.style.cssText = kind === 'audio'
+      ? 'width:min(520px,80%)'
+      : 'max-width:100%;max-height:70vh';
+    wrap.appendChild(el);
+    return wrap;
   }
   function tableBody(d) {
     var wrap = document.createElement('div');
