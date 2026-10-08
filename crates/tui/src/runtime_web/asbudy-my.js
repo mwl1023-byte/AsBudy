@@ -3150,25 +3150,34 @@
       c.querySelector('.ab-chip-name').textContent = e.detail.name || e.detail.path;
       c.hidden = false;
     });
-    // 发送时把路径塞进消息
+    // 发送时把路径塞进消息，**并把引用用掉**
     // ⚠️ 官方有**两条**发送路径：① 点「发送」→ submit 事件；② **按回车 → keydown 里直接
     //    调 sendMessage()，不经过 submit**。只拦 submit 的话，回车发送就白带了（实测踩过）。
-    function injectPicked() {
+    // ⚠️ 2026-10-08 老板报的另一个坑：以前只管**注入**、从来**不清** ⇒
+    //    ① 发完了标签还挂在输入框上（客户以为没生效 / 以为这份文件一直带着）；
+    //    ② 更难受的是 —— 下一条消息会**再带一遍**同一份文件（输入框已被官方清空，
+    //       `indexOf(picked) >= 0` 那个去重判据就失效了）。
+    //    现在：注入完就 `picked = null` ＋ 标签藏起来 —— 「带上」是一次性的，用完为止；
+    //    想接着用再点一次「带上给 AI」或者重选一份。
+    function consumePicked() {
       if (!picked) return;
       var ta = document.getElementById('composer-input');
       if (!ta) return;
-      if (ta.value.indexOf(picked) >= 0) return;
-      var clean = ta.value.replace(/\s*（用这份：[\s\S]*?）\s*$/, '');
-      ta.value = clean + (clean ? '\n' : '') + '（用这份：' + picked + '）';
+      if (ta.value.indexOf(picked) < 0) {
+        var clean = ta.value.replace(/\s*（用这份：[\s\S]*?）\s*$/, '');
+        ta.value = clean + (clean ? '\n' : '') + '（用这份：' + picked + '）';
+      }
+      picked = null;              // 用掉了（见上方注释：不清就会每轮都再带一遍）
+      if (chip) chip.hidden = true;
     }
     document.addEventListener('submit', function (e) {
-      if (e.target && e.target.id === 'composer') injectPicked();
+      if (e.target && e.target.id === 'composer') consumePicked();
     }, true);
     document.addEventListener('keydown', function (e) {
       if (e.key !== 'Enter' || e.shiftKey) return;
       var t = e.target;
       if (!t || t.id !== 'composer-input') return;
-      injectPicked();
+      consumePicked();
     }, true);
     var tries = 0;
     var t = setInterval(function () { if (ensureChip() || ++tries > 60) clearInterval(t); }, 400);
