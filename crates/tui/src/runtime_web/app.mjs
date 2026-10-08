@@ -1645,6 +1645,7 @@ function startBrowserClient() {
     renameDialog: document.querySelector("#rename-dialog"),
     renameForm: document.querySelector("#rename-form"),
     renameInput: document.querySelector("#rename-input"),
+    renameCancel: document.querySelector("#rename-cancel"),
     archivedToggle: document.querySelector("#archived-toggle"),
     archivedDialog: document.querySelector("#archived-dialog"),
     archivedList: document.querySelector("#archived-list"),
@@ -4021,11 +4022,11 @@ function startBrowserClient() {
 
   async function submitRename(event) {
     event.preventDefault();
-    const action = event.submitter?.value;
-    if (action !== "save") {
-      dom.renameDialog.close();
-      return;
-    }
+    // ⚠️ 不要拿 event.submitter 判「是不是取消」（2026-10-08 修）：回车触发的隐式提交
+    //   里 submitter 是 DOM 中**第一个** submit 按钮 —— 原来「取消」排在「保存标题」前面
+    //   且是 submit ⇒ 回车走到取消分支，弹窗关掉、标题没保存（老板报的就是这个）。
+    //   现在「取消」是 type=button（自己绑 click 关窗），表单里只剩「保存标题」一个 submit
+    //   ⇒ 回车与点按钮都是保存，跟同文件「新建会话」弹窗的写法一致。
     const title = dom.renameInput.value.trim();
     if (!title || !app.selectedThreadId) return;
     try {
@@ -4086,6 +4087,7 @@ function startBrowserClient() {
   dom.archivedToggle.addEventListener("click", openArchivedDialog);
   dom.archivedClose.addEventListener("click", () => dom.archivedDialog.close());
   dom.renameForm.addEventListener("submit", submitRename);
+  dom.renameCancel.addEventListener("click", () => dom.renameDialog.close());
   dom.interrupt.addEventListener("click", interruptTurn);
   dom.composer.addEventListener("submit", (event) => {
     event.preventDefault();

@@ -191,7 +191,12 @@
           <input id="rename-input" type="text" maxlength="160" required autocomplete="off">
         </label>
         <div class="dialog-actions">
-          <button class="quiet-button" value="cancel" type="submit" formnovalidate>取消</button>
+          <!-- 「取消」必须是 type=button（2026-10-08 修）：它原来是 type=submit 且排在
+               「保存标题」**前面**，而回车触发的表单隐式提交，浏览器选的是 DOM 里第一个
+               submit 按钮 ⇒ 回车被当成「取消」：弹窗直接关掉、标题没保存。
+               改成 type=button（关窗由 app.mjs 自己绑）后，表单里只剩「保存标题」一个
+               submit ⇒ 回车 = 保存。写法与上面「新建会话」弹窗一致。 -->
+          <button class="quiet-button" id="rename-cancel" type="button">取消</button>
           <button class="primary-button" value="save" type="submit">保存标题</button>
         </div>
       </form>
