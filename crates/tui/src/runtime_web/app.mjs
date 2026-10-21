@@ -767,7 +767,7 @@ export function thinkingPreviewText(detail, streaming, completedLines) {
   return body.join("\n") + (truncated ? "\n\u2026" : "");
 }
 
-/** 路径只留最后两段 —— 别把 /opt/asbudy/customers/yanyijin/2dry8u/public/index.html 整条糊到界面上 */
+/** 路径只留最后两段 —— 别把 /opt/asbudy/customers/<账号>/<项目>/public/index.html 整条糊到界面上 */
 function shortPathZh(value) {
   const parts = String(value || "").split("/").filter(Boolean);
   return parts.length <= 2 ? String(value || "") : parts.slice(-2).join("/");
