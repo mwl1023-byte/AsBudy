@@ -88,13 +88,7 @@ fn goal_command(
                 // the conversation instead of demanding a restatement
                 // (mirrors bare /workflow). The end-of-turn GoalUpdated
                 // snapshot syncs the created goal into the sidebar.
-                let message = "The user invoked /goal with no objective — declare a goal for the \
-                     CURRENT work. Synthesize the objective from the conversation context (the \
-                     task in flight, recent findings, open items) and set it by calling \
-                     `create_goal` with the full objective (and a token_budget only if one was \
-                     discussed). Then continue working toward it. Only if the conversation \
-                     genuinely contains no work yet, ask the user what the goal should be."
-                    .to_string();
+                let message = BARE_GOAL_BRIEF.to_string();
                 CommandResult::with_message_and_action(
                     "Declaring a goal from the current context...",
                     AppAction::SendMessage(message),
@@ -103,6 +97,17 @@ fn goal_command(
         }
     }
 }
+
+/// Model-facing brief for a context-dependent bare `/goal`. `create_goal`
+/// is eager on the default catalog, but a narrowed surface can defer it, so
+/// the brief carries the activation path (#6747).
+pub(crate) const BARE_GOAL_BRIEF: &str = "The user invoked /goal with no objective — declare a goal for the \
+     CURRENT work. Synthesize the objective from the conversation context (the \
+     task in flight, recent findings, open items) and set it by calling \
+     `create_goal` with the full objective (and a token_budget only if one was \
+     discussed); if `create_goal` is not in your tool list, load it with `tool_search` \
+     first. Then continue working toward it. Only if the conversation \
+     genuinely contains no work yet, ask the user what the goal should be.";
 
 /// Plain status line: objective, state, elapsed, budget, continuations, and
 /// — for an active goal that no turn is driving right now — how to continue.
@@ -114,9 +119,9 @@ fn goal_status(
         return CommandResult::message(goal_usage());
     };
     let elapsed = if goal.time_used_seconds > 0 {
-        format_elapsed(goal.time_used_seconds)
+        codewhale_command_contract::elapsed::format_elapsed_secs(goal.time_used_seconds)
     } else if let Some(secs) = goal.started_at_elapsed_seconds {
-        format_elapsed(secs)
+        codewhale_command_contract::elapsed::format_elapsed_secs(secs)
     } else {
         "unknown".to_string()
     };
@@ -192,14 +197,13 @@ fn resume_goal(
         return CommandResult::error("No paused goal set. Use /goal <objective> first.");
     }
 
-    // Resuming an already-active goal is a no-op: the continuation loop is
-    // already running, and re-asserting Active could stack a second
-    // autonomous turn. Report progress instead.
     if effective_goal_status(goal) == ProjectGoalStatus::Active {
         if goal.pending_controls {
             return CommandResult::message(translate(presentation, "goal_control_accepted"));
         }
-        return goal_status(goal, presentation);
+        if goal.is_loading || goal.goal_continuation_waiting {
+            return goal_status(goal, presentation);
+        }
     }
 
     CommandResult::action(AppAction::SetGoalStatus {
@@ -241,16 +245,6 @@ fn goal_status_label(status: ProjectGoalStatus) -> &'static str {
         ProjectGoalStatus::Complete => "complete",
         ProjectGoalStatus::Paused => "paused",
         ProjectGoalStatus::Blocked => "blocked",
-    }
-}
-
-/// Format a whole-seconds duration (portable replica of the TUI leaf helper,
-/// byte-identical output; the contract never ships preformatted strings).
-fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m {:02}s", secs / 60, secs % 60)
     }
 }
 
@@ -316,8 +310,19 @@ fn goal_contextual(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandR
 
 #[cfg(test)]
 mod tests {
+    /// #6747: the bare /goal brief names only callable tools and teaches
+    /// the `tool_search` activation path.
+    #[test]
+    fn bare_goal_brief_names_only_callable_tools() {
+        crate::tools::canonical_action::tests::assert_text_names_only_callable_tools(
+            "bare /goal brief",
+            BARE_GOAL_BRIEF,
+        );
+        assert!(BARE_GOAL_BRIEF.contains("`tool_search`"));
+    }
+
     use super::*;
-    use codewhale_command_contract::facets::{CommandProjectContext, ProjectShareProjection};
+    use codewhale_command_contract::facets::CommandProjectContext;
 
     /// Deterministic fake project facet over portable values only.
     struct FakeProject;
@@ -335,15 +340,6 @@ mod tests {
 
         fn lsp_set(&mut self, _enabled: bool) -> Result<(), String> {
             Ok(())
-        }
-
-        fn share_projection(&self) -> ProjectShareProjection {
-            ProjectShareProjection {
-                history_is_empty: true,
-                history_len: 0,
-                model: String::new(),
-                mode_label: String::new(),
-            }
         }
 
         fn goal_state(&self) -> ProjectGoalState {
@@ -508,19 +504,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_on_an_active_goal_is_a_no_op_report() {
-        // Re-asserting Active while the loop is already running must not
-        // schedule a second autonomous turn.
+    fn resume_on_an_active_goal_only_kicks_when_idle() {
         let mut goal = goal_state();
         goal.objective = Some("Keep the build green".to_string());
         goal.status = ProjectGoalStatus::Active;
-        let resumed = run(&goal, Some("resume"));
-        assert!(!resumed.is_error);
-        assert!(
-            resumed.action.is_none(),
-            "no control op on already-active goal"
-        );
-        assert!(resumed.message.unwrap().contains("Keep the build green"));
+        for (is_loading, waiting) in [(false, false), (true, false), (false, true)] {
+            goal.is_loading = is_loading;
+            goal.goal_continuation_waiting = waiting;
+            let resumed = run(&goal, Some("resume"));
+            assert!(!resumed.is_error);
+            if is_loading || waiting {
+                assert!(resumed.action.is_none());
+                assert!(resumed.message.unwrap().contains("Keep the build green"));
+            } else {
+                assert!(matches!(
+                    resumed.action,
+                    Some(AppAction::SetGoalStatus {
+                        status: crate::tools::goal::GoalStatus::Active,
+                        clear: false
+                    })
+                ));
+            }
+        }
     }
 
     #[test]
@@ -580,19 +585,6 @@ mod tests {
                 .unwrap()
                 .contains("Command capability unavailable: presentation")
         );
-    }
-
-    #[test]
-    fn format_elapsed_matches_tui_leaf_helper() {
-        // The portable replica must stay byte-identical to the TUI elapsed
-        // helper (Phase 4 review recommendation).
-        for secs in [0, 1, 59, 60, 61, 125, 3599, 3600, 3601] {
-            assert_eq!(
-                format_elapsed(secs),
-                crate::elapsed::format_elapsed_secs(secs),
-                "format_elapsed({secs}) must equal the TUI helper"
-            );
-        }
     }
 
     #[test]

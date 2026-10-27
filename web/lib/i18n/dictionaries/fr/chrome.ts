@@ -25,19 +25,10 @@ export const chrome: ChromeDict = {
   navCommunity: "Communauté",
   navContribute: "Contribuer",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "Capacités",
   navProduct: "Produit",
   navModels: "Modèles",
   navPlugins: "Plugins",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Aller au contenu principal",
 
@@ -46,31 +37,7 @@ export const chrome: ChromeDict = {
 
   installCta: "Installer →",
 
-  authSignIn: "Se connecter",
-  authRegister: "Créer un compte",
-  authGroupAria: "Compte",
-
-  wordmarkSeal: "深",
-  wordmarkTag: "n’importe quel modèle, sur votre machine",
-
-  issueLabel: "Édition du {date}",
   dateLocale: "fr-FR",
-
-  starsAria: "Étoiles GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "En direct",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "fusionné",
-  tickerOpened: "ouvert",
-  tickerClosed: "fermé",
-  tickerReleased: "publié",
-  tickerFirstContribution: "première contribution",
-  tickerBy: "par {handle}",
-  tickerAria: "Activité récente du dépôt",
-
-  traceLabel: "trace de raisonnement",
-  traceTabsAria: "Extraits de session",
 
   menuOpen: "Ouvrir le menu",
   menuClose: "Fermer le menu",
@@ -78,11 +45,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "clair",
   themeDark: "sombre",
-  themeAria: "Thème de la documentation : {mode} (cliquer pour changer)",
-  themeTitle: "Thème de la documentation · auto / clair / sombre",
+  themeAria: "Thème : {mode} (cliquer pour changer)",
+  themeTitle: "Thème · auto / clair / sombre",
 
   footerTagline:
-    "Créez ce que vous voulez et automatisez le travail du quotidien avec les modèles de votre choix.",
+    "L’agent de programmation open source pour votre terminal et les modèles de votre choix.",
   footerProduct: "Produit",
   footerProject: "Projet",
   footerDocs: "Documentation",

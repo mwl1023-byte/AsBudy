@@ -52,11 +52,10 @@ impl ToolRunActivitySummary {
 
 /// Detect contiguous runs of successful, low-risk tool cells.
 ///
-/// Failed, running, patch, review, diff, and plan-update cells split runs so
-/// important state never disappears into a summary row. Successful command
-/// cells can join dense runs; `v` / expansion keeps their raw details
-/// available without making routine verifier/shell work dominate the default
-/// transcript.
+/// Failed, running, command, MCP, patch, review, diff, and plan-update cells
+/// split runs so important state never disappears into a summary row
+/// (`ToolCell::is_collapsible_guard`); `v` / expansion keeps the grouped
+/// cells' raw details available.
 #[cfg(test)]
 pub fn detect_tool_runs(history: &[HistoryCell], min_size: usize) -> Vec<ToolRun> {
     detect_tool_runs_from_slices(history, &[], min_size)
@@ -312,19 +311,18 @@ pub fn tool_run_summary(run: &ToolRun) -> String {
 }
 
 fn activity_family_summary(run: &ToolRun, activities: &[ToolRunActivity]) -> Option<String> {
-    let mut families = Vec::new();
+    let mut families: Vec<String> = Vec::new();
     for family in &run.tool_families {
-        if activities.contains(&classify_tool_name_activity(family))
-            && !families.iter().any(|existing| existing == family)
-        {
-            families.push(family.as_str());
+        let label = family.replace('_', " ");
+        if activities.contains(&classify_tool_name_activity(family)) && !families.contains(&label) {
+            families.push(label);
         }
     }
 
     (!families.is_empty()).then(|| families.join(", "))
 }
 
-fn counted(count: usize, singular: &str, plural: &str) -> String {
+pub(super) fn counted(count: usize, singular: &str, plural: &str) -> String {
     let noun = if count == 1 { singular } else { plural };
     format!("{count} {noun}")
 }

@@ -31,23 +31,56 @@ function applySecurityHeaders(res: NextResponse): NextResponse {
  * keeps pulling subresources from `www` after the document moved.
  */
 const CANONICAL_HOST = "codewhale.net";
+const SITE_HOSTS = new Set([CANONICAL_HOST, `www.${CANONICAL_HOST}`]);
 
-function canonicalHostRedirect(req: NextRequest): NextResponse | null {
+function canonicalOriginRedirect(req: NextRequest): NextResponse | null {
   const host = req.headers.get("host");
   if (!host) return null;
   // Compare without the port so local and preview hosts are untouched.
   const bare = host.split(":")[0].toLowerCase();
-  if (bare !== `www.${CANONICAL_HOST}`) return null;
+  if (!SITE_HOSTS.has(bare)) return null;
+  const forwardedProto = req.headers.get("x-forwarded-proto")?.split(",")[0].trim().toLowerCase();
+  const insecure = req.nextUrl.protocol === "http:" || forwardedProto === "http";
+  if (bare === CANONICAL_HOST && !insecure) return null;
   const url = req.nextUrl.clone();
+  url.protocol = "https:";
   url.host = CANONICAL_HOST;
   url.port = "";
-  return NextResponse.redirect(url, 301);
+  // 308, not 301: clients may turn a 301'd POST (the admin login and post
+  // forms) into a GET and drop its body. 308 keeps the method and body and is
+  // still a permanent move for crawlers.
+  return NextResponse.redirect(url, 308);
+}
+
+/**
+ * Paths with no page of their own that should land on installation in one
+ * hop, bare or localized. `/download` and `/desktop` 404'd (M2) until a dark
+ * download hub exists (D11). `/pricing` went bare → `/en/pricing` →
+ * `/en/install` (UX-13); public pricing stays off (§0), so it keeps landing on
+ * install — `app/[locale]/pricing/page.tsx` still redirects as a backstop.
+ * Temporary (307) because each of these may become a real page later.
+ */
+const INSTALL_ALIASES = new Set(["download", "desktop", "pricing"]);
+
+function installAliasRedirect(req: NextRequest): NextResponse | null {
+  const segments = req.nextUrl.pathname.split("/").filter(Boolean);
+  const existing = pathLocale(req.nextUrl.pathname);
+  const rest = existing ? segments.slice(1) : segments;
+  if (rest.length !== 1 || !INSTALL_ALIASES.has(rest[0].toLowerCase())) return null;
+  const locale =
+    existing ??
+    detectLocaleFromHeaders(req.cookies.get(COOKIE)?.value, req.headers.get("accept-language"));
+  const url = req.nextUrl.clone();
+  url.pathname = `/${locale}/install`;
+  const res = NextResponse.redirect(url, 307);
+  res.cookies.set(COOKIE, locale, { path: "/", maxAge: 60 * 60 * 24 * 365 });
+  return res;
 }
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  const canonical = canonicalHostRedirect(req);
+  const canonical = canonicalOriginRedirect(req);
   if (canonical) return applySecurityHeaders(canonical);
 
   // Skip API routes, static files, _next, and the dot-less metadata route
@@ -68,8 +101,8 @@ export function middleware(req: NextRequest) {
     return applySecurityHeaders(NextResponse.redirect(callback, 307));
   }
 
-  // `/login` and `/register` are aliases for the public sign-in / create-account
-  // pages. Fold them before locale detection so `/login` becomes `/en/signin`
+  // `/login` and `/register` are aliases for the public sign-in page.
+  // Fold them before locale detection so `/login` becomes `/en/signin`
   // instead of `/en/login` (which has no page).
   const canonicalAuth = canonicalPublicAuthPath(pathname);
   if (canonicalAuth && canonicalAuth !== pathname) {
@@ -77,6 +110,9 @@ export function middleware(req: NextRequest) {
     url.pathname = canonicalAuth;
     return applySecurityHeaders(NextResponse.redirect(url, 308));
   }
+
+  const installAlias = installAliasRedirect(req);
+  if (installAlias) return applySecurityHeaders(installAlias);
 
   // Check if locale is already in path (`pt-BR` is one segment).
   const existing = pathLocale(pathname);

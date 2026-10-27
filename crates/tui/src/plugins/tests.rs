@@ -152,6 +152,42 @@ fn trust_and_enablement_are_separate_atomic_state_transitions() {
 }
 
 #[test]
+fn native_review_mutation_finishes_then_rechecks_current_default_receipt() {
+    let _policy = super::activation::TestPolicyGuard::extension_host(true);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    let plugin = config.user_plugins_dir.join("native-preset");
+    fs::create_dir_all(&plugin).unwrap();
+    fs::write(
+        plugin.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"native-preset","version":"1.0.0","extensions":{"net.codewhale":{"native":{"paths":["index.mjs"]}}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin.join("index.mjs"),
+        "// codewhale-native-preset-v1 {\"id\":\"reviewer\",\"trust\":\"user\",\"is_default\":true}\nexport function apply() {}\n",
+    )
+    .unwrap();
+    let mut registry = discover_with_config(&config);
+    registry.trust("native-preset").unwrap();
+    registry.enable("native-preset").unwrap();
+    let selected = registry.selected_native_entries().to_vec();
+    assert_eq!(selected.len(), 1);
+    let fresh = discover_with_config(&config);
+    assert_eq!(fresh.selected_native_entries(), selected);
+    assert!(fresh.with_native_preset(selected[0].clone()).is_ok());
+
+    registry.disable("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_err());
+    assert!(!discover_with_config(&config).is_active("native-preset"));
+    registry.enable("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_ok());
+    registry.revoke_trust("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_err());
+    assert!(!discover_with_config(&config).is_active("native-preset"));
+}
+
+#[test]
 fn declarative_runtime_sources_survive_restart_only_from_the_staged_snapshot() {
     let fixture = super::test_fixture::DeclarativePluginFixture::new();
     let plugin = fixture.registry.get("runtime-demo").expect("plugin");
@@ -989,6 +1025,134 @@ fn write_install_source(root: &Path, name: &str) -> PathBuf {
     source
 }
 
+/// A DSH bundle package: one remote MCP row and one skill directory.
+fn write_dsh_package(root: &Path, url: &str) -> PathBuf {
+    let package = root.join("dsh-source");
+    fs::create_dir_all(package.join("pack-skills/guide")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        serde_json::json!({"name": "@demo/docs-dsh", "version": "1.0.0",
+                           "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        package.join("cordis.patch.yml"),
+        format!(
+            "- insert:\n  - id: docs\n    name: '@deepseek-ai/dsh-mcp-client'\n    config: {{serverName: docs, transport: streamable-http, url: '{url}'}}\n  - id: skills\n    name: '@deepseek-ai/dsh-skill-filesystem'\n    config: {{customSkillDirs: [pack-skills]}}\n  - id: theme\n    name: '@deepseek-ai/dsh-client-ui-theme'\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("pack-skills/guide/SKILL.md"),
+        "---\nname: guide\ndescription: Bundled guide\n---\nBody.\n",
+    )
+    .unwrap();
+    package
+}
+
+/// DSH import is the ordinary reviewed install: the preview hash is what an
+/// exact install stages, the bundle lands disabled and untrusted, update
+/// re-converts the recorded package, and a changed package cannot be
+/// installed against a stale review or keep its trust.
+#[test]
+fn dsh_packages_import_through_the_reviewed_install_and_update_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::SealedHome::at(tmp.path());
+    let config = config(tmp.path());
+    let network = allow_all_network();
+    let package = write_dsh_package(tmp.path(), "https://docs.example.invalid/mcp");
+    let (conversion, reviewed) = super::install::preview_dsh(&package).unwrap();
+    assert_eq!(conversion.plugin_name, "docs-dsh");
+    assert_eq!(conversion.remote_servers, ["docs"]);
+    assert_eq!(conversion.skills, ["guide"]);
+    assert!(
+        conversion
+            .outcomes
+            .iter()
+            .any(|o| o.needs_manual_port() && o.row.as_deref() == Some("theme"))
+    );
+
+    let source = super::install::PluginInstallSource::parse(package.to_str().unwrap()).unwrap();
+    assert!(
+        matches!(source, super::install::PluginInstallSource::Dsh(_)),
+        "{source:?}"
+    );
+    let outcome = block_on(super::install::install_with_expected_content_hash(
+        source,
+        &config.user_plugins_dir,
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+        &|_| None,
+        &reviewed,
+    ))
+    .unwrap();
+    let super::install::PluginInstallOutcome::Installed(installed) = outcome else {
+        panic!("DSH import must install");
+    };
+    assert_eq!(installed.content_hash, reviewed);
+    let marker = fs::read_to_string(
+        config
+            .user_plugins_dir
+            .join("docs-dsh")
+            .join(super::install::INSTALLED_FROM_MARKER),
+    )
+    .unwrap();
+    assert!(marker.contains("dsh:"), "{marker}");
+
+    let mut registry = discover_with_config(&config);
+    let plugin = registry.get("docs-dsh").unwrap();
+    assert!(!plugin.enabled && !plugin.trusted());
+    registry.trust("docs-dsh").unwrap();
+    registry.enable("docs-dsh").unwrap();
+    assert!(registry.is_active("docs-dsh"));
+
+    let unchanged = block_on(super::install::update(
+        "docs-dsh",
+        &config.user_plugins_dir,
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+    ))
+    .unwrap();
+    assert!(matches!(
+        unchanged,
+        super::install::PluginUpdateResult::NoChange
+    ));
+
+    fs::remove_dir_all(&package).unwrap();
+    write_dsh_package(tmp.path(), "https://docs-v2.example.invalid/mcp");
+    let stale = block_on(super::install::install_with_expected_content_hash(
+        super::install::PluginInstallSource::Dsh(package.clone()),
+        &tmp.path().join("other-plugins"),
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+        &|_| None,
+        &reviewed,
+    ))
+    .unwrap_err();
+    assert!(
+        stale.to_string().contains("changed after review"),
+        "{stale:#}"
+    );
+
+    let updated = block_on(super::install::update(
+        "docs-dsh",
+        &config.user_plugins_dir,
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+    ))
+    .unwrap();
+    assert!(matches!(
+        updated,
+        super::install::PluginUpdateResult::Updated(_)
+    ));
+    let registry = discover_with_config(&config);
+    assert!(
+        !registry.get("docs-dsh").unwrap().trusted(),
+        "changed converted bytes invalidate the trust receipt"
+    );
+}
+
 #[test]
 fn installed_bundles_land_disabled_and_untrusted_then_follow_the_trust_flow() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1139,7 +1303,7 @@ fn mutation_install_rejects_names_claimed_by_other_scopes() {
 }
 
 #[test]
-fn mutation_update_refuses_local_installs_and_foreign_scopes() {
+fn mutation_update_accepts_unchanged_local_installs_and_refuses_foreign_scopes() {
     let tmp = tempfile::tempdir().unwrap();
     let config = config(tmp.path());
     let source = write_install_source(tmp.path(), "demo");
@@ -1159,16 +1323,62 @@ fn mutation_update_refuses_local_installs_and_foreign_scopes() {
     ))
     .unwrap();
 
+    let installed = config.user_plugins_dir.join("demo");
+    let before = [
+        installed.join("plugin.toml"),
+        installed.join("skills/hello/SKILL.md"),
+        installed.join(super::install::INSTALLED_FROM_MARKER),
+    ]
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    let state_before = fs::read(&config.state_path).ok();
     let mut registry = discover_with_config(&config);
-    let err = block_on(super::mutation::execute(
+    let receipt = block_on(super::mutation::execute(
         super::mutation::PluginMutationRequest::Update {
             selector: "demo".to_string(),
         },
         &ctx,
         &mut registry,
     ))
+    .unwrap();
+    assert_eq!(
+        receipt.outcome,
+        super::mutation::PluginMutationOutcome::NoChange
+    );
+    for (path, bytes) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(fs::read(&config.state_path).ok(), state_before);
+
+    let workspace_bundle = config.workspace_plugins_dir.join("workspace-demo");
+    fs::create_dir_all(&workspace_bundle).unwrap();
+    let workspace_manifest =
+        b"schema_version = 1\n[plugin]\nname = \"workspace-demo\"\nversion = \"1.0.0\"\n";
+    fs::write(workspace_bundle.join("plugin.toml"), workspace_manifest).unwrap();
+    let mut registry = discover_with_config(&config);
+    let err = block_on(super::mutation::execute(
+        super::mutation::PluginMutationRequest::Update {
+            selector: "workspace-demo".to_string(),
+        },
+        &ctx,
+        &mut registry,
+    ))
     .unwrap_err();
-    assert!(format!("{err:#}").contains("local path"), "got: {err:#}");
+    assert!(
+        format!("{err:#}").contains("only user-scope bundles"),
+        "got: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("workspace bundle"),
+        "got: {err:#}"
+    );
+    assert_eq!(
+        fs::read(workspace_bundle.join("plugin.toml")).unwrap(),
+        workspace_manifest
+    );
+    assert!(!config.user_plugins_dir.join("workspace-demo").exists());
 
     let err = block_on(super::mutation::execute(
         super::mutation::PluginMutationRequest::Update {
@@ -1765,7 +1975,6 @@ fn malformed_managed_policy_fails_closed() {
 
 #[test]
 fn managed_policy_path_env_override_is_honored() {
-    let _lock = crate::test_support::lock_test_env();
     let tmp = tempfile::tempdir().unwrap();
     let config = config(tmp.path());
     write_plugin(&config, "");
@@ -1777,8 +1986,13 @@ fn managed_policy_path_env_override_is_honored() {
         "the default sibling must stay absent so the override is proven"
     );
 
-    let _guard = crate::test_support::EnvVarGuard::set(MANAGED_POLICY_PATH_ENV, &custom);
-    let mut registry = discover_with_config(&config);
+    let environment = super::context::HostEnvironment::from_entries([(
+        std::ffi::OsString::from(MANAGED_POLICY_PATH_ENV),
+        custom.as_os_str().to_os_string(),
+    )]);
+    let context =
+        super::context::PluginDiscoveryContext::from_config_and_environment(&config, environment);
+    let mut registry = super::discovery::discover_with_context(&config, context);
     assert_eq!(
         registry.managed_policy_path(),
         Some(custom.as_path()),

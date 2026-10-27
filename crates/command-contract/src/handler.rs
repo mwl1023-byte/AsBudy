@@ -5,10 +5,13 @@
 //! `CommandHandler<crate::commands::CommandResult>`.
 
 use crate::facets::{
-    CommandCostContext, CommandMediaContext, CommandMemoryContext, CommandModePolicyContext,
-    CommandModelContext, CommandPluginContext, CommandPresentationContext, CommandProjectContext,
-    CommandSessionContext, CommandSessionControlContext, CommandSessionExportContext,
-    CommandSessionLifecycleContext, CommandSkillGroupContext, CommandSkillsContext,
+    CommandConfigStatusContext, CommandCostContext, CommandDebugChangeContext,
+    CommandDebugDiagnosticsContext, CommandDebugDiffContext, CommandDebugHistoryContext,
+    CommandDebugReceiptsContext, CommandDebugUndoContext, CommandMediaContext,
+    CommandMemoryContext, CommandModePolicyContext, CommandModelContext, CommandPermissionsContext,
+    CommandPluginContext, CommandPresentationContext, CommandProjectContext, CommandSessionContext,
+    CommandSessionControlContext, CommandSessionExportContext, CommandSessionLifecycleContext,
+    CommandSessionStructcopyContext, CommandSkillGroupContext, CommandSkillsContext,
     CommandSystemPromptContext, CommandWorkspaceContext,
 };
 
@@ -18,7 +21,7 @@ use crate::facets::{
 /// declare least authority without naming the TUI host. The dispatcher uses
 /// the declaration to populate only those slots in [`CommandContexts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CommandCapabilities(u16);
+pub struct CommandCapabilities(u32);
 
 impl CommandCapabilities {
     pub const NONE: Self = Self(0);
@@ -47,32 +50,66 @@ impl CommandCapabilities {
     /// Session-control host data (FEAT-024 D3), the next non-conflicting bit
     /// after `SESSION_LIFECYCLE`. Required only by the six host-dependent
     /// control commands (`/relay`, `/rename`, `/resume`, `/rc`, `/remote-env`,
-    /// `/title`); `/remote-env` also declares `PRESENTATION`. The backing
-    /// storage remains `u16` per the resolved maintainer review on FEAT-023 PR
-    /// #5902 — bit 14 is available, so no speculative widening is performed.
+    /// `/title`); `/remote-env` also declares `PRESENTATION`. Bit 14 fit the
+    /// original `u16` backing without speculative widening in FEAT-023.
     pub const SESSION_CONTROL: Self = Self(1 << 14);
     /// Session-export host data (FEAT-025 D1), the next non-conflicting bit
     /// after `SESSION_CONTROL`. Required only by the host-dependent `/export`
-    /// command and its `/daochu` alias; every concrete App, snapshot, clipboard,
+    /// command (and its `/daochu` alias) and by `/share`, which publishes the
+    /// same redacted projection; every concrete App, snapshot, clipboard,
     /// filesystem, history, and turn-handoff access stays behind the TUI export
     /// adapter.
     ///
-    /// **Capacity: this is the last free bit.** Bits 0-15 are now fully
-    /// allocated, so another capability cannot be added without widening the
-    /// backing storage to `u32`. FEAT-026 (session structcopy) needs its own
-    /// exact-minimum facet and therefore owns that widening decision; reusing
-    /// `SESSION_EXPORT` for it would break the least-capability invariant.
-    /// The `export_capability_space_is_exactly_full` test pins the capacity so
-    /// the next author gets a deliberate decision instead of a compile error
-    /// with no context.
+    /// This filled the original 16-bit space. FEAT-029 widened the backing
+    /// storage before allocating the next independent diagnostics authority;
+    /// the published identity of this bit remains unchanged.
     pub const SESSION_EXPORT: Self = Self(1 << 15);
+    /// Debug diagnostics host data (FEAT-029 D3/D4). This is the first bit in
+    /// the widened backing storage; other debug commands retain their own independent
+    /// authority and do not borrow this facet.
+    pub const DEBUG_DIAGNOSTICS: Self = Self(1 << 16);
+
+    /// Debug receipts authority; independent from diagnostics and other debug operations.
+    pub const DEBUG_RECEIPTS: Self = Self(1 << 17);
+    /// Debug change authority; independent from diagnostics and other debug operations.
+    pub const DEBUG_CHANGE: Self = Self(1 << 18);
+    /// Debug history authority; independent from diagnostics and other debug operations.
+    pub const DEBUG_HISTORY: Self = Self(1 << 19);
+    /// Debug diff authority; independent from diagnostics and other debug operations.
+    pub const DEBUG_DIFF: Self = Self(1 << 20);
+    /// Debug undo authority; independent from diagnostics and other debug operations.
+    pub const DEBUG_UNDO: Self = Self(1 << 21);
+
+    /// One human-selected structural copy; independent from export/recovery.
+    pub const SESSION_STRUCTCOPY: Self = Self(1 << 22);
+    /// Permission observations and token-checked removal, independent of status.
+    pub const PERMISSIONS: Self = Self(1 << 23);
+    /// Read-only status observations, with no permission mutation authority.
+    pub const CONFIG_STATUS: Self = Self(1 << 24);
+    /// Config-group host data (FEAT-028 D3), the next non-conflicting bit after
+    /// `CONFIG_STATUS`. Read/write settings, keys, presets, the editability
+    /// audit and login/logout observations for the config command group. It does
+    /// not grant pet, trust, mode, or workspace authority.
+    pub const CONFIG: Self = Self(1 << 25);
+    /// Pet presence/mode/sound/habitat host data (FEAT-028 D3), independent of
+    /// general configuration and system settings.
+    pub const PET: Self = Self(1 << 26);
+    /// Workspace trust and trusted-path allow-list host data (FEAT-028 D3),
+    /// independent of the general config facet and of `WORKSPACE` operations.
+    pub const TRUST: Self = Self(1 << 27);
+    /// Account/provider session state for `/login` and `/logout` (FEAT-028 D3).
+    pub const LOGIN: Self = Self(1 << 28);
+    /// Workbar placement/panel state for `/workbar` (FEAT-028 D3).
+    pub const WORK_SURFACE: Self = Self(1 << 29);
+    pub const NAVIGATION: Self = Self(1 << 30);
+    pub const VOICE_INPUT: Self = Self(1 << 31);
 
     /// Raw bit pattern, for tests that pin the capability-space capacity.
     ///
-    /// Kept `#[cfg(test)]` so the `u16` backing stays an implementation detail
+    /// Kept `#[cfg(test)]` so the `u32` backing stays an implementation detail
     /// and nothing can widen it accidentally through a public accessor.
     #[cfg(test)]
-    pub(crate) const fn bits_for_test(self) -> u16 {
+    pub(crate) const fn bits_for_test(self) -> u32 {
         self.0
     }
 
@@ -125,6 +162,22 @@ pub struct CommandContexts<'a> {
     lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
     control: Option<&'a mut dyn CommandSessionControlContext>,
     export: Option<&'a mut dyn CommandSessionExportContext>,
+    structcopy: Option<&'a mut dyn CommandSessionStructcopyContext>,
+    debug_receipts: Option<&'a mut dyn CommandDebugReceiptsContext>,
+    debug_change: Option<&'a mut dyn CommandDebugChangeContext>,
+    debug_history: Option<&'a mut dyn CommandDebugHistoryContext>,
+    debug_diff: Option<&'a mut dyn CommandDebugDiffContext>,
+    debug_undo: Option<&'a mut dyn CommandDebugUndoContext>,
+    debug_diagnostics: Option<&'a mut dyn CommandDebugDiagnosticsContext>,
+    permissions: Option<&'a mut dyn CommandPermissionsContext>,
+    config_status: Option<&'a mut dyn CommandConfigStatusContext>,
+    config: Option<&'a mut dyn crate::config::CommandConfigContext>,
+    pet: Option<&'a mut dyn crate::config::CommandPetContext>,
+    trust: Option<&'a mut dyn crate::config::CommandTrustContext>,
+    login: Option<&'a mut dyn crate::config::CommandLoginContext>,
+    work_surface: Option<&'a mut dyn crate::config::CommandWorkSurfaceContext>,
+    navigation: Option<&'a mut dyn crate::navigation::CommandNavigationContext>,
+    voice_input: Option<&'a mut dyn crate::navigation::CommandVoiceInputContext>,
 }
 
 /// Consumed envelope used when one handler needs several independent facets.
@@ -145,6 +198,22 @@ pub struct ContextParts<'a> {
     pub lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
     pub control: Option<&'a mut dyn CommandSessionControlContext>,
     pub export: Option<&'a mut dyn CommandSessionExportContext>,
+    pub structcopy: Option<&'a mut dyn CommandSessionStructcopyContext>,
+    pub debug_receipts: Option<&'a mut dyn CommandDebugReceiptsContext>,
+    pub debug_change: Option<&'a mut dyn CommandDebugChangeContext>,
+    pub debug_history: Option<&'a mut dyn CommandDebugHistoryContext>,
+    pub debug_diff: Option<&'a mut dyn CommandDebugDiffContext>,
+    pub debug_undo: Option<&'a mut dyn CommandDebugUndoContext>,
+    pub debug_diagnostics: Option<&'a mut dyn CommandDebugDiagnosticsContext>,
+    pub permissions: Option<&'a mut dyn CommandPermissionsContext>,
+    pub config_status: Option<&'a mut dyn CommandConfigStatusContext>,
+    pub config: Option<&'a mut dyn crate::config::CommandConfigContext>,
+    pub pet: Option<&'a mut dyn crate::config::CommandPetContext>,
+    pub trust: Option<&'a mut dyn crate::config::CommandTrustContext>,
+    pub login: Option<&'a mut dyn crate::config::CommandLoginContext>,
+    pub work_surface: Option<&'a mut dyn crate::config::CommandWorkSurfaceContext>,
+    pub navigation: Option<&'a mut dyn crate::navigation::CommandNavigationContext>,
+    pub voice_input: Option<&'a mut dyn crate::navigation::CommandVoiceInputContext>,
 }
 
 impl<'a> CommandContexts<'a> {
@@ -166,6 +235,22 @@ impl<'a> CommandContexts<'a> {
             lifecycle: None,
             control: None,
             export: None,
+            structcopy: None,
+            debug_receipts: None,
+            debug_change: None,
+            debug_history: None,
+            debug_diff: None,
+            debug_undo: None,
+            debug_diagnostics: None,
+            permissions: None,
+            config_status: None,
+            config: None,
+            pet: None,
+            trust: None,
+            login: None,
+            work_surface: None,
+            navigation: None,
+            voice_input: None,
         }
     }
 
@@ -187,7 +272,100 @@ impl<'a> CommandContexts<'a> {
             lifecycle: self.lifecycle,
             control: self.control,
             export: self.export,
+            structcopy: self.structcopy,
+            debug_receipts: self.debug_receipts,
+            debug_change: self.debug_change,
+            debug_history: self.debug_history,
+            debug_diff: self.debug_diff,
+            debug_undo: self.debug_undo,
+            debug_diagnostics: self.debug_diagnostics,
+            permissions: self.permissions,
+            config_status: self.config_status,
+            config: self.config,
+            pet: self.pet,
+            trust: self.trust,
+            login: self.login,
+            work_surface: self.work_surface,
+            navigation: self.navigation,
+            voice_input: self.voice_input,
         }
+    }
+
+    pub fn with_config(mut self, value: &'a mut dyn crate::config::CommandConfigContext) -> Self {
+        assert!(
+            self.config.replace(value).is_none(),
+            "config facet already set"
+        );
+        self
+    }
+
+    pub fn with_pet(mut self, value: &'a mut dyn crate::config::CommandPetContext) -> Self {
+        assert!(self.pet.replace(value).is_none(), "pet facet already set");
+        self
+    }
+
+    pub fn with_trust(mut self, value: &'a mut dyn crate::config::CommandTrustContext) -> Self {
+        assert!(
+            self.trust.replace(value).is_none(),
+            "trust facet already set"
+        );
+        self
+    }
+
+    pub fn with_login(mut self, value: &'a mut dyn crate::config::CommandLoginContext) -> Self {
+        assert!(
+            self.login.replace(value).is_none(),
+            "login facet already set"
+        );
+        self
+    }
+
+    pub fn with_work_surface(
+        mut self,
+        value: &'a mut dyn crate::config::CommandWorkSurfaceContext,
+    ) -> Self {
+        assert!(
+            self.work_surface.replace(value).is_none(),
+            "work-surface facet already set"
+        );
+        self
+    }
+
+    pub fn with_navigation(
+        mut self,
+        value: &'a mut dyn crate::navigation::CommandNavigationContext,
+    ) -> Self {
+        assert!(
+            self.navigation.replace(value).is_none(),
+            "navigation facet already set"
+        );
+        self
+    }
+
+    pub fn with_voice_input(
+        mut self,
+        value: &'a mut dyn crate::navigation::CommandVoiceInputContext,
+    ) -> Self {
+        assert!(
+            self.voice_input.replace(value).is_none(),
+            "voice-input facet already set"
+        );
+        self
+    }
+
+    pub fn with_permissions(mut self, value: &'a mut dyn CommandPermissionsContext) -> Self {
+        assert!(
+            self.permissions.replace(value).is_none(),
+            "permissions facet already set"
+        );
+        self
+    }
+    pub fn with_config_status(mut self, value: &'a mut dyn CommandConfigStatusContext) -> Self {
+        assert!(
+            self.config_status.replace(value).is_none(),
+            "config status facet already set"
+        );
+        self
     }
 
     pub fn with_session(mut self, value: &'a mut dyn CommandSessionContext) -> Self {
@@ -307,10 +485,69 @@ impl<'a> CommandContexts<'a> {
         self
     }
 
+    pub fn with_structcopy(mut self, value: &'a mut dyn CommandSessionStructcopyContext) -> Self {
+        assert!(
+            self.structcopy.replace(value).is_none(),
+            "structcopy facet already set"
+        );
+        self
+    }
+
     pub fn with_export(mut self, value: &'a mut dyn CommandSessionExportContext) -> Self {
         assert!(
             self.export.replace(value).is_none(),
             "export facet already set"
+        );
+        self
+    }
+
+    pub fn with_debug_receipts(mut self, value: &'a mut dyn CommandDebugReceiptsContext) -> Self {
+        assert!(
+            self.debug_receipts.replace(value).is_none(),
+            "debug_receipts facet already set"
+        );
+        self
+    }
+
+    pub fn with_debug_change(mut self, value: &'a mut dyn CommandDebugChangeContext) -> Self {
+        assert!(
+            self.debug_change.replace(value).is_none(),
+            "debug_change facet already set"
+        );
+        self
+    }
+
+    pub fn with_debug_history(mut self, value: &'a mut dyn CommandDebugHistoryContext) -> Self {
+        assert!(
+            self.debug_history.replace(value).is_none(),
+            "debug_history facet already set"
+        );
+        self
+    }
+
+    pub fn with_debug_diff(mut self, value: &'a mut dyn CommandDebugDiffContext) -> Self {
+        assert!(
+            self.debug_diff.replace(value).is_none(),
+            "debug_diff facet already set"
+        );
+        self
+    }
+
+    pub fn with_debug_undo(mut self, value: &'a mut dyn CommandDebugUndoContext) -> Self {
+        assert!(
+            self.debug_undo.replace(value).is_none(),
+            "debug_undo facet already set"
+        );
+        self
+    }
+
+    pub fn with_debug_diagnostics(
+        mut self,
+        value: &'a mut dyn CommandDebugDiagnosticsContext,
+    ) -> Self {
+        assert!(
+            self.debug_diagnostics.replace(value).is_none(),
+            "debug diagnostics facet already set"
         );
         self
     }

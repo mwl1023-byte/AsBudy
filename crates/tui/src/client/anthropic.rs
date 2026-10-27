@@ -28,16 +28,16 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{ApiProvider, wire_model_for_provider_route};
+use crate::config::{ProviderKind, wire_model_for_provider_route};
 use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::tools::schema_sanitize;
 use codewhale_models::{ContentBlock, MessageRequest, MessageResponse, StreamEvent, Usage};
 
+use super::CodewhaleClient;
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
-use super::wire::{extract_sse_data_value, next_sse_line};
-use super::{CodewhaleClient, ERROR_BODY_MAX_BYTES, bounded_error_text};
+use super::wire::{extract_sse_data_value, next_sse_line, push_sse_event_data};
 
 /// Maximum `cache_control` breakpoints Anthropic accepts per request.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
@@ -121,7 +121,7 @@ impl CodewhaleClient {
         }
 
         if let Some(tool_choice) = request.tool_choice.as_ref() {
-            body["tool_choice"] = anthropic_tool_choice(tool_choice);
+            body["tool_choice"] = anthropic_tool_choice(tool_choice, &model);
         }
 
         // Thinking + effort shaping. MiniMax supports adaptive/disabled but
@@ -130,14 +130,19 @@ impl CodewhaleClient {
         // gateways (#4978, e.g. Sensenova) only accept the documented
         // enabled/disabled/auto thinking types, so non-native routes get the
         // portable `{"type":"enabled","budget_tokens":N}` shape instead.
-        let thinking_capable = codewhale_models::model_supports_reasoning(&model);
-        let is_minimax_provider = self.api_provider == ApiProvider::MinimaxAnthropic;
+        let thinking_capable = self
+            .route_facts
+            .as_ref()
+            .filter(|facts| facts.wire_model_id == request.model)
+            .and_then(|facts| facts.reasoning)
+            .unwrap_or_else(|| codewhale_models::model_supports_reasoning(&model));
+        let is_minimax_provider = self.api_provider == ProviderKind::MinimaxAnthropic;
         let is_minimax = crate::config::is_exact_minimax_anthropic_m3_route(
             self.api_provider,
             &self.base_url,
             &model,
         );
-        let is_deepseek = self.api_provider == ApiProvider::DeepseekAnthropic;
+        let is_deepseek = self.api_provider == ProviderKind::DeepseekAnthropic;
         // Model Studio's Anthropic-compatible endpoint documents the portable
         // `{"type":"enabled","budget_tokens":N}` shape AND `{"type":"disabled"}`
         // (alibabacloud.com/help/en/model-studio/anthropic-api-messages), so
@@ -146,10 +151,10 @@ impl CodewhaleClient {
         // qwen3.x families).
         let is_modelstudio = matches!(
             self.api_provider,
-            ApiProvider::ModelstudioTokenPlan
-                | ApiProvider::ModelstudioTokenPlanAnthropic
-                | ApiProvider::ModelstudioCodingPlan
-                | ApiProvider::ModelstudioCodingPlanAnthropic
+            ProviderKind::ModelstudioTokenPlan
+                | ProviderKind::ModelstudioTokenPlanAnthropic
+                | ProviderKind::ModelstudioCodingPlan
+                | ProviderKind::ModelstudioCodingPlanAnthropic
         );
         // MiniMax's exact M3 route and DeepSeek's Messages dialect both
         // document adaptive support; everything else needs the native host.
@@ -190,17 +195,78 @@ impl CodewhaleClient {
                 body["thinking"] = json!({ "type": "adaptive" });
             }
             _ if thinking_capable => {
-                if let Some(budget) = compat_thinking_budget(effort.as_deref(), request.max_tokens)
+                if let Some(mut budget) =
+                    compat_thinking_budget(effort.as_deref(), request.max_tokens)
                 {
-                    body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+                    let mut minimum = u64::from(MIN_THINKING_BUDGET_TOKENS);
+                    if let Some(facts) = self
+                        .route_facts
+                        .as_ref()
+                        .filter(|facts| facts.wire_model_id == request.model)
+                        && let Some(option) = facts.reasoning_options.iter().find(|option| {
+                            matches!(
+                                option.get("type").and_then(Value::as_str),
+                                Some("budget" | "budget_tokens")
+                            )
+                        })
+                    {
+                        minimum = option.get("min").and_then(Value::as_u64).unwrap_or(minimum);
+                        let maximum = option
+                            .get("max")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(u64::from(request.max_tokens.saturating_sub(1)));
+                        budget = budget.min(u32::try_from(maximum).unwrap_or(u32::MAX));
+                    }
+                    if u64::from(budget) >= minimum {
+                        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+                    } else {
+                        tracing::warn!(
+                            "The output allowance cannot represent the offering's minimum reasoning budget; thinking was omitted"
+                        );
+                    }
                 }
             }
             _ => {}
         }
 
-        // Sampling parameters: Claude 4.7+ rejects temperature/top_p
-        // entirely; earlier models reject the two together. Send at most one
-        // (temperature wins), or neither for models that forbid them.
+        // Anthropic documents `redacted_thinking.data` as opaque encrypted
+        // content to pass back unchanged and says nothing about third-party
+        // gateways understanding the block type, and we cannot tell a
+        // terminating gateway from a forwarding proxy to the first-party
+        // API (which would handle the block). Withholding on every
+        // non-native host is the conservative call: a strict terminating
+        // gateway would reject the unknown block type outright, while a
+        // forwarding proxy only loses the block's continuity (a
+        // redacted-only current tool turn can still 400 there). Native
+        // `*.anthropic.com` routes keep the payload byte-exact.
+        if !is_native_anthropic_base_url(&self.base_url)
+            && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
+        {
+            messages.retain_mut(|message| {
+                let is_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
+                let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                    return true;
+                };
+                blocks.retain(|block| {
+                    block.get("type").and_then(Value::as_str) != Some("redacted_thinking")
+                });
+                // A message that only carried redacted blocks would
+                // otherwise go out with an empty `content: []`, which
+                // Messages-compatible endpoints reject — the same
+                // every-retry 400 this withhold exists to prevent. Dropping
+                // the message is safe: a redacted-only assistant turn
+                // carries no `tool_use`, so no `tool_result` can dangle.
+                // Reachable only from foreign/imported sessions; the live
+                // engine never persists a reasoning-only turn.
+                !(is_assistant && blocks.is_empty())
+            });
+        }
+
+        // Sampling parameters: every model from Claude 4.7 on (including the
+        // Claude 5 generation and Haiku 5.5) rejects non-default
+        // temperature/top_p; earlier models reject the two together. Send at
+        // most one (temperature wins), or neither for models that forbid
+        // them.
         if !anthropic_model_rejects_sampling(&request.model) {
             if let Some(temperature) = request.temperature {
                 body["temperature"] = json!(temperature);
@@ -213,81 +279,51 @@ impl CodewhaleClient {
         body
     }
 
+    /// Non-streaming send through the shared typed retry path
+    /// (`send_with_retry`): 429/5xx/transport failures retry with backoff and
+    /// honor `Retry-After`, and a final failure stays a downcastable
+    /// `LlmError` so the engine can classify auth, rate-limit, context and
+    /// invalid-request failures like every other wire.
     async fn send_anthropic_request(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
         let url = self.messages_transport_url(url);
-        self.wait_for_rate_limit().await;
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Accept", "text/event-stream")
-            .json(body)
-            .send()
-            .await
-            .context("Anthropic Messages API request failed")?;
-        self.check_anthropic_response(response).await
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize Anthropic Messages request")?;
+        self.send_with_retry(|| {
+            self.http_client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header("Accept", "text/event-stream")
+                .body(request_body.clone())
+        })
+        .await
+        .context("Anthropic Messages API request failed")
     }
 
-    /// Shared status/error-envelope handling for streaming and
-    /// non-streaming Messages responses.
-    async fn check_anthropic_response(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<reqwest::Response> {
-        let status = response.status();
-        if !status.is_success() {
-            let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            let (error_type, message) = parse_anthropic_error_envelope(&raw);
-            self.mark_request_failure(&format!("anthropic status={status}"))
-                .await;
-            anyhow::bail!("Anthropic API error (HTTP {status} {error_type}): {message}");
-        }
-        self.mark_request_success().await;
-        Ok(response)
-    }
-
-    /// Open the streaming Messages request through the shared stream-entry
-    /// transport policy: bounded header wait, dual-client selection, and at
-    /// most one HTTP/1.1 fallback retry on a classified H2 header stall.
-    /// Wire-specific request construction (headers, endpoint, body) stays
-    /// here at the adapter edge.
+    /// Open Messages through the shared provider retry and stream-entry
+    /// policy. Each physical request has its own header wait and at most one
+    /// HTTP/1.1 fallback; provider backoff stays outside that wait. Request
+    /// construction remains at this wire-specific edge.
     async fn open_anthropic_stream_response(
         &self,
         url: &str,
         body: &Value,
     ) -> Result<reqwest::Response> {
         let url = self.messages_transport_url(url);
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            super::stream_entry::stream_open_timeout(),
-            self.stream_idle_timeout,
-        );
-        let opened = super::stream_entry::open_sse_response(&open_req, |policy| {
-            let url = url.clone();
-            async move {
-                self.wait_for_rate_limit().await;
-                let client = super::stream_entry::client_for_policy(
-                    &self.http_client,
-                    self.http1_fallback_client(),
-                    policy,
-                );
-                client
-                    .post(&url)
-                    .header("Accept", "text/event-stream")
-                    .json(body)
-                    .send()
-                    .await
-                    .context("Anthropic Messages API request failed")
-            }
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize Anthropic Messages request")?;
+        self.send_stream_open_with_retry(|policy| {
+            super::stream_entry::client_for_policy(
+                &self.http_client,
+                self.http1_fallback_client(),
+                policy,
+            )
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("Accept", "text/event-stream")
+            .body(request_body.clone())
         })
-        .await;
-        let response = match opened {
-            Ok(response) => response,
-            Err(err) => {
-                self.mark_request_failure(&format!("anthropic stream open: {err}"))
-                    .await;
-                return Err(err);
-            }
-        };
-        self.check_anthropic_response(response).await
+        .await
+        .context("Anthropic Messages API request failed")
     }
 
     /// Handle a streaming Messages API request.
@@ -303,6 +339,9 @@ impl CodewhaleClient {
             .await?;
 
         let stream_idle_timeout = self.stream_idle_timeout;
+        let first_byte = super::stream_entry::first_byte_timeout(stream_idle_timeout);
+        let provider_label = self.api_provider.provider().display_name();
+        let suppress_error_details = self.claude_oauth_config.is_some();
         let byte_stream = response.bytes_stream();
 
         let stream = async_stream::stream! {
@@ -313,6 +352,9 @@ impl CodewhaleClient {
             // multi-byte UTF-8 char (CJK/emoji) split across HTTP/2 DATA is
             // never corrupted to U+FFFD. Genuine invalid bytes fail closed.
             let mut buffer: Vec<u8> = Vec::new();
+            // `data:` fields of the event being assembled, dispatched at the
+            // blank line that ends it (or at stream end).
+            let mut event_data = String::new();
             let stream_start = std::time::Instant::now();
             let mut last_chunk_at = std::time::Instant::now();
             let mut bytes_received: usize = 0;
@@ -321,7 +363,12 @@ impl CodewhaleClient {
 
             loop {
                 if !ended {
-                    match tokio::time::timeout(stream_idle_timeout, byte_stream.next()).await {
+                    let wait = super::stream_entry::next_chunk_timeout(
+                        stream_idle_timeout,
+                        first_byte,
+                        bytes_received,
+                    );
+                    match tokio::time::timeout(wait, byte_stream.next()).await {
                         Ok(Some(Ok(chunk))) => {
                             bytes_received += chunk.len();
                             last_chunk_at = std::time::Instant::now();
@@ -333,11 +380,12 @@ impl CodewhaleClient {
                         }
                         Ok(None) => ended = true,
                         Err(_) => {
-                            yield Err(anyhow::anyhow!(super::stream_entry::idle_timeout_message(
-                                stream_idle_timeout,
+                            yield Err(anyhow::anyhow!(super::stream_entry::body_timeout_message(
+                                wait,
                                 bytes_received,
                                 stream_start.elapsed(),
                                 last_chunk_at.elapsed(),
+                                provider_label,
                             )));
                             return;
                         }
@@ -345,23 +393,41 @@ impl CodewhaleClient {
                 }
 
                 loop {
-                    let line = match next_sse_line(&mut buffer, ended) {
-                        Ok(Some(line)) => line,
+                    let data = match next_sse_line(&mut buffer, ended) {
+                        // A blank line ends the event.
+                        Ok(Some(line)) if line.is_empty() => std::mem::take(&mut event_data),
+                        Ok(Some(line)) => {
+                            // `event:` lines are redundant (the data payload
+                            // carries `type`) and comment/heartbeat lines are
+                            // ignorable.
+                            if let Some(value) = extract_sse_data_value(&line)
+                                && let Err(err) = push_sse_event_data(&mut event_data, value)
+                            {
+                                yield Err(anyhow::anyhow!("{err}"));
+                                return;
+                            }
+                            continue;
+                        }
+                        // The final event may arrive without its blank line.
+                        Ok(None) if ended && !event_data.is_empty() => {
+                            std::mem::take(&mut event_data)
+                        }
                         Ok(None) => break,
                         Err(err) => {
                             yield Err(anyhow::anyhow!("{err}"));
                             return;
                         }
                     };
-
-                    // `event:` lines are redundant (the data payload carries
-                    // `type`) and comment/heartbeat lines are ignorable.
-                    let Some(data) = extract_sse_data_value(&line) else {
+                    if data.is_empty() {
                         continue;
-                    };
+                    }
 
-                    match convert_anthropic_sse_data(data) {
+                    match convert_anthropic_sse_data(&data) {
                         Some(Ok(StreamEvent::Error { error })) => {
+                            if suppress_error_details {
+                                yield Err(anyhow::anyhow!("Claude subscription stream failed"));
+                                return;
+                            }
                             let (error_type, message) = anthropic_error_fields(&error);
                             yield Err(anyhow::anyhow!(
                                 "Anthropic stream error ({error_type}): {message}"
@@ -376,7 +442,11 @@ impl CodewhaleClient {
                             }
                         }
                         Some(Err(e)) => {
-                            logging::warn(format!("Failed to parse Anthropic SSE event: {e}"));
+                            if suppress_error_details {
+                                logging::warn("Failed to parse Claude subscription stream event");
+                            } else {
+                                logging::warn(format!("Failed to parse Anthropic SSE event: {e}"));
+                            }
                         }
                         None => {}
                     }
@@ -386,6 +456,12 @@ impl CodewhaleClient {
                     break;
                 }
             }
+            // Only `message_stop` (returned above) or a provider error proves
+            // the response is whole. A bare HTTP EOF is truncation, and ending
+            // the stream quietly would hand the turn a partial answer as done.
+            yield Err(anyhow::anyhow!(
+                "Anthropic Messages stream closed before message_stop"
+            ));
         };
 
         Ok(Box::pin(stream))
@@ -399,14 +475,65 @@ impl CodewhaleClient {
         let response = self
             .send_anthropic_request(&prepared.endpoint.url, &prepared.body)
             .await?;
-        let mut value: Value = response
+        let value: Value = response
             .json()
             .await
             .context("Failed to parse Anthropic Messages response")?;
-        if let Some(usage) = value.get_mut("usage") {
-            *usage = json!(parse_anthropic_usage(usage));
+        decode_anthropic_message(value)
+    }
+}
+
+fn discard_provider_execution_ids(value: &mut Value) {
+    // Shared history retains execution ids on disk. Incoming provider content
+    // cannot choose one, including a value that would not deserialize as the
+    // host field. Live execution must mint its own correlation instead.
+    if let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) {
+        for block in blocks {
+            if let Some(block) = block.as_object_mut() {
+                block.remove("execution_id");
+            }
         }
-        serde_json::from_value(value).context("Failed to decode Anthropic Messages response")
+    }
+}
+
+fn decode_anthropic_message(mut value: Value) -> Result<MessageResponse> {
+    discard_provider_execution_ids(&mut value);
+    if let Some(usage) = value.get_mut("usage") {
+        *usage = json!(parse_anthropic_usage(usage));
+    }
+    normalize_redacted_thinking_blocks(&mut value);
+    serde_json::from_value(value).context("Failed to decode Anthropic Messages response")
+}
+
+/// Rewrite non-stream `redacted_thinking` content blocks into the
+/// provider-neutral shape (`Thinking` with `redacted_data`) before decoding.
+///
+/// The provider-neutral content model has no `redacted_thinking` tag, so an
+/// unknown block type would fail the whole response decode and lose the turn
+/// — including the tool calls. Streaming responses carry the same blocks as
+/// typed `ContentBlockStart::RedactedThinking` events and need no shim.
+/// A block whose `data` is missing or not a string violates the contract;
+/// it is still rewritten (with an empty payload) so the turn decodes and the
+/// failure surfaces at replay with a diagnosable shape instead of as a
+/// whole-response decode error.
+fn normalize_redacted_thinking_blocks(value: &mut Value) {
+    let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for block in content.iter_mut() {
+        if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+            let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+            if data.is_empty() {
+                logging::warn(
+                    "Response carried a redacted thinking block with a missing or non-string payload; capturing it with an empty payload",
+                );
+            }
+            *block = json!({
+                "type": "thinking",
+                "thinking": "",
+                "redacted_data": data,
+            });
+        }
     }
 }
 
@@ -577,18 +704,51 @@ fn assistant_tool_use_ids(message: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Models that reject `temperature` / `top_p` outright (Claude 4.7+).
+/// Models that reject non-default `temperature` / `top_p` outright (every
+/// model released after Opus 4.6). The Messages API reference states those
+/// models "do not support" setting `temperature` / `top_p` beyond their
+/// backwards-compatible defaults (`temperature: 1.0`, `top_p >= 0.99`), and
+/// the migration guides restate it per family: "Setting `temperature`,
+/// `top_p`, or `top_k` to any non-default value on Claude Opus 4.7 and
+/// later models, including Claude Opus 5.5, returns a 400 error". That
+/// covers the Claude 5 generation (`claude-opus-5(-5)`, `claude-sonnet-5(-5)`)
+/// and Haiku 5.5 (which admits only its defaults — `temperature: 1`, a lone
+/// `top_p: 0.99`; `top_p: 1`, any `top_k`, or both params together 400),
+/// besides the Fable/Mythos lines. Dropping the params entirely is always
+/// safe; sending a forbidden one bricks the request. Re-checked 2026-10-08.
 fn anthropic_model_rejects_sampling(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains("opus-4-7")
         || lower.contains("opus-4-8")
+        || ["opus-5", "sonnet-5", "haiku-5"]
+            .iter()
+            .any(|family| lower.contains(family))
         || lower.contains("fable")
         || lower.contains("mythos")
 }
 
 /// Convert the engine's `tool_choice` value (OpenAI-style string or object)
-/// to the Anthropic object form.
-fn anthropic_tool_choice(tool_choice: &Value) -> Value {
+/// to the Anthropic object form. The Messages API tool-use reference lists
+/// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1 as answering `any`/`tool`
+/// with a 400 error, so those models fall back to the server default `auto`
+/// (`none` still works and is passed through unchanged).
+fn anthropic_tool_choice(tool_choice: &Value, model: &str) -> Value {
+    let lower = model.to_ascii_lowercase();
+    let rejects_forced = lower.contains("opus-5-5")
+        || lower.contains("sonnet-5-5")
+        || lower.contains("fable")
+        || lower.contains("mythos");
+    let forced = match tool_choice.as_str() {
+        Some("any" | "required") => true,
+        Some(name) => !matches!(name, "auto" | "none"),
+        None => matches!(
+            tool_choice.get("type").and_then(Value::as_str),
+            Some("any" | "required" | "tool" | "function")
+        ),
+    };
+    if forced && rejects_forced {
+        return json!({ "type": "auto" });
+    }
     match tool_choice.as_str() {
         Some("auto") => json!({ "type": "auto" }),
         Some("none") => json!({ "type": "none" }),
@@ -710,8 +870,20 @@ fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
         ContentBlock::Thinking {
             thinking,
             signature,
+            redacted_data,
             ..
         } => {
+            // A redacted thinking block is provider-encrypted content with no
+            // readable text: replay it byte-exact so the API can decrypt it,
+            // exactly like a signed block. Anthropic requires the complete
+            // unmodified block in tool loops and decrypts it to restore the
+            // turn's reasoning.
+            if let Some(data) = redacted_data {
+                return Some(json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                }));
+            }
             // Anthropic rejects unsigned thinking blocks on replay (and the
             // DeepSeek-era "(reasoning omitted)" placeholders mean nothing to
             // it), so only signed blocks are replayed — verbatim, signature
@@ -737,6 +909,7 @@ fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             let mut value = json!({
                 "type": "tool_result",
@@ -915,11 +1088,11 @@ fn convert_anthropic_sse_usage_event(trimmed: &str) -> Option<Result<StreamEvent
 
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
-            if let Some(usage) = value
-                .get_mut("message")
-                .and_then(|message| message.get_mut("usage"))
-            {
-                *usage = json!(parse_anthropic_usage(usage));
+            if let Some(message) = value.get_mut("message") {
+                discard_provider_execution_ids(message);
+                if let Some(usage) = message.get_mut("usage") {
+                    *usage = json!(parse_anthropic_usage(usage));
+                }
             }
         }
         Some("message_delta") => {
@@ -964,20 +1137,17 @@ fn parse_anthropic_usage(usage: &Value) -> Usage {
         reasoning_tokens: None,
         reasoning_replay_tokens: None,
         server_tool_use: None,
+
+        input_audio_tokens: None,
+        output_audio_tokens: None,
+
+        request_usages: Vec::new(),
     }
 }
 
 /// Extract `error.type` / `error.message` from an Anthropic error envelope
 /// (`{"type":"error","error":{"type":...,"message":...}}`), falling back to
 /// the raw body so nothing is swallowed.
-fn parse_anthropic_error_envelope(raw: &str) -> (String, String) {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return ("unknown".to_string(), raw.to_string());
-    };
-    let error = value.get("error").unwrap_or(&value);
-    anthropic_error_fields(error)
-}
-
 fn anthropic_error_fields(error: &Value) -> (String, String) {
     let error_type = error
         .get("type")
@@ -997,6 +1167,67 @@ mod tests {
     use super::*;
     use codewhale_models::Role;
     use codewhale_models::{CacheControl, Message, SystemBlock, SystemPrompt, Tool};
+
+    #[test]
+    fn provider_messages_cannot_supply_host_execution_identity() {
+        for supplied in [json!("forged-local"), json!({"invalid": "host id"})] {
+            let value = json!({
+                "id": "provider-message", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-6", "stop_reason": "tool_use",
+                "content": [
+                    {"type": "tool_use", "id": "wire-call", "name": "read",
+                     "input": {"execution_id": "ordinary argument"},
+                     "execution_id": supplied,
+                     "caller": {"type": "code_execution", "tool_id": "parent-wire"},
+                     "thought_signature": "provider-signature"},
+                    {"type": "tool_result", "tool_use_id": "wire-call", "content": "result",
+                     "execution_id": supplied},
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            });
+            let decoded = decode_anthropic_message(value.clone()).unwrap();
+            let event = convert_anthropic_sse_data(
+                &json!({
+                    "type": "message_start", "message": value,
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .unwrap();
+            let StreamEvent::MessageStart { message: streamed } = event else {
+                panic!("expected message start")
+            };
+            for message in [decoded, streamed] {
+                let ContentBlock::ToolUse {
+                    id,
+                    input,
+                    execution_id,
+                    caller,
+                    thought_signature,
+                    ..
+                } = &message.content[0]
+                else {
+                    panic!("expected tool use")
+                };
+                assert!(execution_id.is_none());
+                assert_eq!(id, "wire-call");
+                assert_eq!(input["execution_id"], "ordinary argument");
+                assert_eq!(
+                    caller.as_ref().unwrap().tool_id.as_deref(),
+                    Some("parent-wire")
+                );
+                assert_eq!(thought_signature.as_deref(), Some("provider-signature"));
+                assert!(matches!(
+                    &message.content[1],
+                    ContentBlock::ToolResult {
+                        execution_id: None,
+                        ..
+                    }
+                ));
+                assert_eq!(message.usage.input_tokens, 3);
+            }
+        }
+    }
 
     fn request_with(
         model: &str,
@@ -1045,6 +1276,7 @@ mod tests {
         let client = test_client();
         let mut request = request_with("claude-sonnet-4-6", None, None, None);
         let tool_use = |id: &str, path: &str| ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: "read".to_string(),
             input: json!({ "path": path }),
@@ -1052,6 +1284,7 @@ mod tests {
             thought_signature: None,
         };
         let tool_result = |id: &str, content: &str| ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.to_string(),
             content: content.to_string(),
             is_error: None,
@@ -1263,9 +1496,12 @@ mod tests {
         assert!(body.get("thinking").is_none(), "off omits thinking: {body}");
         assert!(body.get("output_config").is_none());
 
-        // Haiku is not thinking-capable: no thinking, no effort.
+        // A model the reviewed catalog does not carry is not thinking-capable:
+        // no thinking, no effort. `claude-3-5-haiku-latest` (and Haiku 4.5,
+        // which the reviewed catalog now marks `reasoning: true`) are not
+        // interchangeable here.
         let body = client.build_anthropic_body(
-            &request_with("claude-haiku-4-5", Some("high"), None, None),
+            &request_with("claude-3-5-haiku-latest", Some("high"), None, None),
             true,
         );
         assert!(body.get("thinking").is_none(), "{body}");
@@ -1373,6 +1609,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_ok".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.txt"}),
@@ -1380,6 +1617,7 @@ mod tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_orphan".to_string(),
                         name: "task".to_string(),
                         input: json!({}),
@@ -1392,6 +1630,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_ok".to_string(),
                     content: "contents".to_string(),
                     is_error: None,
@@ -1402,6 +1641,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "toolu_tail".to_string(),
                     name: "task".to_string(),
                     input: json!({}),
@@ -1663,16 +1903,52 @@ mod tests {
         assert!(body.get("temperature").is_none(), "{body}");
         assert!(body.get("top_p").is_none(), "{body}");
 
+        // The Claude 5 generation and Haiku 5.5 reject sampling too. The
+        // datestamped spelling pins the substring match against snapshot
+        // suffixes.
+        for model in [
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-opus-5-20260101",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+        ] {
+            let body =
+                client.build_anthropic_body(&request_with(model, None, Some(0.7), Some(0.9)), true);
+            assert!(
+                body.get("temperature").is_none() && body.get("top_p").is_none(),
+                "{model} must not receive sampling params: {body}"
+            );
+        }
+
         // Older models accept ONE of temperature / top_p (temperature wins).
+        // The pre-4.7 generations stay ungated, so a future over-broad arm
+        // like `contains("opus-4-")` cannot slip through.
+        for model in ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"] {
+            let body =
+                client.build_anthropic_body(&request_with(model, None, Some(0.7), Some(0.9)), true);
+            assert_eq!(
+                body.get("temperature").and_then(Value::as_f64),
+                Some(f64::from(0.7f32)),
+                "{model} keeps temperature"
+            );
+            assert!(
+                body.get("top_p").is_none(),
+                "{model}: never send both: {body}"
+            );
+        }
         let body = client.build_anthropic_body(
-            &request_with("claude-sonnet-4-6", None, Some(0.7), Some(0.9)),
+            &request_with("claude-sonnet-4-6", None, None, Some(0.9)),
             true,
         );
         assert_eq!(
-            body.get("temperature").and_then(Value::as_f64),
-            Some(f64::from(0.7f32))
+            body.get("top_p").and_then(Value::as_f64),
+            Some(f64::from(0.9f32)),
+            "top_p alone passes through: {body}"
         );
-        assert!(body.get("top_p").is_none(), "never send both: {body}");
     }
 
     #[test]
@@ -1694,13 +1970,16 @@ mod tests {
                         thinking: "signed reasoning".to_string(),
                         signature: Some("sig-abc".to_string()),
                         state: None,
+                        redacted_data: None,
                     },
                     ContentBlock::Thinking {
                         thinking: "(reasoning omitted)".to_string(),
                         signature: None,
                         state: None,
+                        redacted_data: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_1".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.txt"}),
@@ -1712,6 +1991,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_1".to_string(),
                     content: "contents".to_string(),
                     is_error: None,
@@ -1737,6 +2017,243 @@ mod tests {
             body["messages"][2]["content"][0]["type"].as_str(),
             Some("tool_result")
         );
+    }
+
+    #[test]
+    fn body_replays_redacted_thinking_blocks_byte_exact() {
+        let client = test_client();
+        let mut request = request_with("claude-sonnet-4-6", None, None, None);
+        request.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "do the thing".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: None,
+                        state: None,
+                        redacted_data: Some("ENC_REDACTED_PAYLOAD".to_string()),
+                    },
+                    ContentBlock::ToolUse {
+                        execution_id: None,
+                        id: "toolu_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "a.txt"}),
+                        caller: None,
+                        thought_signature: None,
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "contents".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+        ];
+
+        let body = client.build_anthropic_body(&request, true);
+        let assistant = &body["messages"][1]["content"];
+        assert_eq!(assistant.as_array().map(Vec::len), Some(2));
+        assert_eq!(assistant[0]["type"].as_str(), Some("redacted_thinking"));
+        assert_eq!(assistant[0]["data"].as_str(), Some("ENC_REDACTED_PAYLOAD"));
+        assert_eq!(assistant[1]["type"].as_str(), Some("tool_use"));
+    }
+
+    #[test]
+    fn non_native_gateways_never_receive_redacted_thinking_blocks() {
+        // Conservative withholding: the docs promise nothing about
+        // third-party gateways understanding `redacted_thinking`, and a
+        // strict Messages-compatible gateway would reject the unknown type.
+        let client = anthropic_test_client(Some("https://gateway.example.com/anthropic"));
+        let mut request = request_with("claude-sonnet-4-6", None, None, None);
+        request.messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: None,
+                    state: None,
+                    redacted_data: Some("ENC_REDACTED".to_string()),
+                },
+                ContentBlock::ToolUse {
+                    execution_id: None,
+                    id: "toolu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({}),
+                    caller: None,
+                    thought_signature: None,
+                },
+            ],
+        }];
+
+        let body = client.build_anthropic_body(&request, true);
+        let wire = body.to_string();
+        assert!(
+            !wire.contains("redacted_thinking") && !wire.contains("ENC_REDACTED"),
+            "non-native gateway must not receive redacted blocks: {body}"
+        );
+        let assistant = &body["messages"][0]["content"];
+        assert_eq!(assistant.as_array().map(Vec::len), Some(1));
+
+        // First-party Anthropic keeps the block: it can decrypt it.
+        let native = test_client().build_anthropic_body(&request, true);
+        assert!(
+            native.to_string().contains("ENC_REDACTED"),
+            "first-party route must replay redacted blocks: {native}"
+        );
+    }
+
+    #[test]
+    fn gateway_withhold_drops_messages_that_only_carried_redacted_blocks() {
+        // A redacted-only assistant message (reachable from foreign or
+        // imported sessions; the live engine never persists a reasoning-only
+        // turn) must not go out as `content: []` after the withhold — that
+        // is exactly the every-retry 400 this withhold exists to prevent.
+        // Dropping the message is safe: no `tool_use` means no dangling
+        // `tool_result`.
+        let client = anthropic_test_client(Some("https://gateway.example.com/anthropic"));
+        let mut request = request_with("claude-sonnet-4-6", None, None, None);
+        request.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "do the thing".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: None,
+                    state: None,
+                    redacted_data: Some("ENC_REDACTED_ONLY".to_string()),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "continue".to_string(),
+                    cache_control: None,
+                }],
+            },
+        ];
+
+        let body = client.build_anthropic_body(&request, true);
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            2,
+            "the redacted-only assistant message must be dropped, not emptied: {body}"
+        );
+        assert_eq!(messages[0]["role"].as_str(), Some("user"));
+        assert_eq!(messages[1]["role"].as_str(), Some("user"));
+        assert!(
+            !body.to_string().contains("ENC_REDACTED_ONLY"),
+            "the payload must stay withheld: {body}"
+        );
+
+        // First-party Anthropic keeps the message and its block.
+        let native = test_client().build_anthropic_body(&request, true);
+        assert_eq!(
+            native["messages"].as_array().map(Vec::len),
+            Some(3),
+            "native routes keep the redacted-only turn: {native}"
+        );
+    }
+
+    #[test]
+    fn sse_redacted_content_block_start_decodes_through_the_stream_decoder() {
+        // The exact event whose decode used to drop the turn's block: a
+        // `redacted_thinking` content_block_start through the SSE decoder.
+        // The contract-violating no-data form must still decode (empty
+        // payload + capture warn) instead of failing the event and silently
+        // losing the block.
+        use codewhale_models::ContentBlockStart;
+
+        let decode = |line: &str| {
+            convert_anthropic_sse_data(line)
+                .expect("content_block_start must be recognized")
+                .expect("decode must succeed")
+        };
+
+        let event = decode(
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"ENC"}}"#,
+        );
+        match event {
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlockStart::RedactedThinking { data },
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(data, "ENC");
+            }
+            other => panic!("unexpected event for redacted start: {other:?}"),
+        }
+
+        let malformed = decode(
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking"}}"#,
+        );
+        match malformed {
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockStart::RedactedThinking { data },
+                ..
+            } => assert_eq!(data, "", "missing data must default to an empty payload"),
+            other => panic!("unexpected event for malformed redacted start: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_stream_redacted_thinking_blocks_decode_into_redacted_data() {
+        let payload = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                { "type": "redacted_thinking", "data": "ENC_FROM_API" },
+                { "type": "text", "text": "answer" }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        });
+
+        // An unknown block tag used to fail the whole response decode; the
+        // shim must rewrite it into the provider-neutral shape instead.
+        let mut value = payload;
+        if let Some(usage) = value.get_mut("usage") {
+            *usage = json!(parse_anthropic_usage(usage));
+        }
+        normalize_redacted_thinking_blocks(&mut value);
+        let response: MessageResponse = serde_json::from_value(value)
+            .expect("redacted_thinking must not fail the response decode");
+        assert_eq!(response.content.len(), 2);
+        match &response.content[0] {
+            ContentBlock::Thinking {
+                thinking,
+                redacted_data,
+                ..
+            } => {
+                assert_eq!(redacted_data.as_deref(), Some("ENC_FROM_API"));
+                assert!(thinking.is_empty());
+            }
+            other => panic!("expected thinking block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1932,19 +2449,6 @@ mod tests {
         assert_eq!(usage.prompt_cache_hit_tokens, Some(18000));
         assert_eq!(usage.prompt_cache_miss_tokens, Some(3));
         assert_eq!(usage.prompt_cache_write_tokens, Some(2045));
-    }
-
-    #[test]
-    fn error_envelope_parses_type_and_message() {
-        let (error_type, message) = parse_anthropic_error_envelope(
-            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"},"request_id":"req_1"}"#,
-        );
-        assert_eq!(error_type, "rate_limit_error");
-        assert_eq!(message, "Too many requests");
-
-        let (error_type, message) = parse_anthropic_error_envelope("upstream blew up");
-        assert_eq!(error_type, "unknown");
-        assert_eq!(message, "upstream blew up");
     }
 
     #[test]
@@ -2155,6 +2659,140 @@ mod tests {
         assert!(saw_stop, "message_stop should arrive through the seam");
     }
 
+    async fn collect_anthropic_stream(body: &'static str) -> Vec<Result<StreamEvent>> {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let client = deepseek_test_client(&server.uri());
+        let stream = client
+            .handle_anthropic_stream(
+                &client
+                    .prepare_outbound_request(request_with("deepseek-v4", None, None, None), true)
+                    .expect("anthropic request prepares"),
+            )
+            .await
+            .expect("stream opens");
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
+            .await
+            .expect("stream ends")
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_joins_multiline_data_fields_into_one_event() {
+        use codewhale_models::Delta;
+        // One JSON payload split across two `data:` fields of a single event.
+        let events = collect_anthropic_stream(concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\n",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"joined\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Ok(StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                }) if text == "joined"
+            )),
+            "the split event was lost: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::MessageStop))));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_eof_without_message_stop_is_an_error() {
+        let events = collect_anthropic_stream(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        )
+        .await;
+        let last = events.last().expect("the delta and a terminal item");
+        assert!(
+            last.as_ref()
+                .is_err_and(|error| error.to_string().contains("closed before message_stop")),
+            "a truncated stream must not end quietly: {events:?}"
+        );
+    }
+
+    /// Fault injection (#6184): a provider that answers the headers and then
+    /// sends nothing fails the stream at the first-byte bound with a
+    /// distinct error and a `crashes/` stall record, instead of holding the
+    /// turn for the full idle budget.
+    #[tokio::test]
+    async fn stall_first_byte_timeout_fails_stream_and_records_stall() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::core::engine::turn_heartbeat::set_test_stall_record_dir(Some(
+            dir.path().to_path_buf(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 64 * 1024];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("headers");
+            // Hold the connection open with no body bytes.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(socket);
+        });
+
+        let mut client = deepseek_test_client(&base_url);
+        client.stream_idle_timeout = std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let mut stream = client
+            .handle_anthropic_stream(
+                &client
+                    .prepare_outbound_request(request_with("deepseek-v4", None, None, None), true)
+                    .expect("anthropic request prepares"),
+            )
+            .await
+            .expect("headers arrive");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => continue,
+                    None => panic!("stream ended without the first-byte error"),
+                }
+            }
+        })
+        .await
+        .expect("first-byte bound fires");
+        assert!(error.to_string().contains("first-byte timeout"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let records: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("record dir")
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].contains("first byte"), "{}", records[0]);
+        server.abort();
+        crate::core::engine::turn_heartbeat::set_test_stall_record_dir(None);
+    }
+
     #[tokio::test]
     async fn anthropic_stream_open_error_is_not_retried() {
         use wiremock::matchers::{method, path};
@@ -2184,11 +2822,79 @@ mod tests {
             Ok(_) => panic!("auth errors must fail fast"),
             Err(err) => err,
         };
-        let text = err.to_string();
+        // Typed through the shared classifier, provider message kept.
         assert!(
-            text.contains("HTTP 401") && text.contains("authentication_error"),
-            "error envelope should be preserved: {text}"
+            matches!(
+                err.chain()
+                    .find_map(|cause| cause.downcast_ref::<crate::llm_client::LlmError>()),
+                Some(crate::llm_client::LlmError::AuthenticationError(_))
+            ),
+            "a 401 must stay a typed authentication error: {err:#}"
         );
+        assert!(format!("{err:#}").contains("bad key"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rate_limit_is_retried_honoring_retry_after() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for force_http1 in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_string(
+                        "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                    ),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "text/event-stream")
+                        .set_body_string("data: {\"type\":\"message_stop\"}\n\n"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut client = deepseek_test_client(&server.uri());
+            client.force_http1 = force_http1;
+            client.stream_open_timeout = std::time::Duration::from_millis(250);
+            client.retry.enabled = true;
+            client.retry.max_retries = 2;
+            client.retry.initial_delay = 0.0;
+            client.retry.max_delay = 0.0;
+            let started = std::time::Instant::now();
+            let stream = client
+                .handle_anthropic_stream(
+                    &client
+                        .prepare_outbound_request(
+                            request_with("deepseek-v4", None, None, None),
+                            true,
+                        )
+                        .expect("anthropic request prepares"),
+                )
+                .await;
+            assert!(
+                stream.is_ok(),
+                "a 429 before the stream body must be retried, not surfaced"
+            );
+            // The backoff is configured to zero, so only the provider's
+            // `Retry-After: 1` can account for the wait before the retry.
+            assert!(
+                started.elapsed() >= std::time::Duration::from_millis(900),
+                "the retry must wait out Retry-After, waited {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     /// A `system`-role history message — what a compaction summary, a branch

@@ -186,8 +186,9 @@ impl Engine {
         let session = self.preview_session_facts(&inputs);
 
         // Mirror terminal continuation gates before request construction.
-        // Token budgets are telemetry-only in unbounded goal mode, so an
-        // active goal remains previewable after crossing or lowering a budget.
+        // Token budgets are telemetry-only unless `[goal]
+        // enforce_token_budget` is set; only then does an exhausted budget
+        // make the next goal request unavailable, as the live gates stop.
         let goal_budget_exhausted = match self.config.goal_state.lock() {
             Ok(state) => {
                 let snapshot = state.snapshot();
@@ -464,7 +465,7 @@ impl Engine {
                 system_prompt.as_ref(),
             );
 
-        let request = prepare_primary_turn_request(PrimaryTurnRequest {
+        let mut request = prepare_primary_turn_request(PrimaryTurnRequest {
             model: model.clone(),
             messages: outbound_messages,
             max_tokens: effective_max_output_tokens_for_route(provider, &model, limits),
@@ -473,9 +474,24 @@ impl Engine {
             tool_choice: tool_choice.clone(),
             reasoning_effort: effective_reasoning_effort,
         });
+        let (image_input, image_cap) = self.request_image_policy(
+            route.identity.key.as_str(),
+            &model,
+            route_context.capabilities.image_input,
+        );
+        crate::image_attach::strip_images_when_unsupported(
+            &mut request.messages,
+            image_input,
+            &model,
+        );
+        if let Some(cap) = image_cap {
+            crate::image_attach::cap_request_images(&mut request.messages, cap);
+        }
 
         let prepared = match route.client.prepare_outbound_request(request, true) {
-            Ok(prepared) => prepared.with_route_id(route.identity.exact_id.clone()),
+            Ok(prepared) => {
+                prepared.with_route_id(route.identity.persisted_id().map(str::to_string))
+            }
             Err(error) => {
                 let detail = super::turn_loop::preview_request_error_user_message(
                     &self.config.locale_tag,
@@ -546,7 +562,7 @@ impl Engine {
             context_limit_source: route.context_window.source,
             route_input_limit_tokens: limits.and_then(|limits| limits.input_tokens),
             route_output_limit_tokens: limits.and_then(|limits| limits.output_tokens),
-            billing: preview_billing_facts(&route.config, provider, &base_url),
+            billing: preview_billing_facts(&route.config, &route.identity, &base_url),
             routing_source: routing_source.label().to_string(),
             auto_route_source: auto_route_source.as_deref().map(SafeLabel::phrase),
         };
@@ -605,6 +621,20 @@ impl Engine {
         compaction: &crate::compaction::CompactionConfig,
     ) -> Vec<&'static str> {
         let mut reasons = Vec::new();
+        if crate::profile_constitution::account_is_present(
+            self.api_config.account_profile.as_deref(),
+        )
+        .unwrap_or(true)
+            || self
+                .constitution_block
+                .as_deref()
+                .is_some_and(|block| block.starts_with("Account profile constitution,"))
+        {
+            reasons.push("the account constitution is resolved at next-turn admission; preview its guidance in account settings");
+        } else if crate::prompts::load_user_constitution_block() != self.constitution_block {
+            reasons
+                .push("the local constitution changed and will be recorded at next-turn admission");
+        }
 
         if !self.pending_lsp_blocks.is_empty() {
             reasons.push("pending LSP diagnostics would be injected as a synthetic message");
@@ -631,7 +661,7 @@ impl Engine {
         if crate::compaction::compaction_pressure_reached(messages, system_prompt, compaction) {
             let prepared = self.prepare_compaction_envelope(compaction.clone());
             if should_compact(messages, system_prompt, &prepared) {
-                reasons.push("auto-compaction would rewrite the conversation first");
+                reasons.push("making room would summarize the conversation first");
             }
         }
 
@@ -684,8 +714,7 @@ impl Engine {
         model: &str,
     ) -> PromptProvenance {
         let base = crate::prompts::effective_base_prompt_text();
-        let configured =
-            crate::prompts::compose_default_static_layers(crate::prompts::Personality::Calm, model);
+        let configured = crate::prompts::compose_default_static_layers(model);
 
         let assembly = if effective.trim().is_empty() {
             SystemPromptAssembly::None
@@ -712,13 +741,15 @@ impl Engine {
 /// and sidebar read. Every label is a compile-time constant.
 fn preview_billing_facts(
     config: &crate::config::Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     base_url: &str,
 ) -> BillingFacts {
-    if let Some(surface) = crate::pricing::billing_surface_for_route(provider, Some(base_url)) {
+    if let Some(surface) =
+        crate::pricing::billing_surface_for_route(identity.provider, Some(base_url))
+    {
         return BillingFacts::Surface { surface };
     }
-    match crate::route_billing::for_route(config, provider) {
+    match crate::route_billing::for_route(config, identity) {
         crate::route_billing::BillingPresentation::Metered => BillingFacts::Metered,
         crate::route_billing::BillingPresentation::Subscription(plan) => {
             BillingFacts::Subscription { plan }

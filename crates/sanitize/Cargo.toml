@@ -1,0 +1,17 @@
+[package]
+name = "codewhale-sanitize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure redaction and output sanitization without credential storage"
+
+[lints]
+workspace = true
+
+[dependencies]
+icu_properties = { version = "2.2", default-features = false, features = ["compiled_data"] }
+regex = "1.11"
+serde_json = { workspace = true, features = ["preserve_order"] }
+url = "2.5"

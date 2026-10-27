@@ -117,7 +117,7 @@ fn events() -> CommandResult {
         ),
         (
             HookEvent::ModeChange,
-            "fires on Plan/Act/Operate transitions",
+            "fires on Plan/Work/Operate transitions",
         ),
         (
             HookEvent::OnError,
@@ -339,7 +339,7 @@ mod tests {
             memory_path: tmpdir.path().join("memory.md"),
             notes_path: tmpdir.path().join("notes.txt"),
             mcp_config_path: tmpdir.path().join("mcp.json"),
-            ..crate::test_support::test_tui_options(tmpdir.path())
+            ..crate::tui::test_support::test_tui_options(tmpdir.path())
         };
         App::new(options, &Config::default())
     }

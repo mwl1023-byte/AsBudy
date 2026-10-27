@@ -35,7 +35,7 @@ Underwater's continuous water column is authored by `OceanRamp::for_theme` in
 `crates/tui/src/tui/ocean.rs`: dark navy at the top, deeper near the composer.
 Its existing motion policy preserves reduced/still modes and semantic surfaces.
 
-For the charcoal alternative, the source of truth is `crates/palette/src/tokens.rs` and the
+For the charcoal alternative, the source of truth is `crates/palette/src/rgb.rs` and the
 `SHORELINE_UI_THEME` / `SHORELINE_LIGHT_UI_THEME` mappings in
 `crates/palette/src/themes.rs`. The dark palette is unchanged by the
 Workbench index pass:
@@ -151,9 +151,9 @@ flow. The MCP summary opens the existing manager by mouse or keyboard. A
 problem row inserts its stated remedy into the composer so the user can see
 it before submission. No separate command or session authority is introduced.
 
-The composer outline uses action blue only while the composer owns focus.
-Selecting a home action or opening another surface returns it to the quiet
-border tone. Permission and mode retain their own footer status instead of
+The composer outline uses action blue only while the composer owns focus,
+or the chat's own `/color` when one is set. Selecting a home action or
+opening another surface returns it to the quiet border tone. Permission and mode retain their own footer status instead of
 being repeated in a multicolor composer outline. Model metadata remains
 secondary to the message and its controls.
 

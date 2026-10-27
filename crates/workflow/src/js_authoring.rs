@@ -453,7 +453,6 @@ mod tests {
     use super::*;
     use crate::{
         AgentType, GateKind, GateOn, GateOnFail, GateOutcome, GateState, LaneGateBoard, TaskMode,
-        WorkflowReplayExecutor,
     };
 
     #[test]
@@ -635,24 +634,20 @@ workflow({
         let WorkflowNode::Sequence(sequence) = &workflow.nodes[0] else {
             panic!("acceptance fixture should begin with one ordered role chain");
         };
-        let expected_children = [
-            ("explore", 6, 480, 96_000),
-            ("implement", 4, 420, 72_000),
-            ("reviewer", 4, 420, 72_000),
-            ("test", 4, 420, 72_000),
-            ("release_lead", 3, 300, 48_000),
-        ];
-        let mut aggregate_token_cap = 0_u64;
+        let expected_children = ["explore", "implement", "reviewer", "test", "release_lead"];
         assert_eq!(sequence.children.len(), expected_children.len());
-        for (node, (expected_role, max_steps, timeout_secs, max_tokens)) in
-            sequence.children.iter().zip(expected_children)
-        {
+        for (node, expected_role) in sequence.children.iter().zip(expected_children) {
             let WorkflowNode::Leaf(leaf) = node else {
                 panic!("acceptance role chain must contain only agent leaves");
             };
             assert_eq!(leaf.role.as_deref(), Some(expected_role));
             assert_eq!(leaf.mode, TaskMode::ReadOnly);
             assert!(!leaf.permissions.allow_write);
+            // No explicit `allowed_tools` anywhere: the read-only lowering
+            // alone scopes the source-gathering explore role, and its
+            // catalog-visible surface (tool_search + deferred grep_files) is
+            // pinned from the TUI side (scout_surface_keeps_tool_search_
+            // grep_files_activation_path).
             assert!(leaf.permissions.allowed_tools.is_empty());
             assert_eq!(
                 leaf.permissions.deny_all_tools,
@@ -673,12 +668,17 @@ workflow({
             );
             if expected_role == "explore" {
                 assert!(
-                    leaf.prompt.contains("exactly one `File` call")
-                        && leaf.prompt.contains("Do not call `File` more than once")
-                        && leaf
-                            .prompt
-                            .contains("do not use any action except `search_content`"),
-                    "the scout must finish discovery in one bounded tool round"
+                    leaf.prompt.contains("use `tool_search` with")
+                        && leaf.prompt.contains("Use `grep_files` with")
+                        && leaf.prompt.contains(
+                            "the content-search tool is deferred, so this activation is required before it can be called"
+                        ),
+                    "the scout must activate the deferred content-search tool before searching with it"
+                );
+                assert!(
+                    leaf.prompt
+                        .contains("Read and search these files as needed"),
+                    "discovery must be driven by missing evidence"
                 );
                 assert_eq!(
                     leaf.file_scope
@@ -689,16 +689,24 @@ workflow({
                         "fleets/stopship.toml",
                         "crates/cli/src/lib.rs",
                         "crates/workflow/src/role_resolve.rs",
-                        "crates/tui/src/tools/workflow.rs",
+                        "crates/tui/src/tools/workflow/mod.rs",
                         "crates/lane/src/runtime.rs",
                     ],
                     "the scout grep must not include its own authored prompt"
                 );
+                let repository_root =
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                for path in &leaf.file_scope {
+                    assert!(
+                        repository_root.join(path).is_file(),
+                        "scout evidence path must exist: {path}"
+                    );
+                }
                 assert!(
                     leaf.prompt.contains(
-                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`, `crates/lane/src/runtime.rs`]"
+                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow/mod.rs`, `crates/lane/src/runtime.rs`]"
                     ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
-                    "the one File search must constrain the actual tool input, not only File scope metadata"
+                    "the grep_files search must constrain the actual tool input, not only file scope metadata"
                 );
                 assert!(
                     leaf.prompt.contains("if you can populate all seven")
@@ -728,43 +736,24 @@ workflow({
                     "fleets/stopship.toml",
                     "crates/cli/src/lib.rs",
                     "crates/workflow/src/role_resolve.rs",
-                    "crates/tui/src/tools/workflow.rs",
+                    "crates/tui/src/tools/workflow/mod.rs",
                     "crates/lane/src/runtime.rs",
                 ],
                 "every acceptance role must carry the same promoted evidence boundary"
             );
-            assert_eq!(leaf.budget.max_steps, Some(max_steps), "{expected_role}");
-            let response_budget = match max_steps {
-                6 => "at most six model responses",
-                4 => "at most four model responses",
-                3 => "at most three model responses",
-                _ => unreachable!("unexpected stopship model-response budget"),
-            };
+            assert_eq!(leaf.budget.max_steps, None, "{expected_role}");
+            assert_eq!(leaf.budget.timeout_secs, None, "{expected_role}");
+            assert_eq!(leaf.budget.max_tokens, None, "{expected_role}");
+            assert!(!leaf.prompt.contains("at most"), "{expected_role}");
             assert!(
-                leaf.prompt.contains(response_budget) && leaf.prompt.contains("with no tool calls"),
-                "{expected_role} must reserve a response for its explicit verdict"
-            );
-            assert_eq!(
-                leaf.budget.timeout_secs,
-                Some(timeout_secs),
+                !leaf.prompt.contains("reserve the verdict"),
                 "{expected_role}"
             );
-            assert_eq!(leaf.budget.max_tokens, Some(max_tokens), "{expected_role}");
-            assert!(
-                max_tokens < u64::from(max_steps) * 24_000,
-                "{expected_role} verdict reserve must not raise its token ceiling"
-            );
-            aggregate_token_cap = aggregate_token_cap.saturating_add(max_tokens);
             assert!(
                 leaf.profile.is_none(),
                 "Fleet must resolve the declared role"
             );
         }
-        assert_eq!(
-            aggregate_token_cap, 360_000,
-            "the fixture must stay globally bounded when no shared override is supplied"
-        );
-
         let expected_gates = [
             ("explore", Some("implement"), "source_evidence"),
             ("implement", Some("reviewer"), "verification_plan"),
@@ -879,20 +868,32 @@ workflow({
     }
 
     #[test]
-    fn javascript_example_compiles_and_replays_with_mock_trace() {
+    fn javascript_example_compiles_to_validated_ir() {
         let source = include_str!("../../../workflows/issue_audit.workflow.js");
         let workflow =
             compile_javascript_workflow("issue_audit.workflow.js", source).expect("compile");
-        let trace = crate::WorkflowReplayTrace {
-            trace_id: "empty".to_string(),
-            leaf_records: Vec::new(),
-            control_records: Vec::new(),
+
+        workflow
+            .validate_for_fleet()
+            .expect("example lowers to IR that passes Fleet validation");
+        assert_eq!(workflow.id.as_deref(), Some("issue-audit-js"));
+        assert_eq!(workflow.nodes.len(), 2, "{:#?}", workflow.nodes);
+        let WorkflowNode::BranchSet(branch) = &workflow.nodes[0] else {
+            panic!("first node should be the parallel audit branch");
         };
-
-        let replayed = WorkflowReplayExecutor::new(trace)
-            .run(&workflow)
-            .expect("replay executor should accept validated JS IR");
-
-        assert_eq!(replayed.status, crate::WorkflowRunStatus::ReplayDiverged);
+        let leaf_ids: Vec<&str> = branch
+            .children
+            .iter()
+            .map(|child| match child {
+                WorkflowNode::Leaf(leaf) => leaf.id.as_str(),
+                other => panic!("audit branch child should be an agent leaf: {other:?}"),
+            })
+            .collect();
+        assert_eq!(leaf_ids, ["code-audit", "test-audit", "docs-audit"]);
+        let WorkflowNode::Reduce(reduce) = &workflow.nodes[1] else {
+            panic!("second node should reduce the audit findings");
+        };
+        assert_eq!(reduce.id, "synthesize-release-risk");
+        assert_eq!(reduce.inputs, leaf_ids);
     }
 }

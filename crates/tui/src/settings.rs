@@ -20,7 +20,7 @@ use codewhale_palette::{normalize_hex_rgb_color, normalize_theme_setting};
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 
 /// Fresh terminal installs and explicit theme resets share one default.
-pub(crate) const DEFAULT_TUI_THEME: &str = "underwater";
+pub(crate) use codewhale_config::settings_schema::DEFAULT_TUI_THEME;
 
 /// Smallest Top work surface that can show its divider plus the compact
 /// goal / to-do / Agent projection without turning the rail into invisible
@@ -254,6 +254,8 @@ pub struct Settings {
     pub(crate) auto_compact_explicit: bool,
     /// Reduce status noise and collapse details more aggressively
     pub calm_mode: bool,
+    /// Use the pet as the main view on the next launch.
+    pub pet_mode: bool,
     /// Dense tool-run collapse mode: compact, expanded, or calm.
     pub tool_collapse_mode: String,
     /// Reduce decorative motion. This must never synthesize model text speed;
@@ -373,7 +375,7 @@ pub struct Settings {
     pub composer_vim_mode: String,
     /// Transcript spacing rhythm: compact, comfortable, spacious
     pub transcript_spacing: String,
-    /// Default mode: "agent" (Act), "plan", or "operate". Legacy permission
+    /// Default mode: "agent" (Work), "plan", or "operate". Legacy permission
     /// shorthands are accepted for migration but never advertised as modes.
     pub default_mode: String,
     /// Legacy sidebar width as percentage of terminal width. Load-only
@@ -431,9 +433,10 @@ pub struct Settings {
     /// Archived provider model choices used only by the config selection
     /// migration. Preserve them on unrelated settings saves until migrated.
     pub provider_models: Option<std::collections::HashMap<String, String>>,
-    /// Provider-scoped model IDs intentionally enabled for the ordinary model
-    /// picker. Missing on older files; current and saved provider choices are
-    /// seeded at load time so the migration is additive and non-breaking.
+    /// Legacy additive picker list written by older builds on every model
+    /// switch. Nothing reads it any more (#6533): the picker ranks by recent
+    /// use instead. Parsed and preserved only so old files load and survive
+    /// unrelated saves until a cleanup removes the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_models: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Exact provider/model tuples pinned to the top of model choosers, in
@@ -540,6 +543,7 @@ impl Default for Settings {
             auto_compact_explicit: false,
             // #4095: default presentation is compact/calm; verbose detail is opt-in.
             calm_mode: true,
+            pet_mode: false,
             tool_collapse_mode: "compact".to_string(),
             low_motion: false,
             load_error: None,
@@ -581,7 +585,7 @@ impl Default for Settings {
             composer_border: true,
             composer_multiline_mode: false,
             composer_vim_mode: "normal".to_string(),
-            transcript_spacing: "comfortable".to_string(),
+            transcript_spacing: "spacious".to_string(),
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
             sidebar_focus: "auto".to_string(),
@@ -649,6 +653,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "agents" => "agents",
         "background" => "background",
+        "terminal" => "terminal",
         "files" => "files",
         "notepad" => "notepad",
         "context" => "context",
@@ -1427,13 +1432,14 @@ impl Settings {
     /// match arm below. `None` means `set()` rejects the spelling, so the
     /// ledger never learns it. Keep in sync with the arms — the
     /// `set_marks_session_provenance` test enforces it per spelling.
-    fn canonical_key(key: &str) -> Option<&'static str> {
+    pub(crate) fn canonical_key(key: &str) -> Option<&'static str> {
         Some(match key {
             "auto_compact" | "compact" => "auto_compact",
             "auto_compact_threshold" | "auto_compact_threshold_percent" => {
                 "auto_compact_threshold_percent"
             }
             "calm_mode" | "calm" => "calm_mode",
+            "pet_mode" => "pet_mode",
             "tool_collapse" | "tool_collapse_mode" | "collapse" => "tool_collapse",
             "low_motion" | "motion" => "low_motion",
             "fancy_animations" | "fancy" | "animations" => "fancy_animations",
@@ -1503,6 +1509,9 @@ impl Settings {
             "calm_mode" | "calm" => {
                 self.calm_mode = parse_bool(value)?;
             }
+            "pet_mode" => {
+                self.pet_mode = parse_bool(value)?;
+            }
             "tool_collapse" | "tool_collapse_mode" | "collapse" => {
                 let normalized = normalize_tool_collapse_mode(value);
                 if !matches!(normalized, "compact" | "expanded" | "calm") {
@@ -1548,6 +1557,7 @@ impl Settings {
                     "tasks"
                         | "agents"
                         | "background"
+                        | "terminal"
                         | "files"
                         | "notepad"
                         | "context"
@@ -1557,7 +1567,7 @@ impl Settings {
                         | "pinned"
                 ) {
                     anyhow::bail!(
-                        "Failed to update setting: invalid workbar panel '{value}'. Expected: tasks, agents, background, files, notepad, context, git, or price."
+                        "Failed to update setting: invalid workbar panel '{value}'. Expected: tasks, agents, background, terminal, files, notepad, context, git, or price."
                     );
                 }
                 self.rail_panel = normalize_rail_panel(&normalized).to_string();
@@ -1694,14 +1704,14 @@ impl Settings {
                 self.workspace_follow_symlinks = parse_bool(value)?;
             }
             "default_mode" | "mode" => {
-                // Act (wire: agent), Plan, and Operate are valid startup modes.
+                // Work (wire: agent), Plan, and Operate are valid startup modes.
                 // yolo remains a permission-migration alias, not a mode write.
                 self.default_mode = match value.trim().to_ascii_lowercase().as_str() {
                     "agent" | "normal" | "act" | "work" | "edit" => "agent".to_string(),
                     "plan" => "plan".to_string(),
                     "operate" | "operation" | "ops" => "operate".to_string(),
                     _ => anyhow::bail!(
-                        "Failed to update setting: invalid mode '{value}'. Expected: act (agent), plan, or operate."
+                        "Failed to update setting: invalid mode '{value}'. Expected: work (agent), plan, or operate."
                     ),
                 };
             }
@@ -1794,113 +1804,290 @@ impl Settings {
     }
 
     /// Get all settings as a displayable string
+    /// Test-only whole-report renderer; the command renders from [`Self::command_report`].
+    #[cfg(test)]
     pub fn display(&self, locale: codewhale_localization::Locale) -> String {
         use codewhale_localization::{MessageId, tr};
+        let report = self.command_report();
         let mut lines = Vec::new();
         lines.push(tr(locale, MessageId::SettingsTitle).to_string());
         lines.push("─────────────────────────────".to_string());
-        lines.push(format!("  auto_compact:       {}", self.auto_compact));
-        lines.push(format!(
-            "  auto_compact_pct:   {:.0}",
-            self.auto_compact_threshold_percent
-        ));
-        lines.push(format!("  calm_mode:          {}", self.calm_mode));
-        lines.push(format!("  tool_collapse:      {}", self.tool_collapse_mode));
-        lines.push(format!("  low_motion:         {}", self.low_motion));
-        lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
-        lines.push(format!("  focus_texture:      {}", self.focus_texture));
-        lines.push(format!(
-            "  work_surface:       {}",
-            self.work_surface_placement
-        ));
-        lines.push(format!(
-            "  work_top_height:    {}",
-            self.work_surface_top_height
-        ));
-        lines.push(format!(
-            "  work_side_width:    {}",
-            self.work_surface_side_width
-        ));
-        lines.push(format!("  rail_panel:         {}", self.rail_panel));
-        lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
-        lines.push(format!(
-            "  paste_burst_detect: {}",
-            self.paste_burst_detection
-        ));
-        lines.push(format!("  mention_menu_limit: {}", self.mention_menu_limit));
-        lines.push(format!("  mention_walk_depth: {}", self.mention_walk_depth));
-        lines.push(format!(
-            "  mention_behavior:   {}",
-            self.mention_menu_behavior
-        ));
-        lines.push(format!("  show_thinking:      {}", self.show_thinking));
-        lines.push(format!(
-            "  thinking_expanded:   {}",
-            self.thinking_default_expanded
-        ));
-        lines.push(format!(
-            "  thinking_preview:    {}",
-            self.thinking_preview_lines
-        ));
-        lines.push(format!("  thinking_highlight: {}", self.thinking_highlight));
-        lines.push(format!(
-            "  help_expand_groups:  {}",
-            self.help_expand_groups
-        ));
-        lines.push(format!("  pin_last_prompt:    {}", self.pin_last_prompt));
-        lines.push(format!("  contextual_tips:    {}", self.contextual_tips));
-        lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
-        lines.push(format!("  inline_diffs:      {}", self.inline_diffs));
-        lines.push(format!("  locale:            {}", self.locale));
-        lines.push(format!("  theme:              {}", self.theme));
-        lines.push(format!(
-            "  background_color:   {}",
-            self.background_color.as_deref().unwrap_or("(default)")
-        ));
-        lines.push(format!("  composer_density:   {}", self.composer_density));
-        lines.push(format!("  composer_border:    {}", self.composer_border));
-        lines.push(format!(
-            "  composer_multiline_mode: {}",
-            self.composer_multiline_mode
-        ));
-        lines.push(format!("  composer_vim_mode:  {}", self.composer_vim_mode));
-        lines.push(format!("  transcript_spacing: {}", self.transcript_spacing));
-        lines.push(format!("  status_indicator:   {}", self.status_indicator));
-        lines.push(format!(
-            "  synchronized_output: {}",
-            self.synchronized_output
-        ));
-        lines.push(format!(
-            "  workspace_follow_symlinks: {}",
-            self.workspace_follow_symlinks
-        ));
-        lines.push(format!("  default_mode:       {}", self.default_mode));
-        lines.push(format!("  context_panel:      {}", self.context_panel));
-        lines.push(format!("  cost_currency:      {}", self.cost_currency));
-        lines.push(format!("  max_history:        {}", self.max_input_history));
-        lines.push("  model defaults:     config.toml (use /config)".to_string());
-        lines.push(format!(
-            "  reasoning_effort:   {}",
-            self.reasoning_effort
-                .as_deref()
-                .unwrap_or("(config/default)")
-        ));
-        lines.push(format!(
-            "  permission_posture: {}",
-            self.permission_posture
-                .as_deref()
-                .unwrap_or("(config/default)")
-        ));
-        lines.push(format!(
-            "  sandbox_mode:       {}  # filesystem scope (not approval)",
-            self.sandbox_mode.as_deref().unwrap_or("(config/default)")
-        ));
+        lines.extend(report.rows.iter().map(|row| {
+            format!(
+                "  {:<width$}{}",
+                row.label,
+                row.value,
+                width = row.label_width
+            )
+        }));
         lines.push(String::new());
         lines.push(format!(
             "{} {}",
             tr(locale, MessageId::SettingsConfigFile),
-            Self::path().map_or_else(|_| "(unknown)".to_string(), |p| p.display().to_string())
+            report.config_file
         ));
+        if !report.from_settings.is_empty() || !report.session_overrides.is_empty() {
+            lines.push(String::new());
+            if !report.from_settings.is_empty() {
+                lines.push(format!(
+                    "  from settings.toml: {}",
+                    report.from_settings.join(", ")
+                ));
+            }
+            if !report.session_overrides.is_empty() {
+                lines.push(format!(
+                    "  session override: {}",
+                    report.session_overrides.join(", ")
+                ));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Typed `/settings text` report: the command owns the frame and joining.
+    #[must_use]
+    pub fn command_report(&self) -> codewhale_command_contract::config::CommandSettingsReport {
+        let mut rows = Vec::new();
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "auto_compact:".to_string(),
+            value: self.auto_compact.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "auto_compact_pct:".to_string(),
+            value: format!("{:.0}", self.auto_compact_threshold_percent),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "calm_mode:".to_string(),
+            value: self.calm_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "pet_mode:".to_string(),
+            value: self.pet_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "tool_collapse:".to_string(),
+            value: self.tool_collapse_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "low_motion:".to_string(),
+            value: self.low_motion.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "fancy_animations:".to_string(),
+            value: self.fancy_animations.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "focus_texture:".to_string(),
+            value: self.focus_texture.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "work_surface:".to_string(),
+            value: self.work_surface_placement.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "work_top_height:".to_string(),
+            value: self.work_surface_top_height.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "work_side_width:".to_string(),
+            value: self.work_surface_side_width.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "rail_panel:".to_string(),
+            value: self.rail_panel.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "bracketed_paste:".to_string(),
+            value: self.bracketed_paste.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "paste_burst_detect:".to_string(),
+            value: self.paste_burst_detection.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "mention_menu_limit:".to_string(),
+            value: self.mention_menu_limit.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "mention_walk_depth:".to_string(),
+            value: self.mention_walk_depth.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "mention_behavior:".to_string(),
+            value: self.mention_menu_behavior.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "show_thinking:".to_string(),
+            value: self.show_thinking.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "thinking_expanded:".to_string(),
+            value: self.thinking_default_expanded.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "thinking_preview:".to_string(),
+            value: self.thinking_preview_lines.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "thinking_highlight:".to_string(),
+            value: self.thinking_highlight.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "help_expand_groups:".to_string(),
+            value: self.help_expand_groups.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "pin_last_prompt:".to_string(),
+            value: self.pin_last_prompt.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "contextual_tips:".to_string(),
+            value: self.contextual_tips.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "show_tool_details:".to_string(),
+            value: self.show_tool_details.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "inline_diffs:".to_string(),
+            value: self.inline_diffs.to_string(),
+            label_width: 19,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "locale:".to_string(),
+            value: self.locale.to_string(),
+            label_width: 19,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "theme:".to_string(),
+            value: self.theme.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "background_color:".to_string(),
+            value: self
+                .background_color
+                .as_deref()
+                .unwrap_or("(default)")
+                .to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_density:".to_string(),
+            value: self.composer_density.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_border:".to_string(),
+            value: self.composer_border.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_multiline_mode:".to_string(),
+            value: self.composer_multiline_mode.to_string(),
+            label_width: 25,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_vim_mode:".to_string(),
+            value: self.composer_vim_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "transcript_spacing:".to_string(),
+            value: self.transcript_spacing.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "status_indicator:".to_string(),
+            value: self.status_indicator.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "synchronized_output:".to_string(),
+            value: self.synchronized_output.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "workspace_follow_symlinks:".to_string(),
+            value: self.workspace_follow_symlinks.to_string(),
+            label_width: 27,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "default_mode:".to_string(),
+            value: self.default_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "context_panel:".to_string(),
+            value: self.context_panel.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "cost_currency:".to_string(),
+            value: self.cost_currency.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "max_history:".to_string(),
+            value: self.max_input_history.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "model defaults:".to_string(),
+            value: "config.toml (use /config)".to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "reasoning_effort:".to_string(),
+            value: self
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("(config/default)")
+                .to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "permission_posture:".to_string(),
+            value: self
+                .permission_posture
+                .as_deref()
+                .unwrap_or("(config/default)")
+                .to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "sandbox_mode:".to_string(),
+            value: format!(
+                "{}  # filesystem scope (not approval)",
+                self.sandbox_mode.as_deref().unwrap_or("(config/default)")
+            ),
+            label_width: 20,
+        });
         // Provenance footer: which keys this load actually owns versus the
         // schema defaults, so `/settings` says what the user set. Session
         // marks only appear when the instance outlives a `set()` (the CLI
@@ -1916,196 +2103,12 @@ impl Settings {
                 Layer::ManagedPolicy | Layer::CliFlag | Layer::ProjectConfig | Layer::Default => {}
             }
         }
-        if !user.is_empty() || !session.is_empty() {
-            lines.push(String::new());
-            if !user.is_empty() {
-                lines.push(format!("  from settings.toml: {}", user.join(", ")));
-            }
-            if !session.is_empty() {
-                lines.push(format!("  session override: {}", session.join(", ")));
-            }
-        }
-        lines.join("\n")
-    }
-
-    /// Get available setting keys and their descriptions
-    pub fn available_settings() -> Vec<(&'static str, &'static str)> {
-        vec![
-            (
-                "auto_compact",
-                "Auto-compact near the hard context limit: on/off (model-aware default)",
-            ),
-            (
-                "auto_compact_threshold_percent",
-                "Auto-compact trigger threshold percent: 10-100 (default 80; setting it enables auto-compaction unless auto_compact=false is explicit)",
-            ),
-            ("calm_mode", "Calmer UI defaults: on/off"),
-            (
-                "tool_collapse",
-                "Dense tool-run collapse mode: collapsed (alias compact), expanded, calm",
-            ),
-            (
-                "low_motion",
-                "Reduce decorative motion without changing model text delivery: on/off",
-            ),
-            ("fancy_animations", "Expressive live-state motion: on/off"),
-            (
-                "focus_texture",
-                "Modal focus-context texture prototype: off/scrim/grain (default off)",
-            ),
-            (
-                "work_surface_placement",
-                "Ocean Tasks/To-do/Workers rail placement: bottom (default)/top/left/right",
-            ),
-            (
-                "work_surface_top_height",
-                "Resizable To-do/Sub-agent top bar height: 2-16 rows",
-            ),
-            (
-                "work_surface_side_width",
-                "Resizable To-do/Sub-agent side bar width: 26-80 columns",
-            ),
-            (
-                "rail_panel",
-                "Which panel the rail shows: tasks/agents/context/pinned",
-            ),
-            (
-                "bracketed_paste",
-                "Terminal bracketed-paste mode: on/off (rare to disable)",
-            ),
-            (
-                "paste_burst_detection",
-                "Fallback rapid-key paste detection: on/off",
-            ),
-            (
-                "mention_menu_limit",
-                "Maximum @-mention popup candidates retained before rendering (default 128)",
-            ),
-            (
-                "mention_walk_depth",
-                "Maximum @-mention workspace walk depth; 0 means unlimited (default 10)",
-            ),
-            (
-                "mention_menu_behavior",
-                "@-mention completion behavior: fuzzy/browser (default fuzzy)",
-            ),
-            ("show_thinking", "Show model thinking: on/off"),
-            ("contextual_tips", ""), // Localized guidance comes from the schema.
-            (
-                "thinking_default_expanded",
-                "Expand model thinking by default; Space still toggles: on/off",
-            ),
-            (
-                "thinking_preview_lines",
-                "Collapsed completed-thought preview rows (default 2, 0=header-only, 10=older dump)",
-            ),
-            (
-                "thinking_highlight",
-                "Fill the thinking/reasoning background: on/off",
-            ),
-            (
-                "help_expand_groups",
-                "Start Help/shortcuts with every group expanded: on/off (default off)",
-            ),
-            (
-                "pin_last_prompt",
-                "Pin the last user prompt at the top when it scrolls off: on/off (default on)",
-            ),
-            ("show_tool_details", "Show detailed tool output: on/off"),
-            (
-                "inline_diffs",
-                "Successful File mutation evidence: full/summary/off (exact detail is always retained)",
-            ),
-            (
-                "base_url",
-                "HTTP base URL for DeepSeek-compatible endpoints.",
-            ),
-            (
-                "locale",
-                "UI locale and default model language: auto, en, ja, zh-Hans, zh-Hant, pt-BR, es-419, vi, ko, ca, de, fr, id, hi, ru, uk; every shipped pack holds full English parity",
-            ),
-            (
-                "theme",
-                "UI theme: a compiled name or custom:<name> from the Codewhale themes directory",
-            ),
-            (
-                "background_color",
-                "Main TUI background color: #RRGGBB or default",
-            ),
-            (
-                "composer_density",
-                "Composer density: compact, comfortable, spacious",
-            ),
-            (
-                "composer_border",
-                "Show a border around the composer input area: on/off",
-            ),
-            (
-                "composer_multiline_mode",
-                "Enter inserts a newline and Shift+Enter sends: on/off",
-            ),
-            ("composer_vim_mode", "Composer editing mode: normal, vim"),
-            (
-                "transcript_spacing",
-                "Transcript spacing: compact, comfortable, spacious",
-            ),
-            (
-                "status_indicator",
-                "Header status mark, shown before the route: cw, whale, dots, off",
-            ),
-            (
-                "synchronized_output",
-                "DEC 2026 synchronized output: auto, on, off (set off if your terminal flickers)",
-            ),
-            (
-                "workspace_follow_symlinks",
-                "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
-            ),
-            (
-                "default_mode",
-                "Default mode: act (agent), plan, or operate",
-            ),
-            (
-                "context_panel",
-                "Show the session context workbar panel: on/off",
-            ),
-            (
-                "sessions_rail",
-                "Show the persistent Sessions workbar: on/off (default off)",
-            ),
-            (
-                "session_auto_resume",
-                "Reattach to this workspace's most recent session on startup: on/off (default off). --resume/--continue still win; archived, unreadable, or other-workspace sessions are never auto-resumed.",
-            ),
-            ("cost_currency", "Cost display currency: usd, cny"),
-            ("max_history", "Max input history entries"),
-            (
-                "reasoning_effort",
-                "Default thinking effort: auto, off, low, medium, high, max, or default",
-            ),
-        ]
-    }
-
-    /// Add a model to a provider's enabled chooser set without removing prior
-    /// choices. IDs are compared case-insensitively but preserve their wire
-    /// spelling on disk.
-    #[cfg(test)]
-    pub fn enable_model_for_provider(&mut self, provider: &str, model: &str) {
-        let provider = provider.trim();
-        let model = model.trim();
-        if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
-            return;
-        }
-        let models = self
-            .enabled_models
-            .get_or_insert_with(std::collections::HashMap::new)
-            .entry(provider.to_string())
-            .or_default();
-        if !models
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(model))
-        {
-            models.push(model.to_string());
+        codewhale_command_contract::config::CommandSettingsReport {
+            rows,
+            config_file: Self::path()
+                .map_or_else(|_| "(unknown)".to_string(), |p| p.display().to_string()),
+            from_settings: user.into_iter().map(str::to_string).collect(),
+            session_overrides: session.into_iter().map(str::to_string).collect(),
         }
     }
 
@@ -2792,7 +2795,7 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
 }
 
 /// Parse a boolean value from various formats
-fn parse_bool(value: &str) -> Result<bool> {
+pub(crate) fn parse_bool(value: &str) -> Result<bool> {
     match value.to_lowercase().as_str() {
         "on" | "true" | "yes" | "1" | "enabled" => Ok(true),
         "off" | "false" | "no" | "0" | "disabled" => Ok(false),
@@ -2882,7 +2885,7 @@ fn normalize_composer_density(value: &str) -> &str {
 fn normalize_transcript_spacing(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "compact" | "tight" => "compact",
-        "comfortable" | "default" | "normal" => "comfortable",
+        "comfortable" | "default" | "normal" => "spacious",
         "spacious" | "loose" => "spacious",
         _ => value,
     }
@@ -3422,11 +3425,12 @@ mod tests {
         assert_eq!(settings.rail_panel, "tasks");
 
         // Every panel the dock cycles through must survive `set` and a
-        // settings.toml round trip — the dock persists all eight.
+        // settings.toml round trip — including an empty Terminal view.
         for panel in [
             "tasks",
             "agents",
             "background",
+            "terminal",
             "files",
             "notepad",
             "context",
@@ -3449,10 +3453,9 @@ mod tests {
         let err = settings
             .set("rail_panel", "auto")
             .expect_err("auto-collapse was dropped with the legacy sidebar");
-        assert!(
-            err.to_string()
-                .contains("tasks, agents, background, files, notepad, context, git, or price")
-        );
+        assert!(err.to_string().contains(
+            "tasks, agents, background, terminal, files, notepad, context, git, or price"
+        ));
         assert_eq!(settings.rail_panel, "tasks");
     }
 
@@ -3599,7 +3602,7 @@ mod tests {
             load_error: None,
             fancy_animations: true,
             show_tool_details: true,
-            transcript_spacing: "comfortable".to_string(),
+            transcript_spacing: "spacious".to_string(),
             ..Settings::default()
         }
     }
@@ -3631,13 +3634,13 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_use_comfortable_transcript_spacing() {
+    fn default_settings_use_spacious_transcript_spacing() {
         let settings = Settings::default();
         assert!(settings.calm_mode);
         assert!(!settings.show_tool_details);
         assert!(!settings.low_motion);
         assert!(settings.fancy_animations);
-        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.transcript_spacing, "spacious");
         assert_eq!(settings.tool_collapse_mode, "compact");
         // Thinking is opt-in so the transcript stays focused on the chat.
         assert!(!settings.show_thinking);
@@ -3856,7 +3859,7 @@ mod tests {
             "underwater presentation is the default"
         );
         assert!(!settings.low_motion);
-        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.transcript_spacing, "spacious");
     }
 
     #[test]
@@ -4007,16 +4010,6 @@ mod tests {
         assert_eq!(settings.mention_menu_limit, 128);
         assert_eq!(settings.mention_walk_depth, 10);
         assert_eq!(settings.mention_menu_behavior, "fuzzy");
-        let mention_help = Settings::available_settings()
-            .into_iter()
-            .find(|(key, _)| *key == "mention_walk_depth")
-            .map(|(_, desc)| desc)
-            .expect("mention_walk_depth help");
-        assert!(
-            mention_help.contains("default 10"),
-            "help text still lists the pre-v0.8.50 default: {mention_help}"
-        );
-
         settings
             .set("mention_menu_limit", "256")
             .expect("set mention menu limit");
@@ -4323,26 +4316,22 @@ mod tests {
     }
 
     #[test]
-    fn model_chooser_preferences_do_not_write_a_startup_selection() {
-        let mut settings = Settings::default();
-
-        settings.enable_model_for_provider("openrouter", "anthropic/claude-sonnet-4");
-        settings.enable_model_for_provider("openrouter", "qwen/qwen3.7-plus");
-        settings.enable_model_for_provider("openrouter", "QWEN/QWEN3.7-PLUS");
-        settings.enable_model_for_provider("openrouter", "auto");
-
+    fn legacy_enabled_models_table_still_loads_and_round_trips() {
+        let settings: Settings = toml::from_str(
+            r#"
+[enabled_models]
+zai = ["GLM-5.2", "GLM-5.3"]
+"#,
+        )
+        .expect("legacy enabled_models loads");
         assert!(settings.provider_models.is_none());
         assert_eq!(
             settings
                 .enabled_models
                 .as_ref()
-                .and_then(|models| models.get("openrouter")),
-            Some(&vec![
-                "anthropic/claude-sonnet-4".to_string(),
-                "qwen/qwen3.7-plus".to_string(),
-            ])
+                .and_then(|models| models.get("zai")),
+            Some(&vec!["GLM-5.2".to_string(), "GLM-5.3".to_string()])
         );
-
         let encoded = toml::to_string(&settings).expect("serialize enabled models");
         let decoded: Settings = toml::from_str(&encoded).expect("deserialize enabled models");
         assert_eq!(decoded.enabled_models, settings.enabled_models);
@@ -4542,6 +4531,11 @@ mod tests {
     #[test]
     fn ghostty_term_program_keeps_full_motion_without_the_legacy_30_fps_cap() {
         let _g = term_program_test_guard();
+        let _tmux = crate::test_support::EnvVarGuard::remove("TMUX");
+        let _sty = crate::test_support::EnvVarGuard::remove("STY");
+        let _tilix_id = crate::test_support::EnvVarGuard::remove("TILIX_ID");
+        let _terminator_uuid = crate::test_support::EnvVarGuard::remove("TERMINATOR_UUID");
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
@@ -4570,6 +4564,11 @@ mod tests {
     #[test]
     fn ghostty_term_fallback_keeps_full_motion_without_the_legacy_30_fps_cap() {
         let _g = term_program_test_guard();
+        let _tmux = crate::test_support::EnvVarGuard::remove("TMUX");
+        let _sty = crate::test_support::EnvVarGuard::remove("STY");
+        let _tilix_id = crate::test_support::EnvVarGuard::remove("TILIX_ID");
+        let _terminator_uuid = crate::test_support::EnvVarGuard::remove("TERMINATOR_UUID");
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
@@ -4603,6 +4602,7 @@ mod tests {
     #[test]
     fn non_vscode_term_program_does_not_force_low_motion() {
         let _g = term_program_test_guard();
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         let prev = std::env::var_os("TERM_PROGRAM");
         let prev_term = std::env::var_os("TERM");
         let prev_ssh_client = std::env::var_os("SSH_CLIENT");
@@ -4670,6 +4670,7 @@ mod tests {
     #[test]
     fn tilix_and_terminator_cap_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
@@ -5267,7 +5268,7 @@ mod tests {
             .set("default_mode", "yolo")
             .expect_err("yolo remains a permission migration alias, not a mode write");
         assert!(
-            err.to_string().contains("act (agent), plan, or operate"),
+            err.to_string().contains("work (agent), plan, or operate"),
             "{err}"
         );
     }
@@ -5824,7 +5825,19 @@ mod tests {
         ];
         for (spellings, value) in cases {
             let canonical = spellings[0];
+            // `config set`, `/config` and `config doctor` route and suggest
+            // from the schema by this canonical key; a `/set` spelling with
+            // no declaration would be settable but unplaceable.
+            assert!(
+                codewhale_config::setting(canonical).is_some(),
+                "`/set {canonical}` is accepted but undeclared in SETTINGS_SCHEMA"
+            );
             for spelling in *spellings {
+                assert_eq!(
+                    Settings::canonical_key(spelling),
+                    Some(canonical),
+                    "{spelling}"
+                );
                 let mut settings = Settings::default();
                 assert_eq!(settings.provenance(canonical), Layer::Default);
                 settings
@@ -5841,6 +5854,11 @@ mod tests {
                     "{spelling} does not resolve to its own layer"
                 );
             }
+        }
+        // `default_model` has no provenance case above; check its spellings too.
+        for spelling in ["default_model", "model"] {
+            let canonical = Settings::canonical_key(spelling).expect("model spelling");
+            assert!(codewhale_config::setting(canonical).is_some(), "{spelling}");
         }
     }
 

@@ -3,7 +3,8 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use codewhale_palette as palette;
 
@@ -99,7 +100,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
         }
 
         if is_added(raw) {
-            let content = raw.trim_start_matches('+');
+            let content = &raw[1..];
             collector.extend(render_diff_line(
                 content,
                 width,
@@ -119,7 +120,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
             // A deleted run followed by an added run of the same length is a
             // set of replaced lines: emphasise the words that changed within
             // each pair. Any other shape renders line by line as before.
-            let mut removed = vec![raw.trim_start_matches('-')];
+            let mut removed = vec![&raw[1..]];
             let mut added: Vec<&str> = Vec::new();
             let mut removed_markers: Vec<(usize, &str)> = Vec::new();
             let mut added_markers: Vec<(usize, &str)> = Vec::new();
@@ -134,7 +135,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
                     && let Some(next) = lines.next_if(|next| is_deleted(next))
                 {
                     if removed.len() < INTRALINE_MAX_RUN {
-                        removed.push(next.trim_start_matches('-'));
+                        removed.push(&next[1..]);
                     } else {
                         flush_plain_run(
                             &mut collector,
@@ -147,7 +148,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
                         );
                         render_plain_diff_line(
                             &mut collector,
-                            next.trim_start_matches('-'),
+                            &next[1..],
                             width,
                             &mut old_line,
                             &mut new_line,
@@ -157,7 +158,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
                     }
                 } else if let Some(next) = lines.next_if(|next| is_added(next)) {
                     if added.len() < INTRALINE_MAX_RUN {
-                        added.push(next.trim_start_matches('+'));
+                        added.push(&next[1..]);
                     } else {
                         flush_plain_run(
                             &mut collector,
@@ -179,7 +180,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
                         );
                         render_plain_diff_line(
                             &mut collector,
-                            next.trim_start_matches('+'),
+                            &next[1..],
                             width,
                             &mut old_line,
                             &mut new_line,
@@ -250,8 +251,7 @@ pub fn render_diff_body_bounded(diff: &str, width: u16, max_rows: usize) -> Boun
             continue;
         }
 
-        if raw.starts_with(' ') {
-            let content = raw.trim_start_matches(' ');
+        if let Some(content) = raw.strip_prefix(' ') {
             collector.extend(render_diff_line(
                 content,
                 width,
@@ -711,9 +711,11 @@ fn render_diff_line(
 
 fn format_line_numbers(old_line: Option<usize>, new_line: Option<usize>, marker: char) -> String {
     let old = old_line
+        .filter(|_| marker != '+')
         .map(|value| format!("{value:>LINE_NUMBER_WIDTH$}"))
         .unwrap_or_else(|| " ".repeat(LINE_NUMBER_WIDTH));
     let new = new_line
+        .filter(|_| marker != '-')
         .map(|value| format!("{value:>LINE_NUMBER_WIDTH$}"))
         .unwrap_or_else(|| " ".repeat(LINE_NUMBER_WIDTH));
     format!("{old} {new} {marker} ")
@@ -757,7 +759,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 current = lead.clone();
                 current_width = lead_width;
             }
-            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            push_word_breaking_graphemes(word, width, &mut current, &mut current_width, &mut lines);
             has_word = current_width > lead_width;
             continue;
         }
@@ -794,21 +796,21 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn push_word_breaking_chars(
+fn push_word_breaking_graphemes(
     word: &str,
     width: usize,
     current: &mut String,
     current_width: &mut usize,
     lines: &mut Vec<String>,
 ) {
-    for ch in word.chars() {
-        let char_width = ch.width().unwrap_or(1);
-        if *current_width + char_width > width && *current_width > 0 {
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if *current_width + grapheme_width > width && *current_width > 0 {
             lines.push(std::mem::take(current));
             *current_width = 0;
         }
-        current.push(ch);
-        *current_width += char_width;
+        current.push_str(grapheme);
+        *current_width += grapheme_width;
     }
 }
 
@@ -1189,6 +1191,25 @@ diff --git a/src/lib.rs b/src/lib.rs
         }
 
         assert_eq!(lines.join(""), text);
+    }
+
+    #[test]
+    fn wrap_text_breaks_overlong_words_between_graphemes() {
+        // A ZWJ family and a skin-toned thumbs-up are one two-column grapheme
+        // each, the way Ratatui counts cells.
+        let word = "ab\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{1f44d}\u{1f3fd}cd";
+        for width in 2..=6 {
+            let lines = wrap_text(word, width);
+            let rejoined: Vec<&str> = lines.iter().flat_map(|line| line.graphemes(true)).collect();
+            assert_eq!(
+                rejoined,
+                word.graphemes(true).collect::<Vec<_>>(),
+                "width {width} split a grapheme: {lines:?}"
+            );
+            for line in &lines {
+                assert!(line.width() <= width, "line {line:?} exceeds width {width}");
+            }
+        }
     }
 
     #[test]

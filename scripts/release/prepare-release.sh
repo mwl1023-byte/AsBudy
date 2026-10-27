@@ -7,10 +7,14 @@
 # codewhale-* dependency pins), npm/codewhale/package.json (version +
 # codewhaleBinaryVersion), npm/runtime-sdk/package.json, the VS Code extension
 # package and lock, the root npm lock workspace records, the remote-smoke default
-# tag, README*.md install-tag examples when present, the public fact matrix's
+# tag, README.md and docs/i18n/README*.md install-tag examples when present, the public fact matrix's
 # source-candidate version, Cargo.lock, crates/tui/CHANGELOG.md (via
 # sync-changelog.sh), web/lib/facts.generated.ts (via derive-facts.mjs), and
-# web/lib/changelog.generated.ts (via derive-changelog.mjs).
+# the two version-stamped contract fixtures
+# (crates/config/src/route/providers-export.golden.json and
+# crates/tui/src/commands/contract/fixtures/config_policy/status.json).
+# The website's changelog and install-guide modules are not tracked; the web
+# build and test runs derive them from CHANGELOG.md and docs/INSTALL.md.
 #
 # It does NOT write the CHANGELOG entry — add the `## [X.Y.Z] - YYYY-MM-DD`
 # section first (see docs/RELEASE_CHECKLIST.md), then run this script, then
@@ -25,6 +29,7 @@ fi
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo}"
+readmes=(README.md docs/i18n/README.*.md)
 
 # Release preparation spans generated files and two package managers. Preserve
 # the exact starting bytes so any validation, generator, or downstream gate
@@ -48,14 +53,11 @@ transaction_paths=(
   scripts/remote-smoke/setup-vm.sh
   docs/public-surface-facts.json
   docs/INSTALL.md
-  README.md
-  README.zh-CN.md
-  README.ja-JP.md
-  README.vi.md
-  README.ko-KR.md
+  "${readmes[@]}"
   crates/tui/CHANGELOG.md
   web/lib/facts.generated.ts
-  web/lib/changelog.generated.ts
+  crates/config/src/route/providers-export.golden.json
+  crates/tui/src/commands/contract/fixtures/config_policy/status.json
 )
 for manifest in crates/*/Cargo.toml; do
   transaction_paths+=("${manifest}")
@@ -97,18 +99,12 @@ fi
 if [[ "${old}" != "${new}" ]]; then
   echo "Bumping ${old} -> ${new}"
 
-  OLD_VERSION="${old}" NEW_VERSION="${new}" python3 - <<'PY'
+  OLD_VERSION="${old}" NEW_VERSION="${new}" python3 - "${readmes[@]}" <<'PY'
 import json, os, pathlib, re, sys
 
 old, new = os.environ["OLD_VERSION"], os.environ["NEW_VERSION"]
 old_re = re.escape(old)
-readmes = [
-    "README.md",
-    "README.zh-CN.md",
-    "README.ja-JP.md",
-    "README.vi.md",
-    "README.ko-KR.md",
-]
+readmes = sys.argv[1:]
 
 def bump(path, pattern, repl, minimum):
     p = pathlib.Path(path)
@@ -188,14 +184,7 @@ for readme in readmes:
 #    Current docs deliberately describe installed output generically, so zero
 #    matches is valid. If numeric forms exist, validate that they agree with
 #    the old workspace version before replacing them.
-version_doc_files = [
-    "README.md",
-    "README.zh-CN.md",
-    "README.ja-JP.md",
-    "README.vi.md",
-    "README.ko-KR.md",
-    "docs/INSTALL.md",
-]
+version_doc_files = [*readmes, "docs/INSTALL.md"]
 for doc in version_doc_files:
     p = pathlib.Path(doc)
     text = p.read_text()
@@ -357,6 +346,32 @@ if facts_after.get("latestPublishedRelease") != published_before:
     sys.exit("error: release preparation must not change latestPublishedRelease")
 facts.write_text(facts_out)
 print("  docs/public-surface-facts.json: 1 source-candidate replacement")
+
+# 7) Version-stamped contract fixtures. The golden export and the config
+#    policy status baseline are compared against the workspace version by
+#    their own tests; check-versions.sh (run below) guards them too. Move
+#    them with every bump or CI's test job reddens on the new version.
+golden_fixture = pathlib.Path("crates/config/src/route/providers-export.golden.json")
+if golden_fixture.exists():
+    text = golden_fixture.read_text()
+    out, n = re.subn(rf'("runtimeVersion"\s*:\s*"){old_re}(")', rf"\g<1>{new}\g<2>", text)
+    if n != 1:
+        sys.exit(f"error: expected exactly one runtimeVersion in {golden_fixture}, made {n}")
+    golden_fixture.write_text(out)
+    print(f"  {golden_fixture}: 1 runtimeVersion replacement")
+status_fixture = pathlib.Path(
+    "crates/tui/src/commands/contract/fixtures/config_policy/status.json"
+)
+if status_fixture.exists():
+    text = status_fixture.read_text()
+    out, n = re.subn(rf"\b(codewhale\s+){old_re}\b", rf"\g<1>{new}", text, count=1)
+    if n != 1:
+        sys.exit(
+            f"error: expected the {status_fixture} header to carry {old}, "
+            f"made {n} replacement(s)"
+        )
+    status_fixture.write_text(out)
+    print(f"  {status_fixture}: 1 version replacement")
 PY
 
   echo "Refreshing Cargo.lock..."
@@ -383,13 +398,6 @@ echo "Regenerating crates/tui/CHANGELOG.md slice..."
 
 echo "Regenerating web/lib/facts.generated.ts..."
 node web/scripts/derive-facts.mjs
-
-# Release prep always edits CHANGELOG.md, and derive-changelog.mjs is the only
-# thing that turns it into the file the /changelog route reads. Leaving this
-# out reddened CI on 2026-09-10 twice, because the drift gate only fires after
-# a push. Keep it beside the other regenerators.
-echo "Regenerating web/lib/changelog.generated.ts..."
-node web/scripts/derive-changelog.mjs
 
 echo "Validating..."
 ./scripts/release/check-versions.sh

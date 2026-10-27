@@ -65,7 +65,7 @@ function isPublishedRelease(value: unknown): value is PublishedReleaseFact {
     value.tag === `v${value.version}` &&
     typeof value.publishedAt === "string" &&
     Number.isFinite(Date.parse(value.publishedAt)) &&
-    value.url === `https://github.com/Hmbown/CodeWhale/releases/tag/${value.tag}`
+    value.url === `https://github.com/codewhale-hq/CodeWhale/releases/tag/${value.tag}`
   );
 }
 
@@ -102,6 +102,8 @@ export function isRepoFacts(value: unknown): value is RepoFacts {
     (value.defaultModel === null || typeof value.defaultModel === "string") &&
     (value.nodeEngines === null || typeof value.nodeEngines === "string") &&
     (value.toolCount === null || typeof value.toolCount === "number") &&
+    typeof value.contributorCount === "number" &&
+    Number.isSafeInteger(value.contributorCount) && value.contributorCount > 0 &&
     (value.license === null || typeof value.license === "string") &&
     (value.latestPublishedRelease === null ||
       isPublishedRelease(value.latestPublishedRelease))

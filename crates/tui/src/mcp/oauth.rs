@@ -367,13 +367,14 @@ fn error_is_invalid_grant(error: &anyhow::Error) -> bool {
 /// authorization server has definitively rejected the stored grant — only a
 /// fresh login recovers it.
 pub fn error_text_looks_auth_required(text: &str) -> bool {
+    let status_401 = text_names_http_status(text, "401");
     let text = text.to_ascii_lowercase();
     // `auth required` and `requires oauth` are anchored to the shapes this
     // product and the Codex-compatible managers actually emit (`◆ auth
     // required`, `requires OAuth login/authentication/reauthentication`) —
     // bare substrings would misclassify incidental server errors like
     // "auth required parameter is missing".
-    text.contains("401")
+    status_401
         || text.contains("unauthorized")
         || text.contains("authentication_required")
         || text.contains("invalid_grant")
@@ -394,6 +395,21 @@ pub fn error_text_looks_auth_required(text: &str) -> bool {
         || text.contains("re-authorize")
         || text.contains("/mcp login")
         || text.contains("mcp login")
+}
+
+/// Whether error text names an HTTP status as a status, not as digits inside
+/// an address or a larger number. Transport errors carry the URL they failed
+/// on, so a bare substring match read the reset on
+/// `http://127.0.0.1:50401/mcp` as a 401 and put a healthy server into
+/// `◆ auth required` — whenever the ephemeral port happened to contain it.
+pub(crate) fn text_names_http_status(text: &str, status: &str) -> bool {
+    text.split_whitespace()
+        .filter(|token| !token.contains("://"))
+        .any(|token| {
+            token
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|digits| digits == status)
+        })
 }
 
 pub fn auth_required_login_hint(server_name: &str) -> String {
@@ -509,9 +525,10 @@ struct McpOAuthRuntimeInner {
     manager: Arc<Mutex<AuthorizationManager>>,
     last_tokens: Mutex<Option<StoredMcpOAuthTokens>>,
     /// Why the held credential was invalidated (the provider's error code,
-    /// e.g. `invalid_grant`), so every later failure names the cause even
-    /// though the rejected grant is never replayed. `None` while a
-    /// credential is held.
+    /// e.g. `invalid_grant`, or `logged_out` when a refresh found the stored
+    /// entry removed), so every later failure names the cause even though
+    /// the rejected grant is never replayed. `None` while a credential is
+    /// held.
     rejection: Mutex<Option<String>>,
     /// The HTTP client the runtime was built with, shared with the manager
     /// so an adopted on-disk rotation rebuilds it with identical HTTP shape
@@ -641,6 +658,7 @@ impl McpOAuthRuntime {
         client: McpHttpClient,
     ) -> Result<Self> {
         refresh_expires_in_from_timestamp(&mut tokens);
+        let client = client.with_credential_transport()?;
         let http_client = Arc::new(RecordingOAuthHttpClient::new(client));
         let manager = manager_from_stored_tokens(url, &tokens, &http_client).await?;
 
@@ -702,10 +720,12 @@ impl McpOAuthRuntime {
         self.refresh_and_persist().await
     }
 
-    /// Whether this runtime's credential was definitively rejected by the
-    /// provider and invalidated. `last_tokens` is `Some` from construction
-    /// and after every persisted refresh; only [`Self::clear_stored_tokens`]
-    /// empties it.
+    /// Whether this runtime's credential was invalidated: definitively
+    /// rejected by the provider, or removed from the store (a logout) before
+    /// a refresh could persist. `last_tokens` is `Some` from construction and
+    /// after every persisted refresh; [`Self::clear_stored_tokens`] and a
+    /// refresh that returns no credential or finds the stored entry removed
+    /// empty it.
     async fn is_invalidated(&self) -> bool {
         self.inner.last_tokens.lock().await.is_none()
     }
@@ -726,6 +746,12 @@ impl McpOAuthRuntime {
                     .await
                     .clone()
                     .unwrap_or_else(|| "unauthorized".to_string());
+                if reason == "logged_out" {
+                    bail!(
+                        "stored MCP OAuth credential for server {} was removed by a logout; the server requires OAuth login again",
+                        self.inner.server_name
+                    );
+                }
                 bail!(
                     "stored MCP OAuth credential for server {} was rejected by the provider ({reason}) and removed; the server requires OAuth login again",
                     self.inner.server_name
@@ -809,12 +835,17 @@ impl McpOAuthRuntime {
         if !changed {
             return Ok(false);
         }
+        self.adopt_stored_tokens(stored).await?;
+        Ok(true)
+    }
+
+    async fn adopt_stored_tokens(&self, stored: StoredMcpOAuthTokens) -> Result<()> {
         let manager =
             manager_from_stored_tokens(&self.inner.url, &stored, &self.inner.http_client).await?;
         *self.inner.manager.lock().await = manager;
         *self.inner.last_tokens.lock().await = Some(stored);
         *self.inner.rejection.lock().await = None;
-        Ok(true)
+        Ok(())
     }
 
     /// Invalidate the credential this runtime holds after the provider
@@ -826,27 +857,25 @@ impl McpOAuthRuntime {
     /// the rotated token while keeping our dead grant would make the next
     /// `invalid_grant` compare an "unchanged" store and delete the newer
     /// valid credential.
+    ///
+    /// The comparison and the delete are one step under the secret store's
+    /// entry lock (the same lock every save takes), so a login that lands
+    /// between them is never the credential that gets deleted.
     async fn clear_stored_tokens(&self, reason: &str) -> Result<()> {
         let held = { self.inner.last_tokens.lock().await.take() };
         let Some(held) = held else {
             return Ok(());
         };
-        match load_oauth_tokens(&self.inner.server_name, &self.inner.url)? {
-            Some(stored) if stored != held => {
+        match delete_oauth_tokens_if_held(&self.inner.server_name, &self.inner.url, &held)? {
+            Some(stored) => {
                 tracing::debug!(
                     target: "mcp",
                     server = %self.inner.server_name,
                     "MCP OAuth credential was rotated by another process; keeping the on-disk winner"
                 );
-                let manager =
-                    manager_from_stored_tokens(&self.inner.url, &stored, &self.inner.http_client)
-                        .await?;
-                *self.inner.manager.lock().await = manager;
-                *self.inner.last_tokens.lock().await = Some(stored);
-                *self.inner.rejection.lock().await = None;
+                self.adopt_stored_tokens(stored).await?;
             }
-            _ => {
-                delete_oauth_tokens(&self.inner.server_name, &self.inner.url)?;
+            None => {
                 *self.inner.rejection.lock().await = Some(reason.to_string());
             }
         }
@@ -863,8 +892,9 @@ impl McpOAuthRuntime {
         };
         let Some(credentials) = credentials else {
             let mut last = self.inner.last_tokens.lock().await;
-            if last.take().is_some() {
-                delete_oauth_tokens(&self.inner.server_name, &self.inner.url)?;
+            if let Some(previous) = last.take() {
+                // Only our own credential goes; a newer login stays.
+                delete_oauth_tokens_if_held(&self.inner.server_name, &self.inner.url, &previous)?;
             }
             return Ok(());
         };
@@ -887,9 +917,20 @@ impl McpOAuthRuntime {
             token_response: new_response,
             expires_at,
         };
-        if last.as_ref() != Some(&stored) {
-            save_oauth_tokens(&stored)?;
-            *last = Some(stored);
+        let Some(held) = last.as_ref().filter(|held| **held != stored) else {
+            return Ok(());
+        };
+        match save_oauth_tokens_if_held(held, &stored)? {
+            HeldTokenSave::Saved => *last = Some(stored),
+            HeldTokenSave::Removed => {
+                *last = None;
+                drop(last);
+                *self.inner.rejection.lock().await = Some("logged_out".to_string());
+            }
+            HeldTokenSave::Replaced(current) => {
+                drop(last);
+                self.adopt_stored_tokens(*current).await?;
+            }
         }
         Ok(())
     }
@@ -967,6 +1008,7 @@ fn oauth_http_client(
         Duration::from_secs(server.effective_connect_timeout(&timeouts)),
         Duration::from_secs(server.effective_read_timeout(&timeouts)),
     )
+    .and_then(McpHttpClient::with_credential_transport)
 }
 
 fn oauth_login_client(
@@ -1214,7 +1256,7 @@ enum OAuthLoginAnnounce {
 ///
 /// The authorization URL is available immediately so the model can relay it
 /// to the user verbatim; [`McpOAuthToolLogin::finish`] then blocks on the
-/// loopback callback (up to 5 minutes, same as `/mcp login`) and persists
+/// loopback callback (up to 15 minutes, same as `/mcp login`) and persists
 /// the issued tokens to the shared store on success.
 pub struct McpOAuthToolLogin {
     server_name: String,
@@ -1352,7 +1394,7 @@ Codewhale client, and the exact authorization URL is shown to the user in \
 the session status while this call waits. The same URL is returned in this \
 call's result; if the user reports the browser did not open, show that URL \
 to the user verbatim and ask them to complete the sign-in there.\n\
-2. The call blocks (up to 5 minutes) until the browser flow completes on the \
+2. The call blocks (up to 15 minutes) until the browser flow completes on the \
 local callback listener, is declined, or times out. Do not assume success \
 before the call returns.\n\
 3. On success the server reconnects and its real MCP tools replace this \
@@ -1444,9 +1486,111 @@ pub(crate) fn load_oauth_tokens(
     else {
         return Ok(None);
     };
-    let mut tokens = parse_stored_oauth_tokens(&serialized, server_name)?;
+    decode_stored_oauth_tokens(&serialized, server_name).map(Some)
+}
+
+fn decode_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
+    let mut tokens = parse_stored_oauth_tokens(serialized, server_name)?;
     refresh_expires_in_from_timestamp(&mut tokens);
-    Ok(Some(tokens))
+    Ok(tokens)
+}
+
+/// Delete the stored credential only while it is still exactly `held`,
+/// comparing and deleting under the store's entry lock. Returns the different
+/// credential found in its place (left untouched), or `None` when the entry
+/// was `held` and is now gone, or was already absent. An unreadable entry is
+/// an error and is left in place, as a plain load would report it.
+fn delete_oauth_tokens_if_held(
+    server_name: &str,
+    url: &str,
+    held: &StoredMcpOAuthTokens,
+) -> Result<Option<StoredMcpOAuthTokens>> {
+    let secrets = codewhale_secrets::Secrets::auto_detect();
+    let key = store_key(server_name, url);
+    secrets
+        .with_entry_transaction(&key, |current| {
+            let Some(serialized) = current.as_deref() else {
+                return Ok(Ok(None));
+            };
+            Ok(match decode_stored_oauth_tokens(serialized, server_name) {
+                Ok(stored) if stored == *held => {
+                    *current = None;
+                    Ok(None)
+                }
+                Ok(stored) => Ok(Some(stored)),
+                Err(error) => Err(error),
+            })
+        })
+        .with_context(|| format!("clearing the MCP OAuth token for '{server_name}'"))?
+}
+
+enum HeldTokenSave {
+    Saved,
+    Removed,
+    Replaced(Box<StoredMcpOAuthTokens>),
+}
+
+fn save_oauth_tokens_if_held(
+    held: &StoredMcpOAuthTokens,
+    tokens: &StoredMcpOAuthTokens,
+) -> Result<HeldTokenSave> {
+    let secrets = codewhale_secrets::Secrets::auto_detect();
+    let key = store_key(&tokens.server_name, &tokens.url);
+    let replacement = serde_json::to_string(tokens).context("serializing MCP OAuth token")?;
+    secrets
+        .with_entry_transaction(&key, |current| {
+            let Some(serialized) = current.as_deref() else {
+                return Ok(Ok(HeldTokenSave::Removed));
+            };
+            Ok(
+                match decode_stored_oauth_tokens(serialized, &tokens.server_name) {
+                    Ok(stored) if stored == *held => {
+                        *current = Some(replacement);
+                        Ok(HeldTokenSave::Saved)
+                    }
+                    Ok(stored) => Ok(HeldTokenSave::Replaced(Box::new(stored))),
+                    Err(error) => Err(error),
+                },
+            )
+        })
+        .with_context(|| format!("saving MCP OAuth token for '{}'", tokens.server_name))?
+}
+
+static DYNAMIC_REGISTRATION_UNAVAILABLE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn note_dynamic_registration(server_name: &str, url: &str, available: bool) {
+    let mut unavailable = DYNAMIC_REGISTRATION_UNAVAILABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (server_name.to_string(), url.to_string());
+    if available {
+        unavailable.remove(&key);
+    } else {
+        unavailable.insert(key);
+    }
+}
+
+pub(crate) fn dynamic_registration_unavailable(server_name: &str, url: &str) -> bool {
+    DYNAMIC_REGISTRATION_UNAVAILABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(server_name.to_string(), url.to_string()))
+}
+
+fn error_is_dynamic_registration_unsupported(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<AuthError>(),
+        Some(AuthError::RegistrationFailed(message))
+            if message.contains("Dynamic client registration not supported")
+    )
+}
+
+pub(crate) fn dynamic_registration_unavailable_hint(server_name: &str) -> String {
+    format!(
+        "MCP server '{server_name}' cannot complete an OAuth login: its authorization server offers no dynamic client registration and no `oauth.client_id` is configured. Set `bearer_token_env_var` to an environment variable holding a least-privilege personal access token, then run `/mcp reload`; or configure `oauth.client_id` for a registered OAuth app and log in again"
+    )
 }
 
 fn parse_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
@@ -1603,14 +1747,25 @@ impl OauthLoginFlow {
         };
 
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let oauth_state = start_authorization(
+        let oauth_state = match start_authorization(
             server_url,
             client,
             &scope_refs,
             &redirect_uri,
             oauth_client_id,
         )
-        .await?;
+        .await
+        {
+            Ok(oauth_state) => {
+                note_dynamic_registration(server_name, server_url, true);
+                oauth_state
+            }
+            Err(error) if error_is_dynamic_registration_unsupported(&error) => {
+                note_dynamic_registration(server_name, server_url, false);
+                return Err(error.context(dynamic_registration_unavailable_hint(server_name)));
+            }
+            Err(error) => return Err(error),
+        };
         let auth_url = append_query_param(
             &oauth_state.get_authorization_url().await?,
             "resource",
@@ -1663,11 +1818,12 @@ impl OauthLoginFlow {
         }
 
         let result = async {
-            let callback = timeout(Duration::from_secs(300), &mut self.rx)
+            // Allow time for the user to finish browser authentication and 2FA.
+            let callback = timeout(Duration::from_secs(900), &mut self.rx)
                 .await
                 .with_context(|| {
                     let retry_hint = match announce {
-                        OAuthLoginAnnounce::Terminal => "Retry from a terminal, or use task_shell_start/background shell if an agent is running the login flow.".to_string(),
+                        OAuthLoginAnnounce::Terminal => "Retry from a terminal, or use a background shell (background=true) if an agent is running the login flow.".to_string(),
                         OAuthLoginAnnounce::Tool { .. } => format!(
                             "The user can complete the sign-in directly via `/mcp login {}` or `codewhale mcp login {}`, then this tool can be called again.",
                             self.server_name, self.server_name
@@ -2069,6 +2225,29 @@ impl McpServerConfig {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn typed_oauth_client_requires_https_or_explicit_loopback_without_header_guessing() {
+        crate::tls::ensure_rustls_crypto_provider();
+        let server: super::McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://example.invalid/mcp"
+        }))
+        .unwrap();
+        let error = super::oauth_http_client(&server, "http://example.invalid/mcp", None)
+            .err()
+            .expect("OAuth form credentials must not use public HTTP");
+        assert!(error.to_string().contains("credentials require HTTPS"));
+        assert!(super::oauth_http_client(&server, "https://example.invalid/mcp", None).is_ok());
+        assert!(super::oauth_http_client(&server, "http://127.0.0.1/mcp", None).is_ok());
+        assert!(
+            super::oauth_http_client(
+                &server,
+                "https://fixture-user:fixture-password@example.invalid/mcp",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn registration_rejection_drops_exactly_the_named_scopes() {
         let scopes: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
         let message = concat!(
@@ -2341,6 +2520,17 @@ mod tests {
 
         let err = anyhow!("connection refused");
         assert!(!error_looks_auth_required(&err));
+
+        assert!(error_text_looks_auth_required("HTTP 401 from upstream"));
+        assert!(error_text_looks_auth_required("request failed (401)"));
+        // The failure the classifier used to misread: a reset on a loopback
+        // server whose ephemeral port contains 401 is a transport error.
+        let reset = "error sending request for url (http://127.0.0.1:50401/mcp): \
+                     client error (SendRequest): connection closed before message completed";
+        assert!(!error_text_looks_auth_required(reset), "{reset}");
+        assert!(!error_text_looks_auth_required(
+            "read 14010 bytes before the stream reset"
+        ));
     }
 
     #[test]

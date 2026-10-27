@@ -37,7 +37,10 @@ async fn enforced_readonly_rejects_incompatible_shapes_before_running_anything()
     ] {
         let mut input = json!({"command": "touch should-not-exist", "read_only": true});
         input[key] = value;
-        assert!(!exec_shell_input_agent_readonly(&input), "{input}");
+        assert!(
+            exec_shell_input_agent_readonly_verdict(&input).is_err(),
+            "{input}"
+        );
         let error = BashTool::new("Bash")
             .execute(input, &context)
             .await
@@ -56,7 +59,7 @@ fn enforced_readonly_refuses_an_unenforced_or_writable_prepared_environment() {
         env: HashMap::new(),
         timeout: Duration::from_secs(1),
         sandbox_type: SandboxType::None,
-        policy: ExecutionSandboxPolicy::ReadOnly,
+        policy: ExecutionSandboxPolicy::read_only(),
     };
     assert!(require_native_readonly_execution(&environment).is_err());
     #[cfg(target_os = "macos")]
@@ -197,9 +200,10 @@ async fn enforced_readonly_native_python_cannot_reach_a_loopback_listener() {
     // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
     // rooted there vanishes before --chdir reaches it.
     let tmp = crate::test_support::sandbox_visible_tempdir();
-    let Some(context) = native_context(tmp.path()) else {
+    let Some(mut context) = native_context(tmp.path()) else {
         return;
     };
+    context.elevated_sandbox_policy = Some(ExecutionSandboxPolicy::default());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -213,7 +217,15 @@ async fn enforced_readonly_native_python_cannot_reach_a_loopback_listener() {
         )
         .await
         .unwrap_err();
-    assert!(!refused.to_string().contains("connected"), "{refused}");
+    // Python includes the submitted source line in its traceback. Only an
+    // actual output line means the script reached the print after connect.
+    assert!(
+        !refused
+            .to_string()
+            .lines()
+            .any(|line| line.trim() == "connected"),
+        "{refused}"
+    );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

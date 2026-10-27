@@ -4,7 +4,7 @@ use super::{
     build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
     ensure_advanced_tooling, execute_tool_search_with_cache, initial_active_tools,
     is_synthetic_catalog_tool, remove_evicted_cache_activations, requested_tool_mode,
-    tool_matches_any_rule, touch_cached_tool_after_execution,
+    tool_matches_any_rule,
 };
 use crate::core::session::ToolActivationCache;
 use codewhale_config::AppMode;
@@ -26,14 +26,41 @@ fn tool(name: &str) -> Tool {
     }
 }
 
-/// `code_execution` writes the script to a tempdir and runs it as a plain
-/// child process in the workspace — no seccomp, no jail, no container. The
-/// description is model-facing, so calling it a sandbox would tell the model
-/// it has isolation the runtime never provides.
+/// The shared launcher applies policy only where enforcement is available.
+/// The model-facing description must not promise unconditional isolation.
 #[test]
 fn code_execution_description_does_not_claim_process_sandboxing() {
     assert!(CODE_EXECUTION_DESCRIPTION.contains("local Python interpreter"));
     assert!(!CODE_EXECUTION_DESCRIPTION.contains("sandbox"));
+}
+
+/// Python output must match our UTF-8 decoder even with non-UTF-8 parent stdio.
+#[tokio::test]
+async fn code_execution_returns_utf8_stdout_and_stderr() {
+    use crate::dependencies::ExternalTool as _;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    let _env_lock = lock_test_env();
+    if !crate::dependencies::Python::available() {
+        return;
+    }
+    let _encoding = EnvVarGuard::set("PYTHONIOENCODING", "gbk");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let result = super::execute_code_execution_tool(
+        &json!({"code": r#"import sys; print("\u4e2d\u6587"); print("\u9519\u8bef", file=sys.stderr)"#}),
+        tmp.path(),
+        &crate::tools::spec::ToolContext::new(tmp.path()),
+    )
+    .await
+    .expect("code execution should run");
+    let payload = result.metadata.expect("payload");
+    assert_eq!(
+        (
+            payload["stdout"].as_str().map(str::trim_end),
+            payload["stderr"].as_str().map(str::trim_end),
+        ),
+        (Some("中文"), Some("错误")),
+    );
 }
 
 /// The published synthetic-name list and the predicate that classifies a
@@ -76,6 +103,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "read",
             "write",
             "edit",
+            "file_search",
             "bash",
             "agent",
             "workflow",
@@ -83,6 +111,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "create_goal",
             "get_goal",
             "update_goal",
+            "task_shell_wait",
             "load_skill"
         ]
     );
@@ -93,8 +122,10 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
         "get_goal",
         "update_goal",
         "edit",
+        "file_search",
         "load_skill",
         "read",
+        "task_shell_wait",
         "todo_write",
         "tool_search",
         "workflow",
@@ -109,6 +140,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "read",
             "write",
             "edit",
+            "file_search",
             "bash",
             "agent",
             "workflow",
@@ -116,6 +148,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "create_goal",
             "get_goal",
             "update_goal",
+            "task_shell_wait",
             "Git",
             "Run",
             "tasks",
@@ -170,7 +203,6 @@ fn eager_workflow_still_respects_command_allow_and_deny_gates() {
                 allow.map(|name| vec![name.to_string()]),
                 deny.map(|name| vec![name.to_string()]),
                 None,
-                codewhale_execpolicy::ApprovalMode::Suggest,
                 ToolMode::Direct,
             );
             assert_eq!(policy.allows_tool("workflow"), expected);
@@ -230,24 +262,17 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
     let delta = cache.activate(&catalog, &first);
     active.extend(delta.admitted);
 
-    assert!(touch_cached_tool_after_execution(
-        &catalog,
-        &mut active,
-        &mut cache,
-        "deferred-0"
-    ));
+    assert!(cache.record_use("deferred-7"));
     let delta = cache.activate(&catalog, &["deferred-8".to_string()]);
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
+    // The batch is ranked best-first; using its oldest retained match
+    // promotes it ahead of the next batch without granting an unseen tool.
+    assert!(cache.names().any(|name| name == "deferred-7"));
     assert!(cache.names().any(|name| name == "deferred-0"));
-    assert!(!cache.names().any(|name| name == "deferred-1"));
+    assert!(!cache.names().any(|name| name == "deferred-6"));
 
-    assert!(!touch_cached_tool_after_execution(
-        &catalog,
-        &mut active,
-        &mut cache,
-        "never-activated"
-    ));
+    assert!(!cache.record_use("never-activated"));
     assert!(!active.contains("never-activated"));
 }
 
@@ -380,12 +405,14 @@ fn catalog_build_does_not_append_registry_guidance_to_the_shell_tool() {
 fn requested_tool_mode_prefers_model_hint_then_flag_then_direct() {
     use crate::features::{Feature, Features};
 
-    let off = Features::with_defaults();
-    assert_eq!(requested_tool_mode(None, &off), ToolMode::Direct);
-
-    let mut on = Features::with_defaults();
-    on.enable(Feature::CodeMode);
+    // #6562: code mode is the default; `[features] code_mode = false` is the
+    // escape hatch back to Direct.
+    let on = Features::with_defaults();
     assert_eq!(requested_tool_mode(None, &on), ToolMode::CodeMode);
+
+    let mut off = Features::with_defaults();
+    off.disable(Feature::CodeMode);
+    assert_eq!(requested_tool_mode(None, &off), ToolMode::Direct);
 
     // Model metadata wins over config, in both directions (Codex parity).
     assert_eq!(
@@ -422,5 +449,29 @@ fn execute_tools_is_eager_in_code_mode_and_deferred_in_direct() {
         catalog
             .iter()
             .all(|definition| definition.name != "execute_tools")
+    );
+}
+
+/// A timed-out or cancelled `code_execution` kills the interpreter and what the
+/// script started; a bare `output()` left both running.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_code_execution_kills_the_interpreter_tree() {
+    if crate::dependencies::resolve_python_interpreter().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pid_file = tmp.path().join("grandchild.pid");
+    let code = format!(
+        "import subprocess\np = subprocess.Popen(['sleep', '300'])\nopen({:?}, 'w').write(str(p.pid))\np.wait()\n",
+        pid_file.display().to_string()
+    );
+    let input = json!({ "code": code });
+    let context = crate::tools::spec::ToolContext::new(tmp.path());
+    let run = super::execute_code_execution_tool(&input, tmp.path(), &context);
+    let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+    assert!(
+        crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),
+        "a process the script started outlived the dropped code_execution call"
     );
 }

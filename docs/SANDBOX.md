@@ -1,5 +1,7 @@
 # Sandbox threat model
 
+> 阅读简体中文版：[zh_hans/SANDBOX.md](zh_hans/SANDBOX.md)。
+
 Codewhale can launch shell commands proposed by a model. Approval policy,
 workspace-aware tools, and an operating-system command wrapper are separate
 controls: an approval is not a sandbox, and selecting `workspace-write` does
@@ -14,8 +16,8 @@ run before execution reaches this boundary.
 | Mechanism | Platform | Selection | What Codewhale reports |
 |---|---|---|---|
 | Seatbelt (`sandbox-exec`) | macOS | Automatic when the runtime probe succeeds | `macos-seatbelt` |
-| Bubblewrap (`/usr/bin/bwrap`) | Linux | `prefer_bwrap = true` and the file is executable | `linux-bwrap` |
-| No OS wrapper | Linux without usable opt-in bwrap | Default | `none` |
+| Bubblewrap (`/usr/bin/bwrap`) | Linux | Default when installed and a wrapped probe run succeeds; `prefer_bwrap = false` opts out | `linux-bwrap` |
+| No OS wrapper | Linux without usable bwrap, or opted out | `prefer_bwrap = false`, or bwrap absent/unusable | `none` |
 | No OS wrapper | Windows | Current implementation | `none` |
 | OpenSandbox-compatible service | Any supported host | `sandbox_backend = "opensandbox"` | External execution path |
 
@@ -35,22 +37,32 @@ The profile can provide:
 - broad filesystem reads;
 - writes limited by the selected policy, including the workspace and specific
   runtime/cache paths needed by supported tools;
-- network access only when the policy enables it.
+- network access only when the policy enables it. A `read-only` policy with
+  network (the agent `read_only: true` shell mode) gets outbound IPv4 and the
+  system DNS resolver only. IPv6 and the host's own addresses, loopback
+  included, are denied, except the port of a local proxy named in
+  `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, and other local sockets stay
+  denied.
 
 If the probe fails or `sandbox-exec` is unavailable, Codewhale reports no OS
 sandbox and launches the command without a Seatbelt wrapper. It does not set a
 Seatbelt marker on that fallback.
 
-## Linux: opt-in bubblewrap
+## Linux: default bubblewrap
 
-Linux command sandboxing is opt-in. Set the top-level configuration key:
+Linux command sandboxing is on by default whenever bubblewrap works. Set the
+top-level configuration key to opt out:
 
 ```toml
-prefer_bwrap = true
+prefer_bwrap = false
 ```
 
-Codewhale selects bubblewrap only when `/usr/bin/bwrap` is a regular executable
-file. The wrapper derives its mounts and network namespace from the resolved
+Codewhale selects bubblewrap only when `/usr/bin/bwrap` is a regular
+executable file AND a wrapped probe run proves it can create its namespaces
+on this host — the exec bit alone lies where user namespaces are restricted
+(e.g. Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns`),
+where every wrapped command would fail rather than run unsandboxed. The
+wrapper derives its mounts and network namespace from the resolved
 `SandboxPolicy`:
 
 ```text
@@ -86,14 +98,18 @@ paths, and `/` are not promoted to writable mounts.
 For `read-only`, there are no writable binds, so the working directory remains
 inside the read-only root view. `--unshare-all` isolates the network namespace
 by default. Codewhale adds `--share-net` only when the policy's
-`network_access` is true. `danger-full-access` and `external-sandbox` bypass the
-local wrapper entirely.
+`network_access` is true. The agent `read_only: true` shell mode turns it on
+only in Full Access (see [Subagents](SUBAGENTS.md)); it then shares the host
+network namespace, including loopback and abstract unix sockets, like a
+networked `workspace-write` shell. Bubblewrap does not filter either.
+`danger-full-access` and `external-sandbox` bypass the local wrapper entirely.
 
-If the user does not opt in, or `/usr/bin/bwrap` is missing or non-executable,
-Codewhale reports `none` and launches the command without a Linux OS wrapper.
-There is no marker-only fallback to a different Linux sandbox.
+If the user opts out, or `/usr/bin/bwrap` is missing, non-executable, or
+cannot actually confine a child, Codewhale reports `none` and launches the
+command without a Linux OS wrapper. There is no marker-only fallback to a
+different Linux sandbox.
 
-Install bubblewrap separately when this opt-in fits the workflow:
+Install bubblewrap separately to get enforcement on Linux:
 
 - Ubuntu/Debian: `apt install bubblewrap`
 - Fedora: `dnf install bubblewrap`
@@ -160,6 +176,11 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 
 - `read-only` and `workspace-write` are enforced by Seatbelt or bubblewrap only
   when that wrapper is selected and available.
+- The configured value can only narrow the sandbox the permission mode
+  picks: Full Access (`yolo`) runs without the wrapper, Ask and Auto-Review
+  use `workspace-write`, and Plan uses `read-only`. A configured
+  `danger-full-access` or `external-sandbox` therefore takes effect only in
+  Full Access; it never loosens Ask or Auto-Review.
 - `danger-full-access` deliberately bypasses the local OS wrapper. On Linux it
   also skips the `PR_SET_NO_NEW_PRIVS` process-hardening flag at startup so
   `sudo`/setuid workflows keep running (#5723); see the process-hardening
@@ -178,8 +199,9 @@ backend:
 - `CODEWHALE_SANDBOX_URL`
 - `CODEWHALE_SANDBOX_API_KEY`
 
-There is no `CODEWHALE_PREFER_BWRAP` environment override; use the top-level
-`prefer_bwrap` config key.
+`CODEWHALE_PREFER_BWRAP` (legacy alias `DEEPSEEK_PREFER_BWRAP`) overrides the
+preference explicitly; the top-level `prefer_bwrap` config key is the durable
+setting.
 
 ## Diagnostics and failure attribution
 
@@ -217,7 +239,7 @@ Denial attribution is intentionally conservative:
 
 - `crates/tui/src/sandbox/mod.rs` — truthful selection and public capability markers
 - `crates/tui/src/sandbox/seatbelt.rs` — macOS wrapper and availability probe
-- `crates/tui/src/sandbox/bwrap.rs` — Linux opt-in wrapper
+- `crates/tui/src/sandbox/bwrap.rs` — Linux wrapper and functional availability probe
 - `crates/tui/src/sandbox/process_hardening.rs` — Linux parent-process hardening
 - `crates/tui/src/sandbox/backend.rs` — external backend selection
 - `crates/tui/src/tools/diagnostics.rs` — machine-readable diagnostics

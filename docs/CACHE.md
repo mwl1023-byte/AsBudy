@@ -1,5 +1,7 @@
 # Prompt-cache stability (the pinned prefix)
 
+> 阅读简体中文版：[zh_hans/CACHE.md](zh_hans/CACHE.md)。
+
 Provider prompt caches (DeepSeek KV cache, Anthropic `cache_control`) only pay
 off when the **byte prefix** of a request matches the previous one: the system
 prompt, then the tool catalog, then `messages[0..n-1]`. Any change to those
@@ -18,9 +20,8 @@ Concretely:
   (which changes the project-context pack, a directory listing, a skills scan)
   cannot move the pinned prefix under the model's feet mid-turn.
 - **History only grows.** Volatile facts the model must see (LSP diagnostics,
-  steer input, subagent completions, `<recommended_plugins>` on a matching
-  user turn) are appended to the message list, never spliced into the frozen
-  prefix. Workspace drift is delivered the same way:
+  steer input, subagent completions) are appended to the message list, never
+  spliced into the frozen prefix. Workspace drift is delivered the same way:
   at the start of each **new user turn** (never mid-tool-loop) the engine
   recomposes the volatile contributors and, if anything differs from what the
   model last saw, appends **one** `<context_update>` user-role message with a
@@ -35,8 +36,10 @@ Concretely:
 
 ## What counts as a declared header change
 
-These re-pin the prefix under a logged `change:<what>` reason (an expected,
-one-request miss):
+These re-pin the prefix under a logged `change:<what>` reason. A changed
+tool header can invalidate the remaining conversation prefix, requiring a full
+refill and, for some providers, cache-write charges. A named change does not
+make that cost small or prove a provider cache miss:
 
 | Op | Reason |
 | --- | --- |
@@ -48,7 +51,9 @@ one-request miss):
 | Session construction | `initial` |
 
 History resets that legitimately invalidate the tail (not the header) are
-logged as `reset:<what>` — `reset:compaction`, `reset:clear`.
+logged as `reset:<what>` — `reset:compaction`, `reset:clear`, and
+`reset:image_window` when a provider's per-request image limit moves the
+request image window (the oldest images go as fixed text notes).
 
 Anything else that changes the header bytes with **no** declared reason is
 **drift**: it is logged as `drift:<component>`, the original pin is **kept**
@@ -75,20 +80,38 @@ when no secret is configured (the common case), so it does not move the prefix.
 When a configured secret appears in a tool result, redacting it is a security
 requirement that correctly overrides cache stability for that one message.
 
+## Per-request receipts
+
+`provider_request_receipt` in exec stream JSON and `turn.provider_request` in
+Runtime events join the current preparation's logical prefix outcome with
+provider-wire tool bytes and digest, route identity and endpoint fingerprint,
+and that request's reported usage. A prepared wire observation does not prove
+provider delivery. Missing usage or adapter measurements remain
+unknown. Transparent retries settle their own receipt before cumulative usage
+is folded; their preparation is explicitly marked reused. Transport retries are
+counted, but missing per-attempt usage is never presented as free work.
+
+These are observations, not additional billing records. They do not establish
+that eviction caused every cache miss. A cache refill can depend on provider
+retention, routing, message changes and other conditions outside the local pin.
+
 ## Verifying the fix
 
 `/cache stats` reports prefix stability, the pin reason, the last miss reason,
 the undeclared-drift count, and the aggregate provider cache hit rate. In a
-coding session, expect the first turn to be a write and every later step —
-including steps after the agent writes files — to hit.
+coding session, a stable eligible prefix can be reused within the provider's
+retention window. Read reported usage to establish a hit; local stability alone
+does not prove one.
 
 ### Live end-to-end check (manual, key-gated)
 
 With a real `DEEPSEEK_API_KEY`, run a session that makes the agent take at
-least three tool steps in one turn, then open `/cache inspect`. Every request
-after the first should report `prompt_cache_hit_tokens > 0`; the base static
-prefix hash and the tool-catalog hash must not move between steps. If the hit
-drops mid-turn, the pin reason / drift count name the cause.
+least three tool steps in one turn, then open `/cache inspect`. Keep the route
+and tool surface fixed and compare `prompt_cache_hit_tokens`, reported input
+usage and the per-request receipt. Stable prefix and tool-catalog hashes show
+local continuity; provider cache counters establish reported reuse. A local
+re-pin can explain a change, but its absence does not establish the cause of a
+provider miss.
 
 ## KV-cache effect note (for contributors)
 

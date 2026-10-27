@@ -18,7 +18,7 @@
 //!    deliberately, and the resolution says so.
 //! 4. **No session route at all:** `Unavailable` with a precise reason.
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::fleet::store::FleetMember;
 use crate::model_routing::provider_router_candidates;
 use crate::provider_lake::all_catalog_models_for_provider;
@@ -65,7 +65,7 @@ impl ScoutResolution {
 /// companion exists for this provider/route" — never a guess.
 #[must_use]
 pub fn verified_fast_companion(provider_id: &str, session_model: &str) -> Option<(String, String)> {
-    let provider = ApiProvider::parse(provider_id)?;
+    let provider = ProviderKind::parse(provider_id)?;
     let candidates = provider_router_candidates(provider, session_model);
     let cheap = candidates.cheap?;
     // Verification: the suggested model must actually exist as an offering
@@ -166,11 +166,11 @@ mod tests {
 
     #[test]
     fn unpinned_scout_gets_verified_catalog_companion_or_inherits() {
-        // DeepSeek's documented cheap sibling is deepseek-v4-flash and it is
+        // DeepSeek's documented cheap sibling is deepseek-flash and it is
         // in the bundled catalog — a verified suggestion.
         let resolution = resolve_scout_route(None, "deepseek", "deepseek-v4-pro");
         assert_eq!(resolution.provider, "deepseek");
-        assert_eq!(resolution.model, "deepseek-v4-flash");
+        assert_eq!(resolution.model, "deepseek-flash");
         assert_eq!(resolution.source, ScoutSource::CatalogSuggestion);
 
         // Anthropic's Claude models have a documented cheap sibling
@@ -205,7 +205,7 @@ mod tests {
         match resolution.source {
             ScoutSource::CatalogSuggestion => {
                 // GLM-5-Turbo must actually be listed for zai in this build.
-                let available = all_catalog_models_for_provider(ApiProvider::Zai);
+                let available = all_catalog_models_for_provider(ProviderKind::Zai);
                 assert!(
                     available.iter().any(|m| m == "GLM-5-Turbo"),
                     "a CatalogSuggestion must be verifiable in the catalog"
@@ -224,7 +224,7 @@ mod tests {
     fn receipt_line_names_the_source() {
         let resolution = resolve_scout_route(None, "deepseek", "deepseek-v4-pro");
         let line = resolution.receipt_line();
-        assert!(line.contains("deepseek-v4-flash"), "{line}");
+        assert!(line.contains("deepseek-flash"), "{line}");
         assert!(line.contains("catalog suggestion"), "{line}");
     }
 }

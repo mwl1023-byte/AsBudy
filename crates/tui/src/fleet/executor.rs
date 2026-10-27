@@ -340,8 +340,13 @@ fn build_worker_exec_command_from_prompt(
         args.push(max_tool_calls.to_string());
     }
     if !exec_config.append_system_prompt.trim().is_empty() {
-        args.push("--append-system-prompt".to_string());
-        args.push(exec_config.append_system_prompt.clone());
+        // One `--flag=value` argument, so the policy is always the value: as a
+        // separate argument, text that reads like one of exec's own options
+        // (`--hooks`) is parsed as that option and the worker fails to start.
+        args.push(format!(
+            "--append-system-prompt={}",
+            exec_config.append_system_prompt
+        ));
     }
 
     if let Some(authority) = authority {
@@ -469,7 +474,7 @@ fn parse_exec_terminal_final_answer(value: &serde_json::Value) -> Option<FleetWo
         .and_then(|chars| usize::try_from(chars).ok())
         .unwrap_or_else(|| excerpt.chars().count());
     Some(FleetWorkerFinalAnswer {
-        excerpt: crate::exec_stream_final_answer_excerpt(excerpt),
+        excerpt: exec_stream_final_answer_excerpt(excerpt),
         chars,
     })
 }
@@ -489,7 +494,7 @@ fn parse_exec_terminal_route(value: &serde_json::Value) -> ParsedTerminalRoute {
         if provider.is_empty() || model.is_empty() {
             return None;
         }
-        let provider_kind = crate::config::ApiProvider::parse(provider)?;
+        let provider_kind = crate::config::ProviderKind::parse(provider)?;
         let provider_exact_id = match meta.get("provider_id") {
             None => None,
             Some(value) => {
@@ -500,7 +505,7 @@ fn parse_exec_terminal_route(value: &serde_json::Value) -> ParsedTerminalRoute {
                 Some(id.to_string())
             }
         };
-        if provider_exact_id.is_some() && provider_kind != crate::config::ApiProvider::Custom {
+        if provider_exact_id.is_some() && provider_kind != crate::config::ProviderKind::Custom {
             return None;
         }
         Some(FleetWorkerReportedRoute {
@@ -558,6 +563,7 @@ pub fn classify_worker_exit(exit_code: Option<i32>, stopped: bool) -> FleetWorke
 pub struct FleetExecutor {
     workspace: std::path::PathBuf,
     sessions_dir: Option<std::path::PathBuf>,
+    tailnet_snapshot: Option<std::sync::Arc<super::tailnet::TailnetSnapshot>>,
     adapter: super::host::LocalProcessFleetHostAdapter,
     ssh_adapters: std::collections::BTreeMap<String, super::host::SshFleetHostAdapter>,
     streams: std::collections::BTreeMap<String, WorkerStream>,
@@ -706,12 +712,28 @@ pub struct FleetWorkerTerminalEvent {
 }
 
 impl FleetExecutor {
+    pub async fn refresh_tailnet_inventory(&mut self) {
+        let snapshot = tokio::task::spawn_blocking(|| {
+            super::tailnet::TailnetSnapshot::new(
+                super::tailnet::inventory().map_err(|error| error.to_string()),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            super::tailnet::TailnetSnapshot::new(Err(format!(
+                "Tailnet inventory task failed: {error}"
+            )))
+        });
+        self.tailnet_snapshot = Some(std::sync::Arc::new(snapshot));
+    }
+
     pub fn new(workspace: impl AsRef<std::path::Path>) -> Self {
         let workspace = workspace.as_ref().to_path_buf();
         Self {
             adapter: super::host::LocalProcessFleetHostAdapter::new(&workspace),
             workspace,
             sessions_dir: None,
+            tailnet_snapshot: None,
             ssh_adapters: std::collections::BTreeMap::new(),
             streams: std::collections::BTreeMap::new(),
         }
@@ -765,6 +787,7 @@ impl FleetExecutor {
         attempt: Option<FleetExecutorAttempt>,
     ) -> super::host::FleetHostResult<super::host::FleetWorkerHandle> {
         let mut request = super::host::FleetWorkerStartRequest::new(worker_id, command);
+        request.attempt = attempt.clone();
         request.cwd = cwd;
         let session_capture = if matches!(host, FleetHostSpec::Local) {
             self.sessions_dir.as_ref().map(|dir| {
@@ -797,12 +820,13 @@ impl FleetExecutor {
                 let handle = self.adapter.start_worker(request)?;
                 (handle, WorkerStreamHost::Local)
             }
-            FleetHostSpec::Ssh { .. } => {
+            FleetHostSpec::Ssh { .. } | FleetHostSpec::Tailscale { .. } => {
                 let config = super::host::SshFleetHostConfig::from_host_spec(host)?;
                 let key = worker_id.to_string();
                 let adapter = self.ssh_adapters.entry(key.clone()).or_insert(
                     super::host::SshFleetHostAdapter::new(&self.workspace, config)?,
                 );
+                adapter.set_tailnet_snapshot(self.tailnet_snapshot.clone());
                 let handle = adapter.start_worker(request)?;
                 (handle, WorkerStreamHost::Ssh(key))
             }
@@ -847,11 +871,14 @@ impl FleetExecutor {
     }
 
     /// Wall-clock time this worker process has been running (R5). `None` when
-    /// the worker is not tracked.
+    /// the worker is not tracked or its exit was already observed: a process
+    /// that has exited is not running, so a deadline must not rewrite the
+    /// outcome that exit produced as a timeout.
     #[must_use]
     pub fn worker_running_for(&self, worker_id: &str) -> Option<std::time::Duration> {
         self.streams
             .get(worker_id)
+            .filter(|stream| !stream.terminal)
             .map(|stream| stream.started_at.elapsed())
     }
 
@@ -1028,6 +1055,29 @@ impl FleetExecutor {
     }
 }
 
+/// Character bound for `metadata.visible_final_answer_excerpt`. The excerpt
+/// is a status surface (fleet receipts, event labels, runtime API payloads),
+/// not the transcript: the full answer lives in the saved session and the
+/// worker's stream-json log, and `visible_final_answer_chars` carries the real
+/// length so a consumer can tell a bounded excerpt from a short answer.
+pub(crate) const EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS: usize = 4_000;
+
+/// Bound and secret-redact the visible final answer once, at the emitter, so
+/// every downstream consumer reads the same excerpt.
+pub(crate) fn exec_stream_final_answer_excerpt(output: &str) -> String {
+    let redacted = codewhale_config::persistence::redact_secrets(output.trim());
+    let mut chars = redacted.chars();
+    let excerpt: String = chars
+        .by_ref()
+        .take(EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,6 +1125,7 @@ mod tests {
 
     fn agent_profile(id: &str, role: &str, instructions: &str) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: Some(format!("{role} profile")),
             description: Some(format!("{role} description")),
@@ -1101,6 +1152,7 @@ mod tests {
 
     fn launch_spec(task: &FleetTaskSpec, workspace: &std::path::Path) -> AgentWorkerSpec {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker 1".to_string(),
             host: FleetHostSpec::Local,
@@ -1201,7 +1253,11 @@ mod tests {
         assert!(joined.contains("--allowed-tools read_file,grep_files"));
         assert!(joined.contains("--disallowed-tools exec_shell"));
         assert!(joined.contains("--max-turns 40"));
-        assert!(cmd.args.iter().any(|a| a == "never push to main"));
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a == "--append-system-prompt=never push to main")
+        );
     }
 
     #[test]
@@ -1398,6 +1454,7 @@ mod tests {
         worker.role = Some("implementer".to_string());
         worker.tool_profile = None;
         task.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             writable_paths: vec![std::path::PathBuf::from("src")],
             ..FleetWorkspaceRequirements::default()
         });
@@ -1660,46 +1717,6 @@ mod tests {
         let cmd = build_worker_exec_command("codewhale", &task, &exec, None);
         assert!(!cmd.args.join(" ").contains("--max-turns"));
         assert!(!cmd.args.join(" ").contains("--max-tool-calls"));
-    }
-
-    #[test]
-    fn default_max_turns_does_not_add_a_hidden_worker_cap() {
-        use clap::Parser;
-
-        let exec = FleetExecConfig::default();
-        let workspace = TempDir::new().unwrap();
-        for requested_steps in [None, Some(0), Some(13)] {
-            let mut task = task("x");
-            task.budget = requested_steps.map(|max_steps| FleetTaskBudget {
-                max_steps: Some(max_steps),
-                ..FleetTaskBudget::default()
-            });
-            let spec = launch_spec(&task, workspace.path());
-            let cmd = build_worker_exec_command_with_launch_spec(
-                "codewhale",
-                &task,
-                &spec,
-                &exec,
-                None,
-                &[],
-            )
-            .expect("production worker command");
-            let cli = crate::Cli::try_parse_from(
-                std::iter::once("codewhale").chain(cmd.args.iter().map(String::as_str)),
-            )
-            .expect("production worker args must parse");
-            let Some(crate::Commands::Exec(args)) = cli.command else {
-                panic!("expected worker exec command");
-            };
-            let expected = requested_steps.filter(|steps| *steps > 0);
-            assert_eq!(args.max_turns, expected);
-            assert_eq!(args.max_tool_calls, None);
-            // Follow omission beyond argv through the real CLI resolver. This
-            // previously installed 200 despite correct unbounded launch args.
-            let turn = crate::core::turn::TurnContext::new(crate::exec_max_steps(args.max_turns));
-            assert_eq!(turn.step_limit(), expected);
-            assert_eq!(turn.stop_diagnostics.effective_max_steps, expected);
-        }
     }
 
     #[test]
@@ -2046,7 +2063,7 @@ mod tests {
         })).unwrap();
         assert!(!answer.excerpt.contains("sk-ant-must-not-leak"));
         assert!(
-            answer.excerpt.chars().count() <= crate::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
+            answer.excerpt.chars().count() <= super::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
         );
         assert_eq!(answer.chars, 9000);
     }

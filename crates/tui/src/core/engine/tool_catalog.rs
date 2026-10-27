@@ -14,9 +14,10 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use crate::mcp::McpPool;
 use crate::model_profile::ToolSurfaceBudget;
-use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
+use crate::tools::spec::{
+    ToolContext, ToolError, ToolResult, optional_str, optional_u64, required_str,
+};
 use codewhale_config::AppMode;
-use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::Tool;
 
 use crate::core::session::ToolActivationCache;
@@ -24,18 +25,18 @@ use crate::dependencies::ExternalTool;
 use crate::features::{Feature, Features};
 use crate::regex_cache::compile_user_regex;
 
-pub(super) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
+pub(crate) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
 pub(crate) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
-pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
+pub(crate) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
-const CODE_EXECUTION_DESCRIPTION: &str = "Execute Python code with the local Python interpreter in the workspace and return stdout/stderr/return_code as JSON.";
+const CODE_EXECUTION_DESCRIPTION: &str = "Execute Python code with the local Python interpreter using this call's execution policy and return stdout/stderr/return_code as JSON.";
 pub(super) use crate::tools::codemode::EXECUTE_TOOLS_TOOL_NAME;
 pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
 pub(crate) const TOOL_SEARCH_NAME: &str = "tool_search";
 const TOOL_RESULT_RETRIEVAL_NAME: &str = "retrieve_tool_result";
 const TOOL_SEARCH_TYPE: &str = "tool_search_20251119";
-const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
-const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
+pub(super) const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
+pub(super) const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
 const TOOL_SEARCH_DEFAULT_MAX_RESULTS: usize = 8;
 const TOOL_SEARCH_MAX_RESULTS_LIMIT: usize = 8;
 
@@ -50,10 +51,10 @@ pub(crate) fn is_tool_search_tool(name: &str) -> bool {
 #[rustfmt::skip]
 pub(crate) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     // Core work controls are eager; specialized tools stay searchable.
-    "read", "write", "edit", "bash", "agent", "workflow", "todo_write",
+    "read", "write", "edit", "file_search", "bash", "agent", "workflow", "todo_write",
     // Continuation instructions require these controls. Hiding them behind
     // discovery leaves a model unable to stop the work it was asked to run.
-    "create_goal", "get_goal", "update_goal",
+    "create_goal", "get_goal", "update_goal", "task_shell_wait",
     // The pinned `## Skills` index tells the model to call `load_skill`, so
     // the tool has to be on the wire for that instruction to be true. Behind
     // `tool_search` it cost a discovery hop plus a `change:tool_surface`
@@ -76,12 +77,12 @@ const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
     CoreActionToolFallback {
         name: "write",
         description: "Create or replace workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-mutation authority; switch to Work mode before writing.",
+        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-writing authority; the user can change modes with /mode.",
     },
     CoreActionToolFallback {
         name: "edit",
         description: "Apply exact replacements to workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-mutation authority; switch to Work mode before editing.",
+        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-writing authority; the user can change modes with /mode.",
     },
 ];
 
@@ -311,7 +312,9 @@ pub(crate) fn ensure_advanced_tooling(
     // `crate::dependencies::resolve_python_interpreter` for the probe.
     if mode != AppMode::Plan
         && !catalog.iter().any(|t| t.name == CODE_EXECUTION_TOOL_NAME)
-        && crate::dependencies::resolve_python_interpreter().is_some()
+        && crate::dependencies::host_tool_available(CODE_EXECUTION_TOOL_NAME, || {
+            crate::dependencies::resolve_python_interpreter().is_some()
+        })
     {
         catalog.push(Tool {
             tool_type: Some(CODE_EXECUTION_TOOL_TYPE.to_string()),
@@ -320,7 +323,16 @@ pub(crate) fn ensure_advanced_tooling(
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "code": { "type": "string", "description": "Python source code to execute." }
+                    "code": { "type": "string", "description": "Python source code to execute." },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["workspace-write", "danger-full-access"],
+                        "description": "Request a wider policy for this exact execution after a sandbox denial; requires justification and explicit user approval."
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: why this exact code needs wider access."
+                    }
                 },
                 "required": ["code"]
             }),
@@ -342,7 +354,9 @@ pub(crate) fn ensure_advanced_tooling(
     // the tool only when `resolve_node()` succeeds.
     if mode != AppMode::Plan
         && !catalog.iter().any(|t| t.name == JS_EXECUTION_TOOL_NAME)
-        && crate::dependencies::resolve_node().is_some()
+        && crate::dependencies::host_tool_available(JS_EXECUTION_TOOL_NAME, || {
+            crate::dependencies::resolve_node().is_some()
+        })
     {
         let mut tool = crate::tools::js_execution::js_execution_tool_definition();
         tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
@@ -432,23 +446,6 @@ pub(crate) fn remove_evicted_cache_activations(
     }
 }
 
-/// Promote a successfully executed deferred tool only when this conversation
-/// had already activated it. Execution can update recency, never grant a name.
-pub(crate) fn touch_cached_tool_after_execution(
-    catalog: &[Tool],
-    active: &mut HashSet<String>,
-    cache: &mut ToolActivationCache,
-    name: &str,
-) -> bool {
-    if !cache.names().any(|cached| cached == name) {
-        return false;
-    }
-    let delta = cache.activate(catalog, &[name.to_string()]);
-    remove_evicted_cache_activations(catalog, active, delta.evicted);
-    active.extend(delta.admitted);
-    true
-}
-
 /// Make the recovery schema visible on the next provider step when a tool
 /// result actually publishes retrievable evidence. The initial toolbox stays
 /// small, while a receipt never advertises a deferred route that merely asks
@@ -458,20 +455,23 @@ pub(crate) fn activate_result_dependencies(
     active: &mut HashSet<String>,
     cache: &mut ToolActivationCache,
     result: &ToolResult,
-) -> bool {
+    measure: &mut crate::core::session::ToolActivationMeasurer<'_>,
+) -> Result<bool, ToolError> {
     let needs_retrieval = result
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.get("evidence_available"))
         .and_then(Value::as_bool)
-        == Some(true);
+        == Some(true)
+        || super::context::offers_retrieval(result.metadata.as_ref());
     if !needs_retrieval {
-        return false;
+        return Ok(false);
     }
-    let delta = cache.activate(catalog, &[TOOL_RESULT_RETRIEVAL_NAME.to_string()]);
+    let delta =
+        cache.activate_measured(catalog, &[TOOL_RESULT_RETRIEVAL_NAME.to_string()], measure)?;
     remove_evicted_cache_activations(catalog, active, delta.evicted.iter().cloned());
     active.extend(delta.admitted.iter().cloned());
-    !delta.admitted.is_empty() || !delta.evicted.is_empty()
+    Ok(!delta.admitted.is_empty() || !delta.evicted.is_empty())
 }
 
 fn active_tool_list_from_catalog(catalog: &[Tool], active: &HashSet<String>) -> Vec<Tool> {
@@ -525,7 +525,6 @@ pub(super) struct ToolSurfacePolicy {
     /// this limit into its own admission counter at turn start; `None` means
     /// unlimited (the default), which keeps the admission gate inert.
     pub(super) max_tool_calls: Option<u32>,
-    questions_allowed: bool,
 }
 
 impl ToolSurfacePolicy {
@@ -540,7 +539,6 @@ impl ToolSurfacePolicy {
         allowed_tools: Option<Vec<String>>,
         disallowed_tools: Option<Vec<String>>,
         max_tool_calls: Option<u32>,
-        approval_mode: ApprovalMode,
         tool_mode: ToolMode,
     ) -> Self {
         let mut catalog = tools.unwrap_or_default();
@@ -553,7 +551,12 @@ impl ToolSurfacePolicy {
         // explicit command gate.
         catalog.retain(|tool| {
             !tool_denied(disallowed_tools.as_deref(), &tool.name)
-                && tool_allowed(allowed_tools.as_deref(), &tool.name)
+                && (tool_allowed(allowed_tools.as_deref(), &tool.name)
+                    || retrieval_available_beside_an_allowlist(
+                        allowed_tools.as_deref(),
+                        disallowed_tools.as_deref(),
+                        &tool.name,
+                    ))
         });
         for tool in &mut catalog {
             if let Some(actions) = tool
@@ -576,12 +579,6 @@ impl ToolSurfacePolicy {
                 .and_then(Value::as_array)
                 .is_none_or(|actions| !actions.is_empty())
         });
-        let questions_allowed =
-            super::super::authority::permission_posture_allows_questions(approval_mode);
-        if !questions_allowed {
-            catalog.retain(|tool| tool.name != REQUEST_USER_INPUT_NAME);
-        }
-
         let mut active_names = initial_active_tools(&catalog);
         active_names.extend(dynamic_active_tools.iter().map(|name| (*name).to_string()));
         active_names.retain(|name| catalog.iter().any(|tool| tool.name == *name));
@@ -597,7 +594,6 @@ impl ToolSurfacePolicy {
             allowed_tools,
             disallowed_tools,
             max_tool_calls,
-            questions_allowed,
         }
     }
 
@@ -608,6 +604,26 @@ impl ToolSurfacePolicy {
 
     pub(super) fn passes_allow_list(&self, name: &str) -> bool {
         tool_allowed(self.allowed_tools.as_deref(), name)
+            || retrieval_available_beside_an_allowlist(
+                self.allowed_tools.as_deref(),
+                self.disallowed_tools.as_deref(),
+                name,
+            )
+    }
+
+    /// A configured-server handshake may only serve this captured turn's
+    /// MCP namespace. Do not replace the command-scoped ceiling with config.
+    pub(super) fn permits_mcp_discovery(&self, server: &str) -> bool {
+        !crate::mcp::McpPool::server_denied_by(
+            self.disallowed_tools.as_deref().unwrap_or_default(),
+            server,
+        ) && self.allowed_tools.as_ref().is_none_or(|rules| {
+            let normalized = rules
+                .iter()
+                .map(|rule| rule.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            crate::mcp::tool_selection_covers_server(&normalized, server)
+        })
     }
 
     pub(super) fn denies_tool(&self, name: &str) -> bool {
@@ -617,10 +633,6 @@ impl ToolSurfacePolicy {
     pub(super) fn denies_call(&self, name: &str, input: &Value) -> bool {
         tool_call_denied(self.disallowed_tools.as_deref(), name, input)
     }
-
-    pub(super) fn allows_questions(&self) -> bool {
-        self.questions_allowed
-    }
 }
 
 pub(super) fn tool_allowed(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
@@ -628,6 +640,25 @@ pub(super) fn tool_allowed(allowed_tools: Option<&[String]>, tool_name: &str) ->
         return true;
     };
     tool_matches_any_rule(allowed_tools, tool_name)
+}
+
+/// Retrieval stays off the initial `tools` field but must survive an allow-list
+/// narrowing, or a result that names a saved copy advertises a route the turn
+/// cannot call.
+///
+/// This is deliberately not a branch inside [`tool_allowed`]: that answer is
+/// "does this name match the allow-list", and an empty allow-list means no
+/// tools, which `exec` relies on. Keeping the tool in the catalog lets
+/// [`activate_result_dependencies`] admit it later, only after a result really
+/// publishes retrievable evidence, and an explicit deny still removes it.
+fn retrieval_available_beside_an_allowlist(
+    allowed_tools: Option<&[String]>,
+    disallowed_tools: Option<&[String]>,
+    tool_name: &str,
+) -> bool {
+    tool_name == TOOL_RESULT_RETRIEVAL_NAME
+        && disallowed_tools.is_none_or(|rules| !tool_denied(Some(rules), tool_name))
+        && allowed_tools.is_some_and(|rules| !rules.is_empty())
 }
 
 pub(crate) fn tool_denied(disallowed_tools: Option<&[String]>, tool_name: &str) -> bool {
@@ -662,6 +693,9 @@ fn requires_raw_shell(name: &str) -> bool {
             | "code_execution"
             | "js_execution"
             | "rlm_eval"
+            // Launching an MCP server spawns an arbitrary local process.
+            | "start_mcp_server"
+            | "start_registry_mcp_server"
     )
 }
 
@@ -788,6 +822,75 @@ pub(crate) fn active_tools_for_request(
         crate::tools::schema_sanitize::prepare_tools_for_strict_mode(&mut tools);
     }
     Some(tools)
+}
+
+pub(crate) fn measure_deferred_tools(
+    client: &dyn crate::core::model_client::ModelClient,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    strict_tool_mode: bool,
+    catalog: &[Tool],
+    names: &[String],
+) -> Result<crate::core::session::ToolActivationMeasurement, ToolError> {
+    let eager = catalog
+        .iter()
+        .filter(|tool| !tool.defer_loading.unwrap_or(false) || is_tool_search_tool(&tool.name))
+        .map(|tool| tool.name.clone())
+        .collect::<HashSet<_>>();
+    let prepare = |active: &HashSet<String>| {
+        let tools = active_tools_for_request(catalog, active, strict_tool_mode);
+        let tool_choice = tools.as_ref().map(|_| {
+            if strict_tool_mode {
+                json!("required")
+            } else {
+                json!({"type": "auto"})
+            }
+        });
+        codewhale_core::request::prepare_primary_turn_request(
+            codewhale_core::request::PrimaryTurnRequest {
+                model: model.to_string(),
+                messages: Vec::new(),
+                max_tokens: client.effective_max_output_tokens(model),
+                system: None,
+                tools,
+                tool_choice,
+                reasoning_effort: reasoning_effort.map(str::to_string),
+            },
+        )
+    };
+    let baseline = client
+        .measure_outbound_tools(prepare(&eager))
+        .map_err(|_| {
+            ToolError::not_available(
+                "Unable to measure the provider tool surface; toolbox admission was not changed",
+            )
+        })?;
+    let mut active = eager;
+    active.extend(names.iter().cloned());
+    let measured = client
+        .measure_outbound_tools(prepare(&active))
+        .map_err(|_| {
+            ToolError::not_available(
+                "Unable to measure the provider tool surface; toolbox admission was not changed",
+            )
+        })?;
+    Ok(crate::core::session::ToolActivationMeasurement {
+        schema_bytes: baseline
+            .as_ref()
+            .zip(measured.as_ref())
+            .map(|(base, all)| all.tool_schema_bytes.saturating_sub(base.tool_schema_bytes)),
+        unavailable: measured.map_or_else(Vec::new, |wire| {
+            names
+                .iter()
+                .filter(|name| {
+                    wire.omitted_tool_names
+                        .iter()
+                        .any(|omitted| crate::client::from_api_tool_name(omitted) == **name)
+                })
+                .cloned()
+                .collect()
+        }),
+    })
 }
 
 /// Reusable scratch for one `tool_search` catalog scan.
@@ -1056,7 +1159,7 @@ fn suggest_tool_names(catalog: &[Tool], requested: &str, limit: usize) -> Vec<St
 ///
 /// MCP-contributed names are deliberately *not* here: those resolve through the
 /// real pool, and stay unknown when the pool did not resolve them.
-/// [`MULTI_TOOL_PARALLEL_NAME`] is not here either — it is a call name the model
+/// `multi_tool_use.parallel` is not here either — it is a legacy name the model
 /// may emit, never a catalog entry, so it can never appear in a transmitted
 /// tool array and has no catalog provenance to report.
 pub(super) fn default_synthetic_catalog_tool_names() -> Vec<String> {
@@ -1226,7 +1329,33 @@ pub(super) fn maybe_hydrate_requested_deferred_tool(
     }
 
     hydrated_tools_this_batch.insert(tool_name.to_string());
+    if deferred_first_call_matches_schema(def, tool_input) {
+        // Progressive disclosure keeps unused schemas out of the prefix; it
+        // must not cost a well-formed call its turn. Every authority gate has
+        // already run for this call, so executing it grants nothing new, and
+        // the tool still activates at the tail for later requests.
+        return None;
+    }
     Some(deferred_tool_schema_hydration_result(def, tool_input))
+}
+
+/// Whether a call to a tool whose schema the model has not yet been shown is
+/// shaped like that schema: an object carrying every required field and, when
+/// the schema declares properties, no field outside them. Known limitation:
+/// field types are left to the tool's own input validation, which reports a
+/// wrong type as an ordinary tool error after the schema has been activated.
+pub(crate) fn deferred_first_call_matches_schema(tool: &Tool, tool_input: &Value) -> bool {
+    let Some(input) = tool_input.as_object() else {
+        return false;
+    };
+    let expected = schema_fields(&tool.input_schema);
+    let required = schema_required_fields(&tool.input_schema);
+    required.iter().all(|field| input.contains_key(field))
+        && (expected.is_empty() && input.is_empty()
+            || !expected.is_empty()
+                && input
+                    .keys()
+                    .all(|key| expected.iter().any(|field| &field.name == key)))
 }
 
 #[cfg(test)]
@@ -1249,7 +1378,7 @@ pub(super) fn preflight_requested_deferred_tool(
     result
 }
 
-fn deferred_tool_schema_hydration_result(tool: &Tool, tool_input: &Value) -> ToolResult {
+pub(crate) fn deferred_tool_schema_hydration_result(tool: &Tool, tool_input: &Value) -> ToolResult {
     let expected = schema_fields(&tool.input_schema);
     let required = schema_required_fields(&tool.input_schema);
     let received = received_field_names(tool_input);
@@ -1444,12 +1573,33 @@ pub(super) fn execute_tool_search(
     catalog: &[Tool],
     active_tools: &mut HashSet<String>,
 ) -> Result<ToolResult, ToolError> {
-    execute_tool_search_inner(tool_name, input, catalog, active_tools, None)
+    execute_tool_search_inner(tool_name, input, catalog, active_tools, None, &mut |_| {
+        Ok(Default::default())
+    })
 }
 
 /// Execute tool search while retaining activated schemas in the bounded
 /// conversation cache. Kept separate from the test-only pure search helper so existing
 /// pure catalog tests and compatibility callers do not need an engine session.
+pub(crate) fn execute_tool_search_measured(
+    tool_name: &str,
+    input: &serde_json::Value,
+    catalog: &[Tool],
+    active_tools: &mut HashSet<String>,
+    cache: &mut crate::core::session::ToolActivationCache,
+    measure: &mut crate::core::session::ToolActivationMeasurer<'_>,
+) -> Result<ToolResult, ToolError> {
+    execute_tool_search_inner(
+        tool_name,
+        input,
+        catalog,
+        active_tools,
+        Some(cache),
+        measure,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn execute_tool_search_with_cache(
     tool_name: &str,
     input: &serde_json::Value,
@@ -1457,7 +1607,14 @@ pub(crate) fn execute_tool_search_with_cache(
     active_tools: &mut HashSet<String>,
     cache: &mut crate::core::session::ToolActivationCache,
 ) -> Result<ToolResult, ToolError> {
-    execute_tool_search_inner(tool_name, input, catalog, active_tools, Some(cache))
+    execute_tool_search_measured(
+        tool_name,
+        input,
+        catalog,
+        active_tools,
+        cache,
+        &mut |names| ToolActivationCache::test_measure(catalog, names),
+    )
 }
 
 fn execute_tool_search_inner(
@@ -1466,6 +1623,7 @@ fn execute_tool_search_inner(
     catalog: &[Tool],
     active_tools: &mut HashSet<String>,
     cache: Option<&mut crate::core::session::ToolActivationCache>,
+    measure: &mut crate::core::session::ToolActivationMeasurer<'_>,
 ) -> Result<ToolResult, ToolError> {
     let query = required_str(input, "query")?;
     let match_kind = match tool_name {
@@ -1498,10 +1656,27 @@ fn execute_tool_search_inner(
     };
 
     let mut cache_rejected = Vec::new();
+    let mut cache_held = Vec::new();
+    let mut evicted = Vec::new();
+    let mut toolbox = None;
     if let Some(cache) = cache {
-        let delta = cache.activate(catalog, &discovered);
-        remove_evicted_cache_activations(catalog, active_tools, delta.evicted);
+        let delta = cache.activate_measured(catalog, &discovered, measure)?;
+        toolbox = Some(json!({
+            "active_deferred_tools": cache.names().collect::<Vec<_>>(),
+            "added_wire_schema_bytes": delta.schema_bytes,
+            "soft_name_target": crate::core::session::TOOL_ACTIVATION_CACHE_MAX_NAMES,
+            "soft_wire_byte_target": crate::core::session::TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES,
+            "exceeds_soft_target": delta.exceeds_soft_target,
+            "authority": "Current deferred toolbox; admitted tools supersede earlier eviction or unavailable notices for the same name. Permission checks still apply to every call.",
+        }));
+        remove_evicted_cache_activations(catalog, active_tools, delta.evicted.iter().cloned());
+        evicted = delta
+            .evicted
+            .into_iter()
+            .filter(|name| !active_tools.contains(name))
+            .collect();
         cache_rejected = delta.rejected;
+        cache_held = delta.held;
         discovered = delta.admitted;
     }
     for name in &discovered {
@@ -1526,65 +1701,130 @@ fn execute_tool_search_inner(
         json!({
             "type": "unavailable_tool_reference",
             "tool_name": name,
-            "reason": "The tool schema exceeds the bounded conversation toolbox (8 cached tools, 16KiB of added serialized schemas). Narrow the search or use a smaller matching tool."
+            "reason": "The provider cannot offer this tool schema, or its added wire schema exceeds 16KiB. It was not loaded. Use a smaller matching tool or a compatible route."
+        })
+    }));
+    unavailable_references.extend(cache_held.iter().map(|name| {
+        json!({
+            "type": "unavailable_tool_reference",
+            "tool_name": name,
+            "reason": "Not loaded in this batch: recently used tools fill the soft toolbox target (8 deferred tools, 16KiB of added wire schemas). Call tool_search with tool_search_input to load this match on its own; recently used tools can exceed these soft targets.",
+            "tool_search_input": readmission_search_input(name),
         })
     }));
 
-    let payload = json!({
+    let mut payload = json!({
         "type": "tool_search_tool_search_result",
         "tool_references": references,
         "unavailable_tool_references": unavailable_references.clone(),
     });
+    let mut metadata = json!({
+        "tool_references": discovered,
+        "unavailable_tool_references": unavailable_references,
+    });
+    if let Some(toolbox) = toolbox {
+        payload["toolbox"] = toolbox.clone();
+        metadata["toolbox"] = toolbox;
+    }
+    if !evicted.is_empty() {
+        payload["evicted_tool_references"] = evicted
+            .iter()
+            .map(|name| {
+                json!({
+                    "type": "evicted_tool_reference",
+                    "tool_name": name,
+                    "reason": "Removed from the current deferred toolbox while making room under its soft targets (8 deferred tools, 16KiB of added wire schemas). Call tool_search with tool_search_input to load it again; a later admission supersedes this notice.",
+                    "tool_search_input": readmission_search_input(name),
+                })
+            })
+            .collect();
+        metadata["evicted_tool_references"] = json!(evicted);
+    }
 
     Ok(ToolResult {
         content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
         success: true,
-        metadata: Some(json!({
-            "tool_references": discovered,
-            "unavailable_tool_references": unavailable_references,
-        })),
+        metadata: Some(metadata),
     })
 }
 
+fn readmission_search_input(name: &str) -> Value {
+    json!({
+        "query": format!("^{}\\n", regex::escape(&name.to_lowercase())),
+        "match": "regex",
+        "max_results": 1,
+    })
+}
+
+/// Describe-only `tool_search` for `execute_tools` programs: the same
+/// ranking as a direct search, answered with each match's name, description
+/// and input schema — and no activation, so the request's tool array and
+/// the session-pinned prefix stay exactly as they were.
+pub(super) fn describe_tools_for_program(
+    input: &serde_json::Value,
+    catalog: &[Tool],
+) -> Result<ToolResult, ToolError> {
+    let query = required_str(input, "query")?;
+    let match_kind = optional_str(input, "match")?.unwrap_or("bm25");
+    let max_results = usize::try_from(optional_u64(
+        input,
+        "max_results",
+        TOOL_SEARCH_DEFAULT_MAX_RESULTS as u64,
+    )?)
+    .unwrap_or(TOOL_SEARCH_DEFAULT_MAX_RESULTS)
+    .clamp(1, TOOL_SEARCH_MAX_RESULTS_LIMIT);
+    let names = match match_kind {
+        "regex" => discover_tools_with_regex(catalog, query, max_results)?,
+        "bm25" => discover_tools_with_bm25_like(catalog, query, max_results),
+        other => {
+            return Err(ToolError::invalid_input(format!(
+                "Unsupported match algorithm '{other}'. Expected one of: bm25, regex"
+            )));
+        }
+    };
+    let tools = names
+        .iter()
+        .filter_map(|name| catalog.iter().find(|tool| &tool.name == name))
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    ToolResult::json(&json!({ "tools": tools }))
+        .map_err(|error| ToolError::execution_failed(error.to_string()))
+}
+
+/// Runs under the effective per-call policy, including an explicitly approved
+/// elevation. Shared-launcher platform limits still apply; this is not a
+/// persistent REPL. Code arrives on stdin so sandbox-private /tmp is harmless.
 pub(super) async fn execute_code_execution_tool(
     input: &serde_json::Value,
     workspace: &Path,
+    context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     let code = required_str(input, "code")?;
-
-    // Resolve the locally-installed Python interpreter we cached at
-    // catalog-build time. If it's absent now (somehow registered but
-    // disappeared between startup and this call — concurrent uninstall,
-    // PATH change, etc.) the ExternalTool::tokio_command() will return
-    // None and we fail fast with a clear message.
-    //
-    // Write the code to a temp file and execute it as a script rather
-    // than passing it via `-c "<code>"`. Reasons:
-    //   * `-c` has length limits (argv) on Windows.
-    //   * Multiline code with quote nesting is brittle through `-c`.
-    //   * Tracebacks reference a real filename instead of `<string>`,
-    //     so the model can interpret line numbers correctly.
-    // Tempfile lives only for the duration of this execution; Drop
-    // removes it. We use `.py` so any shebang / encoding-sniffer
-    // logic in the interpreter behaves normally.
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| ToolError::execution_failed(format!("tempdir failed: {e}")))?;
-    let script_path = temp_dir.path().join("code_execution.py");
-    tokio::fs::write(&script_path, code)
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
-
-    let mut cmd = crate::dependencies::Python::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed(
-            "code_execution: Python interpreter became unavailable".to_string(),
-        )
+    let interpreter = crate::dependencies::Python::resolve().ok_or_else(|| {
+        ToolError::execution_failed("code_execution: Python interpreter became unavailable")
     })?;
-    cmd.arg(&script_path).current_dir(workspace);
-
-    let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| ToolError::Timeout { seconds: 120 })
-        .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
+    let (program, mut args) = crate::dependencies::split_interpreter_spec(&interpreter);
+    args.push("-".to_string());
+    let budget = Duration::from_secs(120);
+    let mut cmd =
+        crate::tools::shell::sandboxed_runner_command(context, &program, args, workspace, budget)?;
+    // Match the UTF-8 decoder below, including Windows Python's piped output.
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    let output = tokio::time::timeout(
+        budget,
+        crate::process_tree::contained_output_with_input(&mut cmd, code.as_bytes().to_vec()),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout {
+        seconds: budget.as_secs(),
+    })
+    .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

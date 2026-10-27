@@ -682,7 +682,12 @@ async fn test_write_file_tool() {
     let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
     assert_eq!(
         mutation["files"],
-        json!([{ "path": "output.txt", "outcome": "created" }])
+        json!([{
+            "path": "output.txt",
+            "outcome": "created",
+            "size": "test content".len(),
+            "sha256": crate::hashing::sha256_hex(b"test content"),
+        }])
     );
     assert!(
         mutation["diff"]
@@ -766,6 +771,7 @@ async fn write_file_tool_preserves_existing_mode() {
     let path = tmp.path().join("shared.txt");
     fs::write(&path, b"before").expect("initial write");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("set shared permissions");
+    ctx.note_file_read(&ctx.resolve_path("shared.txt").expect("resolve"));
 
     WriteFileTool
         .execute(json!({"path": "shared.txt", "content": "after"}), &ctx)
@@ -783,6 +789,7 @@ async fn write_file_over_crlf_file_preserves_crlf_line_endings() {
     let ctx = ToolContext::new(tmp.path().to_path_buf());
     let path = tmp.path().join("crlf.txt");
     fs::write(&path, b"alpha\r\nbeta\r\n").expect("initial CRLF write");
+    ctx.note_file_read(&ctx.resolve_path("crlf.txt").expect("resolve"));
 
     WriteFileTool
         .execute(
@@ -807,6 +814,7 @@ async fn contract_write_over_crlf_file_preserves_crlf_line_endings() {
     let ctx = ToolContext::new(tmp.path().to_path_buf());
     let path = tmp.path().join("crlf.txt");
     fs::write(&path, b"alpha\r\nbeta\r\n").expect("initial CRLF write");
+    ctx.note_file_read(&ctx.resolve_path("crlf.txt").expect("resolve"));
 
     WriteFileTool::execute_contract_write(
         json!({"path": "crlf.txt", "content": "gamma\ndelta\n"}),
@@ -1211,7 +1219,14 @@ async fn test_edit_file_tool() {
     let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
     assert_eq!(
         mutation["files"],
-        json!([{ "path": "edit_me.txt", "outcome": "updated" }])
+        json!([{
+            "path": "edit_me.txt",
+            "outcome": "updated",
+            "size": fs::read(tmp.path().join("edit_me.txt")).expect("edited").len(),
+            "sha256": crate::hashing::sha256_hex(
+                fs::read(tmp.path().join("edit_me.txt")).expect("edited")
+            ),
+        }])
     );
     let receipt_diff = mutation["diff"].as_str().expect("receipt diff");
     assert!(receipt_diff.contains("--- a/edit_me.txt"), "{receipt_diff}");
@@ -1907,6 +1922,50 @@ async fn test_edit_file_not_found_shows_search_preview() {
         err.contains("first line"),
         "error should preview search text: {err}"
     );
+}
+
+/// #6542 — a missed search returns the nearest region with line numbers and
+/// names a whitespace-only difference, so the retry can copy the real text.
+#[tokio::test]
+async fn edit_miss_returns_nearest_excerpt_with_line_numbers_and_whitespace_note() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    fs::write(
+        tmp.path().join("near.rs"),
+        "fn a() {}\n\nfn compute(x: u32) -> u32 {\n    x + 1\n}\n",
+    )
+    .expect("write");
+    read_before_edit(&ctx, "near.rs").await;
+
+    let err = EditFileTool
+        .execute(
+            json!({
+                "path": "near.rs",
+                "search": "fn compute(x: u32) -> u32 {   \n    x + 1\n}",
+                "replace": "fn compute(x: u32) -> u32 {\n    x + 2\n}"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("trailing whitespace keeps the search from matching")
+        .to_string();
+    assert!(err.contains("Closest match (lines 3-5"), "{err}");
+    assert!(err.contains("3\tfn compute(x: u32) -> u32 {"), "{err}");
+    assert!(err.contains("trailing whitespace"), "{err}");
+
+    let err = EditFileTool
+        .execute(
+            json!({
+                "path": "near.rs",
+                "search": "completely unrelated text\nnothing like it",
+                "replace": "x"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("no match")
+        .to_string();
+    assert!(err.contains("No similar region"), "{err}");
 }
 
 /// #157 / #5209 — `replacement` is an unambiguous synonym for `replace`, so

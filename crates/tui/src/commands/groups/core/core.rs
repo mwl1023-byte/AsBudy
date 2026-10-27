@@ -1,161 +1,28 @@
-//! Core commands: help, clear, exit, model
+//! Remaining legacy core commands: clear, exit, model and related interactions.
 
-use std::fmt::Write;
-use std::path::PathBuf;
-
-use crate::config::{
-    ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
-    normalize_custom_model_id, normalize_model_name_for_provider,
-};
+use crate::config::{ProviderKind, normalize_custom_model_id, normalize_model_name_for_provider};
 #[cfg(test)]
 use crate::reasoning_preference::ReasoningEffort;
 use crate::tui::app::{App, AppAction};
-use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
-use codewhale_config::AppMode;
-use codewhale_localization::{Locale, MessageId, tr};
+use crate::tui::views::{ModalKind, SubAgentsView, subagent_view_agents};
+use codewhale_localization::Locale;
+use codewhale_localization::{MessageId, tr};
 
 use super::CommandResult;
-
-/// Show help information
-pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
-    if let Some(topic) = topic {
-        let user_commands = crate::commands::user_registry::with_registry_for_workspace(
-            Some(&app.workspace),
-            Clone::clone,
-        );
-        if let Some(command) = user_commands.get(topic) {
-            return CommandResult::message(user_command_help(app.ui_locale, command));
-        }
-
-        // Show help for specific command
-        if let Some(cmd) = crate::commands::get_command_info(topic) {
-            let mut help = format!(
-                "{}\n\n  {}\n\n  {} {}",
-                cmd.name,
-                cmd.description_for(app.ui_locale),
-                tr(app.ui_locale, MessageId::HelpUsageLabel),
-                cmd.usage
-            );
-            let visible_aliases = cmd
-                .aliases
-                .iter()
-                .filter(|alias| user_commands.get(alias).is_none())
-                .copied()
-                .collect::<Vec<_>>();
-            if !visible_aliases.is_empty() {
-                let _ = write!(
-                    help,
-                    "\n  {} {}",
-                    tr(app.ui_locale, MessageId::HelpAliasesLabel),
-                    visible_aliases.join(", ")
-                );
-            }
-            if cmd.name == "config" {
-                help.push_str(
-                    "\n\n  Provider context window: set `context_window = 262144` under the active `[providers.<name>]` table to cap a 1M model to 256K. Use `/config context_window` to inspect the configured and effective values.",
-                );
-                help.push('\n');
-                help.push_str(&tr(app.ui_locale, MessageId::ConfigHelpDiscoverable));
-            }
-            return CommandResult::message(help);
-        }
-
-        // Skills are user-invocable but were never a `/help` topic (#3912):
-        // they execute and autocomplete, yet the surface that teaches the
-        // product claimed they did not exist.
-        if let Some(help) = skill_help(app, topic) {
-            return CommandResult::message(help);
-        }
-
-        return CommandResult::error(
-            tr(app.ui_locale, MessageId::HelpUnknownCommand).replace("{topic}", topic),
-        );
-    }
-
-    // Show help overlay
-    if app.view_stack.top_kind() != Some(ModalKind::Help) {
-        let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
-        app.view_stack.push(help);
-    }
-    CommandResult::ok()
-}
-
-/// `/help <skill>` for a discovered skill (#3912).
-///
-/// Matches the cached skill list case-insensitively, accepting the bare name
-/// as well as either invocation shape the dispatcher supports, so `/help
-/// $review` and `/help /skill review` resolve the same as `/help review`.
-fn skill_help(app: &App, topic: &str) -> Option<String> {
-    let needle = topic
-        .trim()
-        .trim_start_matches('$')
-        .trim_start_matches('/')
-        .trim_start_matches("skill ")
-        .trim();
-    if needle.is_empty() {
-        return None;
-    }
-
-    let (name, description) = app
-        .cached_skills
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(needle))?;
-
-    let mut help = format!("${name}");
-    if !description.trim().is_empty() {
-        let _ = write!(help, "\n\n  {}", description.trim());
-    }
-    // Both shapes are advertised because both dispatch (`commands::execute`).
-    let _ = write!(
-        help,
-        "\n\n  {} ${name}\n  {} /skill {name}",
-        tr(app.ui_locale, MessageId::HelpUsageLabel),
-        tr(app.ui_locale, MessageId::HelpUsageLabel),
-    );
-    Some(help)
-}
-
-fn user_command_help(
-    locale: Locale,
-    command: &crate::commands::user_registry::UserCommandMetadata,
-) -> String {
-    let mut help = command.name.clone();
-    if let Some(description) = command
-        .description
-        .as_deref()
-        .filter(|description| !description.trim().is_empty())
-    {
-        let _ = write!(help, "\n\n  {description}");
-    }
-
-    let usage = command
-        .display_usage()
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("/{}", command.name));
-    let _ = write!(
-        help,
-        "\n\n  {} {}",
-        tr(locale, MessageId::HelpUsageLabel),
-        usage
-    );
-    if !command.aliases.is_empty() {
-        let _ = write!(
-            help,
-            "\n  {} {}",
-            tr(locale, MessageId::HelpAliasesLabel),
-            command.aliases.join(", ")
-        );
-    }
-    help
-}
 
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
     if app.session_transition_blocked() {
-        return CommandResult::error(
-            tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
-        );
+        // The same gate the lifecycle commands consult, so the refusal owes
+        // the same explanation. The sentence stays localized; a blocker row
+        // is data (id, status, elapsed, summary) and is not translated
+        // anywhere else either.
+        let mut message = tr(app.ui_locale, MessageId::ClearConversationBusy).to_string();
+        for blocker in app.session_transition_blockers() {
+            message.push_str("\n  • ");
+            message.push_str(&blocker);
+        }
+        return CommandResult::error(message);
     }
     let new_id = uuid::Uuid::new_v4().to_string();
     let queue_transition = match crate::tui::ui::prepare_offline_queue_transition(app, &new_id) {
@@ -176,6 +43,7 @@ pub fn clear(app: &mut App) -> CommandResult {
     app.current_session_metadata = None;
     app.session_title = None;
     app.window_title = None;
+    app.composer_color = None;
     let locale = app.ui_locale;
     let message = tr(locale, MessageId::ClearConversation).to_string();
     CommandResult::with_message_and_action(
@@ -214,8 +82,25 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.mark_history_updated();
     app.clear_api_messages();
     app.system_prompt = None;
+    app.goal = crate::tui::app::HostGoalState::default();
+    app.last_known_goal_state = None;
+    app.pending_goal_controls.clear();
+    app.pending_goal_controls
+        .push_back(crate::tui::app::PendingGoalControl {
+            goal_id: None,
+            intent: crate::tui::app::GoalControlIntent::SetStatus {
+                status: crate::tools::goal::GoalStatus::Active,
+                clear: true,
+            },
+            dispatched: false,
+        });
+    app.goal_continuation_waiting = false;
+    app.paused_goal_objective = None;
+    app.paused = false;
+    app.pausable = false;
     app.viewport.transcript_selection.clear();
     app.queued_messages.clear();
+    app.held_restored_queue = 0;
     app.queued_draft = None;
     app.session.total_tokens = 0;
     app.session.total_conversation_tokens = 0;
@@ -246,7 +131,23 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.last_warmup_key = None;
     app.session.last_tool_catalog = None;
     app.session.last_base_url = None;
+    // A fresh conversation inherits neither this one's denials nor its
+    // "approve for session" grants (UX-8).
+    app.approval_session_denied.clear();
+    app.approval_session_approved.clear();
+    // Nor this one's child-agent approval cards, footer rows, or web-mirror
+    // copies: the reset finalizes those children engine-side.
+    crate::tui::pending_requests::clear_all(app);
     true
+}
+
+/// The site locale segment for a public Codewhale URL.
+///
+/// The mapping itself lives in the portable `navigation::links` module, which
+/// the navigation proof requires to stay free of host imports; this is the
+/// host-side adapter for callers that hold a `Locale`.
+pub(crate) fn public_site_locale_segment(locale: Locale) -> &'static str {
+    super::navigation::links::public_site_locale_segment(locale.tag())
 }
 
 /// Exit the application
@@ -258,6 +159,13 @@ pub fn exit() -> CommandResult {
 /// picker (Pro/Flash + thinking effort) per #39 — gives users a discoverable
 /// way to flip both knobs without memorising the docs.
 pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
+    // `/model router …` is `/router …` (#6525): one Router setup view.
+    if let Some(name) = model_name.map(str::trim) {
+        let (head, rest) = name.split_once(char::is_whitespace).unwrap_or((name, ""));
+        if head.eq_ignore_ascii_case("router") {
+            return super::router::router_command(Some(rest));
+        }
+    }
     if model_name.is_some_and(|name| name.eq_ignore_ascii_case("save-default")) {
         // Explicit persistence of the pending session route as the startup
         // default — only an explicit command can write settings after an
@@ -293,15 +201,13 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
                 .replace("{new}", "auto");
-            message.push_str(
-                " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-            );
+            message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
             return CommandResult::with_message_and_action(
                 message,
                 AppAction::UpdateCompaction(app.compaction_config()),
             );
         }
-        let declared = app.api_provider != ApiProvider::OpenaiCodex
+        let declared = app.api_provider != ProviderKind::OpenaiCodex
             && codewhale_config::catalog::configured::validate_configured_models(
                 &app.configured_models,
             )
@@ -332,10 +238,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             model_id
         };
         let strict_direct_custom_endpoint = app.accepts_custom_model_ids()
-            && matches!(
-                app.api_provider,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
-            );
+            && matches!(app.api_provider, ProviderKind::Deepseek | ProviderKind::Zai);
         let route_resolution = if declared {
             match crate::route_runtime::resolve_declared_model_candidate(
                 app.api_provider,
@@ -405,16 +308,14 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         let provider_identity = app.provider_identity_for_persistence().to_string();
         app.provider_models
             .insert(provider_identity.clone(), model_id.clone());
-        app.enable_provider_model(&provider_identity, &model_id);
+        app.note_route_used(&provider_identity, &model_id);
         // Route changes are temporary by default: nothing is written here.
         // The route-save prompt offers the explicit persistence choices.
         app.note_session_route_change(&provider_identity, &model_id);
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
             .replace("{new}", &model_id);
-        message.push_str(
-            " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-        );
+        message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
         CommandResult::with_message_and_action(
             message,
             AppAction::UpdateCompaction(app.compaction_config()),
@@ -449,304 +350,19 @@ pub fn subagents(app: &mut App) -> CommandResult {
 }
 
 /// Switch to a configured profile.
-pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
+pub fn profile_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
     let profile_name = match arg {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
         _ => {
-            return CommandResult::error(
-                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.codewhale/config.toml under [profiles] sections.",
-            );
+            return CommandResult::error(tr(app.ui_locale, MessageId::ProfileUsage));
         }
     };
     CommandResult::with_message_and_action(
-        format!("Switching to profile '{profile_name}'..."),
+        tr(app.ui_locale, MessageId::ProfileSwitching).replace("{name}", &profile_name),
         AppAction::SwitchProfile {
             profile: profile_name,
         },
     )
-}
-
-pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
-    let Some(raw_path) = arg.map(str::trim).filter(|path| !path.is_empty()) else {
-        return CommandResult::message(format!("Current workspace: {}", app.workspace.display()));
-    };
-
-    let expanded = match expand_workspace_path(raw_path) {
-        Ok(path) => path,
-        Err(message) => return CommandResult::error(message),
-    };
-    let candidate = if expanded.is_absolute() {
-        expanded
-    } else {
-        app.workspace.join(expanded)
-    };
-
-    if !candidate.exists() {
-        return CommandResult::error(format!("Workspace does not exist: {}", candidate.display()));
-    }
-    if !candidate.is_dir() {
-        return CommandResult::error(format!(
-            "Workspace is not a directory: {}",
-            candidate.display()
-        ));
-    }
-
-    let workspace = candidate.canonicalize().unwrap_or(candidate);
-    CommandResult::with_message_and_action(
-        format!("Switching workspace to {}...", workspace.display()),
-        AppAction::SwitchWorkspace { workspace },
-    )
-}
-
-fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
-    if path == "~" {
-        return crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string())?;
-        return Ok(home.join(rest));
-    }
-    Ok(PathBuf::from(path))
-}
-
-fn public_site_locale_segment(locale: Locale) -> &'static str {
-    match locale {
-        Locale::ZhHans | Locale::ZhHant => "zh",
-        Locale::Ja => "ja",
-        Locale::Vi => "vi",
-        Locale::Ko => "ko",
-        Locale::Es419 => "es",
-        Locale::PtBr => "pt-BR",
-        Locale::Ru => "ru",
-        Locale::Uk => "uk",
-        // Not shipped on the website yet — English pages are the fallback.
-        Locale::En | Locale::Ca | Locale::De | Locale::Fr | Locale::Id | Locale::Hi => "en",
-    }
-}
-
-/// Show Codewhale documentation, community, managed-app, and provider links.
-pub fn codewhale_links(app: &mut App) -> CommandResult {
-    let locale = app.ui_locale;
-    let active_provider = app.api_provider.as_str();
-    let site_locale = public_site_locale_segment(locale);
-    let mut message = format!(
-        "{}\n─────────────────────────────\n",
-        tr(locale, MessageId::LinksProjectTitle)
-    );
-
-    let _ = writeln!(
-        message,
-        "{} `https://codewhale.net/{site_locale}/docs`",
-        tr(locale, MessageId::LinksDocumentation)
-    );
-    let _ = writeln!(
-        message,
-        "{} `https://codewhale.net/{site_locale}/community`",
-        tr(locale, MessageId::LinksCommunity)
-    );
-    let _ = writeln!(
-        message,
-        "{} `https://github.com/Hmbown/CodeWhale`",
-        tr(locale, MessageId::LinksGitHub)
-    );
-    let _ = writeln!(
-        message,
-        "{} `https://app.codewhale.net`",
-        tr(locale, MessageId::LinksManagedApp)
-    );
-    let _ = writeln!(message, "{}", tr(locale, MessageId::LinksManagedAppNote));
-
-    let _ = write!(
-        message,
-        "\n{}\n─────────────────────────────\n",
-        tr(locale, MessageId::LinksTitle)
-    );
-
-    for provider in codewhale_config::provider::providers_sorted_for_display() {
-        let links = provider.credential_help();
-        let active_marker = if provider.id() == active_provider {
-            " <- current"
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            message,
-            "\n{} ({}){}",
-            provider.display_name(),
-            provider.id(),
-            active_marker
-        );
-        if let Some(key_url) = links.credential_url {
-            let _ = writeln!(
-                message,
-                "{} `{}`",
-                tr(locale, MessageId::LinksDashboard),
-                key_url
-            );
-        } else {
-            let _ = writeln!(
-                message,
-                "{} {}",
-                tr(locale, MessageId::LinksDashboard),
-                links.guidance
-            );
-        }
-        if let Some(docs_url) = links.docs_url {
-            let _ = writeln!(
-                message,
-                "{}      `{}`",
-                tr(locale, MessageId::LinksDocs),
-                docs_url
-            );
-        }
-        if provider.kind() == codewhale_config::ProviderKind::Moonshot {
-            let _ = writeln!(
-                message,
-                "{}",
-                tr(locale, MessageId::LinksKimiCodeRouteNote)
-                    .replace("{route}", DEFAULT_KIMI_CODE_BASE_URL)
-                    .replace("{console}", KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
-            );
-        }
-        let env_vars = provider.env_vars();
-        if env_vars.is_empty() {
-            let _ = writeln!(message, "Env: none");
-        } else {
-            let _ = writeln!(message, "Env: {}", env_vars.join(", "));
-        }
-    }
-
-    let _ = writeln!(message, "\n{}", tr(locale, MessageId::LinksTip));
-    CommandResult::message(message)
-}
-
-/// Show home dashboard with stats and quick actions
-pub fn home_dashboard(app: &mut App) -> CommandResult {
-    let locale = app.ui_locale;
-    let mut stats = String::new();
-
-    // Basic info
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeDashboardTitle));
-    let _ = writeln!(stats, "============================================");
-
-    // Model & mode
-    let _ = writeln!(
-        stats,
-        "{}      {}",
-        tr(locale, MessageId::HomeModel),
-        app.model
-    );
-    let _ = writeln!(
-        stats,
-        "{}       {}",
-        tr(locale, MessageId::HomeMode),
-        app.mode.label()
-    );
-    let _ = writeln!(
-        stats,
-        "{}  {}",
-        tr(locale, MessageId::HomeWorkspace),
-        app.workspace.display()
-    );
-
-    // Session stats
-    let history_count = app.history.len();
-    let total_tokens = app.session.displayed_total_conversation_tokens();
-    let queued_messages = app.queued_messages.len();
-    let _ = writeln!(
-        stats,
-        "{}    {} messages",
-        tr(locale, MessageId::HomeHistory),
-        history_count
-    );
-    let _ = writeln!(
-        stats,
-        "{}     {} (session)",
-        tr(locale, MessageId::HomeTokens),
-        total_tokens
-    );
-    if queued_messages > 0 {
-        let _ = writeln!(
-            stats,
-            "{}     {} messages",
-            tr(locale, MessageId::HomeQueued),
-            queued_messages
-        );
-    }
-
-    // Fleet role workers
-    let subagent_count = app.subagent_cache.len();
-    if subagent_count > 0 {
-        let _ = writeln!(
-            stats,
-            "{} {} active",
-            tr(locale, MessageId::HomeSubagents),
-            subagent_count
-        );
-    }
-
-    // Active skill
-    if let Some(skill) = &app.active_skill {
-        let _ = writeln!(
-            stats,
-            "{}      {} (active)",
-            tr(locale, MessageId::HomeSkill),
-            skill
-        );
-    }
-
-    // Quick actions section
-    let _ = writeln!(stats, "\n{}", tr(locale, MessageId::HomeQuickActions));
-    let _ = writeln!(stats, "--------------------------------------------");
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickWorkspace));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickRestore));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickTokens));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickLinks));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSkills));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickConfig));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSettings));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickModel));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSubagents));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickTaskList));
-    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickHelp));
-
-    // Mode-specific tips
-    let _ = writeln!(stats, "\n{}", tr(locale, MessageId::HomeModeTips));
-    let _ = writeln!(stats, "--------------------------------------------");
-    match app.mode {
-        AppMode::Agent => {
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeTip));
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeReviewTip));
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeYoloTip));
-        }
-        AppMode::Operate => {
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeOperateModeTip));
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeOperateModeFleetTip));
-        }
-        AppMode::Plan => {
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomePlanModeTip));
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomePlanModeChecklistTip));
-        }
-    }
-
-    CommandResult::message(stats)
-}
-
-/// Toggle output translation to the current system language on/off.
-///
-/// When enabled, the model is instructed to respond in the current locale and an
-/// interception layer translates any remaining English output before it
-/// reaches the user.
-pub fn translate(app: &mut App) -> CommandResult {
-    app.translation_enabled = !app.translation_enabled;
-    let locale = app.ui_locale;
-    if app.translation_enabled {
-        CommandResult::message(tr(locale, MessageId::CmdTranslateOn))
-    } else {
-        CommandResult::message(tr(locale, MessageId::CmdTranslateOff))
-    }
 }
 
 #[cfg(test)]
@@ -756,56 +372,12 @@ mod tests {
     use crate::config::Config;
     use crate::tui::app::{App, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
-    use codewhale_config::AppMode;
     use codewhale_models::Message;
     use codewhale_models::Role;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::Instant;
-    use tempfile::{TempDir, tempdir};
-
-    #[test]
-    fn help_topic_resolves_a_discovered_skill_and_both_shapes() {
-        // #3912: `/help <skill>` said "Unknown command" for a skill that
-        // executes and autocompletes.
-        let mut app = create_test_app();
-        app.cached_skills = vec![(
-            "codereview".to_string(),
-            "Review a diff for defects".to_string(),
-        )];
-
-        for topic in [
-            "codereview",
-            "CodeReview",
-            "$codereview",
-            "/skill codereview",
-        ] {
-            let result = help(&mut app, Some(topic));
-            let message = result
-                .message
-                .as_deref()
-                .unwrap_or_else(|| panic!("{topic} should resolve to skill help"));
-            assert!(message.contains("Review a diff for defects"), "{message}");
-            assert!(message.contains("$codereview"), "{message}");
-            assert!(message.contains("/skill codereview"), "{message}");
-        }
-    }
-
-    #[test]
-    fn help_topic_still_errors_for_an_unknown_name() {
-        let mut app = create_test_app();
-        app.cached_skills = vec![("codereview".to_string(), "Review a diff".to_string())];
-        let result = help(&mut app, Some("definitely-not-a-thing"));
-        assert!(result.is_error, "unknown topics must still be an error");
-        assert!(
-            !result
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Review a diff"),
-            "the skill fallback must not match an unrelated topic"
-        );
-    }
+    use tempfile::TempDir;
 
     struct SettingsPathGuard {
         _tmp: TempDir,
@@ -849,11 +421,11 @@ mod tests {
     fn create_test_app() -> App {
         let options = TuiOptions {
             skills_dir: PathBuf::from("/tmp/test-skills"),
-            ..crate::test_support::test_tui_options(PathBuf::from("/tmp/test-workspace"))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("/tmp/test-workspace"))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.model = "deepseek-v4-pro".to_string();
         app.auto_model = false;
         app.model_ids_passthrough = false;
@@ -861,80 +433,48 @@ mod tests {
     }
 
     #[test]
-    fn test_help_unknown_command() {
-        let mut app = create_test_app();
-        let result = help(&mut app, Some("nonexistent"));
-        assert!(result.message.is_some());
-        assert!(result.message.unwrap().contains("Unknown command"));
-        assert!(result.action.is_none());
-    }
+    fn profile_command_localizes_replies_and_preserves_switch_action() {
+        let _env = crate::test_support::lock_test_env();
+        for (locale, usage, switching) in [
+            (
+                Locale::En,
+                "Usage: /profile <name>",
+                "Switching to profile 'work'...",
+            ),
+            (
+                Locale::ZhHans,
+                "用法: /profile <name>",
+                "正在切换到配置文件 'work'...",
+            ),
+            (
+                Locale::De,
+                "Verwendung: /profile <name>",
+                "Wechsle zum Profil 'work'...",
+            ),
+        ] {
+            let mut app = create_test_app();
+            app.ui_locale = locale;
+            let previous_profile = app.config_profile.clone();
 
-    #[test]
-    fn test_help_known_command() {
-        let mut app = create_test_app();
-        let result = help(&mut app, Some("clear"));
-        assert!(result.message.is_some());
-        let msg = result.message.unwrap();
-        assert!(msg.contains("clear"));
-        assert!(msg.contains("Clear conversation history"));
-        assert!(msg.contains("Usage: /clear"));
-    }
+            for command in ["/profile", "/profile   "] {
+                let result = crate::commands::execute(command, &mut app);
+                assert!(result.is_error, "{locale:?}: {command:?}");
+                assert!(result.action.is_none(), "{locale:?}: {command:?}");
+                let message = result.message.expect("profile usage");
+                assert!(message.contains(usage), "{locale:?}: {message}");
+                assert!(message.contains("~/.codewhale/config.toml"), "{message}");
+                assert!(message.contains("[profiles]"), "{message}");
+            }
 
-    #[test]
-    fn test_help_config_topic_uses_interactive_editor_text() {
-        let mut app = create_test_app();
-        let result = help(&mut app, Some("config"));
-        let msg = result.message.expect("help topic should return message");
-        assert!(msg.contains("config"));
-        assert!(msg.contains("Inspect and change settings"));
-        assert!(msg.contains("Usage: /config"));
-        assert!(msg.contains("context_window = 262144"));
-        assert!(msg.contains("/config context_window"));
-        assert!(msg.contains("/config search.provider"));
-        assert!(msg.contains("/config prompt_suggestion"));
-        assert!(msg.contains("/config notifications"));
-    }
-
-    #[test]
-    fn test_help_links_topic_shows_aliases() {
-        let mut app = create_test_app();
-        let result = help(&mut app, Some("links"));
-        let msg = result.message.expect("help topic should return message");
-        assert!(msg.contains("links"));
-        assert!(msg.contains("Show Codewhale, community, and provider links"));
-        assert!(msg.contains("Usage: /links"));
-        assert!(msg.contains("Aliases: dashboard, api"));
-    }
-
-    #[test]
-    fn test_help_memory_topic_shows_usage_and_description() {
-        let mut app = create_test_app();
-        let result = help(&mut app, Some("memory"));
-        let msg = result.message.expect("help topic should return message");
-        assert!(msg.contains("memory"));
-        assert!(msg.contains("persistent structured user memory"));
-        assert!(msg.contains(
-            "Usage: /memory [status|path|search|get|remember|import|export|reindex|clear|help]"
-        ));
-    }
-
-    #[test]
-    fn test_help_pushes_overlay() {
-        let mut app = create_test_app();
-        assert_ne!(app.view_stack.top_kind(), Some(ModalKind::Help));
-        let result = help(&mut app, None);
-        assert_eq!(result.message, None);
-        assert_eq!(result.action, None);
-        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Help));
-    }
-
-    #[test]
-    fn test_help_does_not_duplicate_overlay() {
-        let mut app = create_test_app();
-        help(&mut app, None);
-        let initial_kind = app.view_stack.top_kind();
-        help(&mut app, None);
-        assert_eq!(app.view_stack.top_kind(), initial_kind);
+            let result = crate::commands::execute("/profile   work  ", &mut app);
+            assert!(!result.is_error, "{locale:?}");
+            assert_eq!(result.message.as_deref(), Some(switching), "{locale:?}");
+            assert!(matches!(
+                result.action,
+                Some(AppAction::SwitchProfile { profile }) if profile == "work"
+            ));
+            assert_eq!(app.config_profile, previous_profile, "{locale:?}");
+        }
     }
 
     #[test]
@@ -1118,62 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_without_arg_shows_current_workspace() {
-        let mut app = create_test_app();
-        let result = workspace_switch(&mut app, None);
-        let msg = result.message.expect("workspace should be shown");
-        assert!(msg.contains("Current workspace:"));
-        assert!(msg.contains("/tmp/test-workspace"));
-        assert!(result.action.is_none());
-    }
-
-    #[test]
-    fn workspace_existing_absolute_dir_returns_switch_action() {
-        let mut app = create_test_app();
-        let dir = tempdir().expect("temp dir");
-        let result = workspace_switch(&mut app, Some(dir.path().to_str().unwrap()));
-        assert!(matches!(
-            result.action,
-            Some(AppAction::SwitchWorkspace { workspace }) if workspace == dir.path().canonicalize().unwrap()
-        ));
-    }
-
-    #[test]
-    fn workspace_relative_dir_resolves_from_current_workspace() {
-        let root = tempdir().expect("temp dir");
-        let child = root.path().join("child");
-        std::fs::create_dir(&child).expect("child dir");
-        let mut app = create_test_app();
-        app.workspace = root.path().to_path_buf();
-
-        let result = workspace_switch(&mut app, Some("child"));
-        assert!(matches!(
-            result.action,
-            Some(AppAction::SwitchWorkspace { workspace }) if workspace == child.canonicalize().unwrap()
-        ));
-    }
-
-    #[test]
-    fn workspace_rejects_missing_path() {
-        let mut app = create_test_app();
-        let result = workspace_switch(&mut app, Some("definitely-missing"));
-        assert!(result.is_error);
-        assert!(result.message.unwrap().contains("does not exist"));
-    }
-
-    #[test]
-    fn workspace_rejects_file_path() {
-        let root = tempdir().expect("temp dir");
-        let file = root.path().join("file.txt");
-        std::fs::write(&file, "not a directory").expect("test file");
-        let mut app = create_test_app();
-
-        let result = workspace_switch(&mut app, Some(file.to_str().unwrap()));
-        assert!(result.is_error);
-        assert!(result.message.unwrap().contains("not a directory"));
-    }
-
-    #[test]
     fn test_model_change_updates_state() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
@@ -1196,7 +680,7 @@ mod tests {
     fn model_command_preserves_active_kimi_code_endpoint_for_bare_k3() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.set_provider_identity(crate::config::ApiProvider::Moonshot, "moonshot");
+        app.set_provider_identity(crate::config::ProviderKind::Moonshot, "moonshot");
         app.model_ids_passthrough = true;
         app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.active_context_window_override = None;
@@ -1294,7 +778,11 @@ mod tests {
             seed.save().expect("seed settings");
         }
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1325,7 +813,11 @@ mod tests {
     fn model_command_keeps_glm_53_as_its_own_wire_id() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
         app.auto_model = false;
@@ -1357,18 +849,18 @@ mod tests {
 
         // Terminal A: Z.ai / GLM.
         let mut app_a = create_test_app();
-        app_a.api_provider = crate::config::ApiProvider::Zai;
+        app_a.api_provider = crate::config::ProviderKind::Zai;
         app_a.model_ids_passthrough = false;
         app_a.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app_a.auto_model = false;
         let result_a = model(&mut app_a, Some("GLM-5.2"));
         assert!(!result_a.is_error, "GLM-5.2 is valid on Z.ai");
-        assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app_a.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
         // Terminal B: DeepSeek / deepseek-v4-flash.
         let mut app_b = create_test_app();
-        app_b.api_provider = crate::config::ApiProvider::Deepseek;
+        app_b.api_provider = crate::config::ProviderKind::Deepseek;
         app_b.model_ids_passthrough = false;
         app_b.model = "deepseek-v4-pro".to_string();
         app_b.auto_model = false;
@@ -1376,11 +868,11 @@ mod tests {
         assert!(!result_b.is_error, "deepseek-v4-flash is valid on DeepSeek");
 
         // B's route is a coherent DeepSeek route — never Z.ai + a DeepSeek model.
-        assert_eq!(app_b.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app_b.api_provider, crate::config::ProviderKind::Deepseek);
         assert_eq!(app_b.model, "deepseek-v4-flash");
 
         // A is untouched by B's selection — still Z.ai / GLM.
-        assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app_a.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
         // Shared settings: NOTHING was written by either `/model` — both
@@ -1406,7 +898,7 @@ mod tests {
         // rejected locally with a precise diagnostic, before any network call.
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1419,7 +911,7 @@ mod tests {
         assert!(msg.contains("deepseek-v4-pro"), "names the model: {msg}");
         assert!(msg.contains("zai"), "names the provider: {msg}");
         // The session route is unchanged — still Z.ai / GLM.
-        assert_eq!(app.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app.model, crate::config::DEFAULT_ZAI_MODEL);
     }
 
@@ -1501,7 +993,7 @@ mod tests {
     fn test_model_auto_preserves_raw_explicit_thinking() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::OpenaiCodex;
+        app.api_provider = ProviderKind::OpenaiCodex;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
         app.reasoning_effort_preference = Some(ReasoningEffort::Off);
@@ -1534,7 +1026,7 @@ mod tests {
     fn test_model_change_accepts_custom_id_for_openai_compatible_provider() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Openai;
+        app.api_provider = crate::config::ProviderKind::Openai;
         app.model_ids_passthrough = true;
 
         let result = model(&mut app, Some("opencode-go/glm-5.1"));
@@ -1580,7 +1072,7 @@ mod tests {
     #[test]
     fn model_command_rejects_saved_model_from_other_provider() {
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.provider_models
             .insert("moonshot".to_string(), "kimi-k2.6".to_string());
 
@@ -1590,7 +1082,7 @@ mod tests {
         assert!(message.contains("Invalid model"));
         assert!(message.contains("active provider"));
         assert!(result.action.is_none());
-        assert_eq!(app.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, crate::config::ProviderKind::Deepseek);
         assert_eq!(app.model, "deepseek-v4-pro");
     }
 
@@ -1630,72 +1122,8 @@ mod tests {
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SubAgents));
         assert_eq!(
             app.status_message,
-            Some("Finding this session's sub-agents...".to_string())
+            Some("Finding this session's agents...".to_string())
         );
-    }
-
-    #[test]
-    fn test_codewhale_links() {
-        let mut app = create_test_app();
-        let result = codewhale_links(&mut app);
-        assert!(result.message.is_some());
-        let msg = result.message.unwrap();
-        assert!(msg.contains("Codewhale & community"));
-        assert!(msg.contains("https://codewhale.net/en/docs"));
-        assert!(msg.contains("https://codewhale.net/en/community"));
-        assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
-        assert!(msg.contains("https://app.codewhale.net"));
-        assert!(msg.contains("separate sign-in"));
-        assert!(msg.contains("not connected to the current local session"));
-        assert!(msg.contains("Provider Links"));
-        assert!(msg.contains("DeepSeek (deepseek) <- current"));
-        assert!(msg.contains("https://platform.deepseek.com/api_keys"));
-        assert!(msg.contains("Xiaomi MiMo (xiaomi-mimo)"));
-        assert!(msg.contains("https://platform.xiaomimimo.com/token-plan"));
-        assert!(msg.contains("Moonshot/Kimi (moonshot)"));
-        assert!(msg.contains("https://platform.kimi.ai/console/api-keys"));
-        assert!(msg.contains("https://platform.kimi.ai/docs/overview"));
-        assert!(msg.contains("https://api.kimi.com/coding/v1"));
-        assert!(msg.contains("https://www.kimi.com/code/console"));
-        assert!(msg.contains("never imports Kimi CLI credentials"));
-        assert!(msg.contains("https://console.openmodel.ai/"));
-        assert!(msg.contains("https://docs.openmodel.ai/en/docs/getting-started/authentication"));
-        assert!(msg.contains("https://console.sakana.ai/api-keys"));
-        assert!(msg.contains("https://console.sakana.ai/get-started"));
-        assert!(msg.contains("Baidu Qianfan (qianfan)"));
-        assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
-        assert!(msg.contains("Local Ollama is keyless by default"));
-        assert!(msg.contains("codewhale auth chatgpt"));
-        assert!(msg.contains("codex login"));
-        assert!(msg.contains("no canonical vendor credential page exists"));
-        assert!(msg.contains("OPENAI_API_KEY"));
-        assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
-        assert!(!msg.contains("https://codewhale.dev/docs/providers"));
-        assert!(result.action.is_none());
-    }
-
-    #[test]
-    fn provider_links_emit_urls_as_inline_code_for_narrow_transcripts() {
-        let mut app = create_test_app();
-        let result = codewhale_links(&mut app);
-        let msg = result.message.expect("links should return a message");
-
-        assert!(msg.contains("`https://platform.openai.com/api-keys`"));
-        assert!(
-            msg.contains(
-                "`https://platform.minimax.io/user-center/basic-information/interface-key`"
-            )
-        );
-
-        for line in msg.lines().filter(|line| line.contains("http")) {
-            let Some(url_start) = line.find("http") else {
-                continue;
-            };
-            assert!(
-                line[..url_start].ends_with('`') && line[url_start..].contains('`'),
-                "provider URL should be inline-code wrapped so narrow TUI renders do not emit oversized OSC8 link payloads: {line}"
-            );
-        }
     }
 
     #[test]
@@ -1710,106 +1138,5 @@ mod tests {
         );
         assert_eq!(links.docs_url, None);
         assert_eq!(links.credential_url, None);
-    }
-
-    #[test]
-    fn project_links_follow_the_available_public_site_locale() {
-        let mut app = create_test_app();
-        app.ui_locale = Locale::ZhHans;
-
-        let msg = codewhale_links(&mut app)
-            .message
-            .expect("links should return a message");
-
-        assert!(msg.contains("`https://codewhale.net/zh/docs`"));
-        assert!(msg.contains("`https://codewhale.net/zh/community`"));
-        assert!(msg.contains("`https://app.codewhale.net`"));
-    }
-
-    #[test]
-    fn test_home_dashboard_includes_all_sections() {
-        let mut app = create_test_app();
-        app.session.total_conversation_tokens = 1234;
-        let result = home_dashboard(&mut app);
-        assert!(result.message.is_some());
-        let msg = result.message.unwrap();
-        assert!(msg.contains("codewhale"));
-        assert!(!msg.contains("codewhale Home Dashboard"));
-        assert!(msg.contains("Model:"));
-        assert!(msg.contains("Mode:"));
-        assert!(msg.contains("Workspace:"));
-        assert!(msg.contains("History:"));
-        assert!(msg.contains("Tokens:"));
-        assert!(msg.contains("Quick Actions"));
-        assert!(msg.contains("Mode Tips"));
-        assert!(result.action.is_none());
-    }
-
-    #[test]
-    fn test_home_dashboard_shows_queued_when_present() {
-        let mut app = create_test_app();
-        app.queued_messages
-            .push_back(crate::tui::app::QueuedMessage::new(
-                "test".to_string(),
-                None,
-            ));
-        let result = home_dashboard(&mut app);
-        let msg = result.message.unwrap();
-        assert!(msg.contains("Queued:"));
-    }
-
-    #[test]
-    fn test_home_dashboard_mode_tips_for_each_mode() {
-        let modes = [AppMode::Agent, AppMode::Plan, AppMode::Operate];
-        for mode in modes {
-            let mut app = create_test_app();
-            app.mode = mode;
-            let result = home_dashboard(&mut app);
-            let msg = result.message.unwrap();
-            assert!(msg.contains("Mode Tips"), "Missing tips for mode {mode:?}");
-        }
-    }
-
-    #[test]
-    fn test_home_dashboard_quick_actions_reflect_links_and_config_and_hide_removed_commands() {
-        let mut app = create_test_app();
-        let result = home_dashboard(&mut app);
-        let msg = result
-            .message
-            .expect("home dashboard should return message");
-        assert!(msg.contains("/workspace   - Switch folders or worktrees"));
-        assert!(msg.contains("/restore     - Roll files back to a turn snapshot"));
-        assert!(msg.contains("/tokens      - Show session spend and context"));
-        assert!(msg.contains("/links       - Codewhale, community & provider links"));
-        assert!(msg.contains("/config      - Inspect and change settings"));
-        assert!(
-            !msg.lines()
-                .any(|line| line.trim_start().starts_with("/set "))
-        );
-        assert!(!msg.contains("/codewhale"));
-    }
-
-    #[test]
-    fn home_dashboard_localizes_in_zh_hans() {
-        use codewhale_localization::Locale;
-        let mut app = create_test_app();
-        app.ui_locale = Locale::ZhHans;
-        let result = home_dashboard(&mut app);
-        let msg = result
-            .message
-            .expect("home dashboard should return message");
-        assert!(
-            msg.contains("codewhale"),
-            "missing canonical product title:\n{msg}"
-        );
-        assert!(msg.contains("模型"), "missing zh-Hans model label:\n{msg}");
-        assert!(
-            msg.contains("快捷操作"),
-            "missing zh-Hans quick actions:\n{msg}"
-        );
-        assert!(
-            msg.contains("模式提示"),
-            "missing zh-Hans mode tips:\n{msg}"
-        );
     }
 }

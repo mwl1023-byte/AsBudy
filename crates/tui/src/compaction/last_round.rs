@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use codewhale_models::{ContentBlock, Message, SystemPrompt};
 
 use super::{
-    compaction_checkpoint_message, is_compaction_checkpoint_message, retained_user_messages,
+    compaction_checkpoint_message, history_is_post_provenance, is_compaction_checkpoint_message,
+    is_compaction_checkpoint_message_in_era, retained_user_messages_in_era,
     truncate_retained_block, user_text_of,
 };
 
@@ -95,6 +96,8 @@ pub struct CompactionKeep {
 pub fn inspect_compaction_keep(messages: &[Message]) -> CompactionKeep {
     let last_round = last_round_slice(messages);
     CompactionKeep {
+        // Existence check: a stamped carrier also matches the loose form, so
+        // "any checkpoint" reads the same in both eras and needs no era here.
         has_checkpoint: messages.iter().any(is_compaction_checkpoint_message),
         last_round_messages: last_round.len(),
         last_round_tool_results: last_round.iter().flat_map(tool_result_ids).count(),
@@ -104,39 +107,44 @@ pub fn inspect_compaction_keep(messages: &[Message]) -> CompactionKeep {
     }
 }
 
+/// Workspace anchors are passive model input; only user-configured trust admits
+/// them. Missing, linked, unreadable, or empty anchors contribute no text.
 #[must_use]
 pub fn pinned_anchors_text(workspace: Option<&std::path::Path>) -> Option<String> {
     let workspace = workspace?;
+    if !crate::config::is_workspace_trusted(workspace) {
+        return None;
+    }
     let primary = workspace.join(".codewhale").join("anchors.md");
-    let path = if primary.exists() {
+    let path = if primary.symlink_metadata().is_ok() || workspace.join(".codewhale").is_symlink() {
         primary
     } else {
         workspace.join(".deepseek").join("anchors.md")
     };
-    std::fs::read_to_string(path)
+    crate::fs_confined::read_to_string(workspace, &path)
         .ok()
         .map(|contents| contents.trim().to_string())
         .filter(|contents| !contents.is_empty())
 }
 
-fn is_plain_user_text(message: &Message) -> bool {
-    !is_compaction_checkpoint_message(message)
+fn is_plain_user_text(post_provenance: bool, message: &Message) -> bool {
+    !is_compaction_checkpoint_message_in_era(message, post_provenance)
         && !crate::runtime_handoff::is_runtime_owned_user_message(message)
         && user_text_of(message).is_some()
 }
 
-fn user_prompt_text_of(message: &Message) -> Option<String> {
-    is_plain_user_text(message)
+fn user_prompt_text_of(post_provenance: bool, message: &Message) -> Option<String> {
+    is_plain_user_text(post_provenance, message)
         .then(|| user_text_of(message))
         .flatten()
 }
 
-fn last_plain_user_index(messages: &[Message], end: usize) -> Option<usize> {
+fn last_plain_user_index(messages: &[Message], end: usize, post_provenance: bool) -> Option<usize> {
     messages[..end]
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(idx, message)| is_plain_user_text(message).then_some(idx))
+        .find_map(|(idx, message)| is_plain_user_text(post_provenance, message).then_some(idx))
 }
 
 fn slice_has_tool_result(messages: &[Message], start: usize) -> bool {
@@ -150,7 +158,15 @@ fn slice_has_tool_result(messages: &[Message], start: usize) -> bool {
 
 #[must_use]
 pub(crate) fn last_round_start(messages: &[Message]) -> usize {
-    let Some(last_user) = last_plain_user_index(messages, messages.len()) else {
+    last_round_start_in_era(messages, history_is_post_provenance(messages))
+}
+
+/// Era-aware core of [`last_round_start`]. The era belongs to the history the
+/// slice is cut from: `last_round_kept_count` reads a prefix of a longer
+/// history whose carrier may sit after the cut, so it passes the full
+/// history's era down instead of letting this re-derive one from the prefix.
+fn last_round_start_in_era(messages: &[Message], post_provenance: bool) -> usize {
+    let Some(last_user) = last_plain_user_index(messages, messages.len(), post_provenance) else {
         return 0;
     };
     if slice_has_tool_result(messages, last_user) {
@@ -162,7 +178,7 @@ pub(crate) fn last_round_start(messages: &[Message]) -> usize {
     // sessions can still summarize older text.
     let mut candidate = last_user;
     loop {
-        let Some(prev) = last_plain_user_index(messages, candidate) else {
+        let Some(prev) = last_plain_user_index(messages, candidate, post_provenance) else {
             return last_user;
         };
         if slice_has_tool_result(messages, prev) {
@@ -178,24 +194,30 @@ pub(crate) fn last_round_range(messages: &[Message]) -> (usize, usize) {
     // A previous checkpoint can sit in the middle of an uninterrupted task.
     // Stopping at that marker hid every tool step after the first compact
     // from the next pass's survival checks.
-    let end = messages.len().saturating_sub(usize::from(
+    let post_provenance = history_is_post_provenance(messages);
+    let end =
         messages
-            .last()
-            .is_some_and(is_compaction_checkpoint_message),
-    ));
+            .len()
+            .saturating_sub(usize::from(messages.last().is_some_and(|message| {
+                is_compaction_checkpoint_message_in_era(message, post_provenance)
+            })));
     (start, end)
 }
 
 /// How many messages of the open round sit in `messages` before a checkpoint.
 #[must_use]
 pub fn last_round_kept_count(messages: &[Message]) -> Option<usize> {
+    let post_provenance = history_is_post_provenance(messages);
     let checkpoint = messages
         .iter()
-        .rposition(is_compaction_checkpoint_message)?;
+        .rposition(|message| is_compaction_checkpoint_message_in_era(message, post_provenance))?;
     if checkpoint == 0 {
         return None;
     }
-    let start = last_round_start(&messages[..checkpoint]);
+    // The prefix belongs to the full history: recognize its turns with the
+    // full history's era, not one re-derived from the prefix (whose carrier
+    // may sit after the cut).
+    let start = last_round_start_in_era(&messages[..checkpoint], post_provenance);
     Some(checkpoint.saturating_sub(start))
 }
 
@@ -210,6 +232,7 @@ fn last_round_slice(messages: &[Message]) -> &[Message] {
 /// Older completed exchanges are covered by the summary and durable history.
 /// A split is legal only when all preceding tool calls have their results.
 fn protected_last_round(messages: &[Message]) -> Vec<&Message> {
+    let post_provenance = history_is_post_provenance(messages);
     let round = last_round_slice(messages);
     let mut pending = HashSet::new();
     let mut boundaries = Vec::new();
@@ -232,8 +255,8 @@ fn protected_last_round(messages: &[Message]) -> Vec<&Message> {
         .iter()
         .enumerate()
         .filter_map(|(idx, message)| {
-            (!is_compaction_checkpoint_message(message)
-                && (idx >= start || is_plain_user_text(message)))
+            (!is_compaction_checkpoint_message_in_era(message, post_provenance)
+                && (idx >= start || is_plain_user_text(post_provenance, message)))
             .then_some(message)
         })
         .collect()
@@ -243,8 +266,13 @@ pub(super) fn replacement_messages(
     messages: &[Message],
     retained_user_message_tokens: usize,
 ) -> Vec<Message> {
+    let post_provenance = history_is_post_provenance(messages);
     let (start, _) = last_round_range(messages);
-    let mut retained = retained_user_messages(&messages[..start], retained_user_message_tokens);
+    let mut retained = retained_user_messages_in_era(
+        post_provenance,
+        &messages[..start],
+        retained_user_message_tokens,
+    );
     let round = protected_last_round(messages)
         .into_iter()
         .cloned()
@@ -265,6 +293,25 @@ pub(super) fn replacement_messages(
     if let Some(contract) = contract {
         retained.retain(|message| !crate::runtime_handoff::is_operate_contract_message(message));
         retained.insert(0, contract.clone());
+    }
+    // Contributions are captured once per turn. Preserve the complete latest
+    // snapshot, including a withdrawal, rather than summarizing or truncating
+    // instructions that still apply to this tool loop.
+    if let Some(snapshot) = messages.iter().rev().find(|message| {
+        crate::runtime_handoff::extension_prompt_contributions_display(message).is_some()
+    }) {
+        retained.retain(|message| {
+            crate::runtime_handoff::extension_prompt_contributions_display(message).is_none()
+        });
+        retained.insert(0, snapshot.clone());
+    }
+    if let Some(snapshot) = messages
+        .iter()
+        .rev()
+        .find(|message| crate::runtime_handoff::constitution_display(message).is_some())
+    {
+        retained.retain(|message| crate::runtime_handoff::constitution_display(message).is_none());
+        retained.insert(0, snapshot.clone());
     }
     retained
 }
@@ -287,44 +334,61 @@ pub(super) fn bound_last_round(messages: &[Message]) -> Vec<Message> {
     round
 }
 
-fn tool_result_ids(message: &Message) -> Vec<String> {
+fn tool_result_ids(message: &Message) -> Vec<(codewhale_models::ToolCallKey<'_>, &str)> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                block.tool_call_key().map(|key| (key, tool_use_id.as_str()))
+            }
             _ => None,
         })
         .collect()
 }
 
-fn has_tool_result_id(message: &Message, id: &str) -> bool {
+fn has_tool_result_id(message: &Message, id: &(codewhale_models::ToolCallKey<'_>, &str)) -> bool {
+    if id.0.as_str().trim().is_empty() {
+        return false;
+    }
     message.content.iter().any(|block| {
         matches!(
             block,
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+            ContentBlock::ToolResult { tool_use_id, .. } if block.tool_call_key() == Some(id.0) && tool_use_id == id.1
         )
     })
 }
 
-fn tool_use_ids(message: &Message) -> Vec<String> {
+fn tool_use_ids(message: &Message) -> Vec<(codewhale_models::ToolCallKey<'_>, &str)> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            ContentBlock::ToolUse { id, .. } => block.tool_call_key().map(|key| (key, id.as_str())),
             _ => None,
         })
         .collect()
 }
 
-fn has_tool_use_id(message: &Message, id: &str) -> bool {
+fn has_tool_use_id(message: &Message, id: &(codewhale_models::ToolCallKey<'_>, &str)) -> bool {
+    if id.0.as_str().trim().is_empty() {
+        return false;
+    }
     message.content.iter().any(|block| {
         matches!(
             block,
-            ContentBlock::ToolUse { id: seen, .. } if seen == id
+            ContentBlock::ToolUse { id: provider, .. } if block.tool_call_key() == Some(id.0) && provider == id.1
         )
     })
+}
+
+fn tool_call_identity_label(id: &(codewhale_models::ToolCallKey<'_>, &str)) -> String {
+    match id.0 {
+        codewhale_models::ToolCallKey::Execution(execution_id) => {
+            format!("execution {execution_id} (provider call {})", id.1)
+        }
+        codewhale_models::ToolCallKey::LegacyProvider(provider_id) => provider_id.to_string(),
+    }
 }
 
 fn assistant_text_of(message: &Message) -> Option<String> {
@@ -346,7 +410,7 @@ fn assistant_text_of(message: &Message) -> Option<String> {
 
 /// A retained copy may be truncated (`bound_last_round` caps oversized blocks),
 /// so a prefix either way counts as survival -- but nothing weaker does.
-fn survives(text: &str, replacement: &[Message], of: fn(&Message) -> Option<String>) -> bool {
+fn survives(text: &str, replacement: &[Message], of: impl Fn(&Message) -> Option<String>) -> bool {
     replacement.iter().any(|message| {
         of(message)
             .is_some_and(|kept| kept == text || text.starts_with(&kept) || kept.starts_with(text))
@@ -357,6 +421,7 @@ pub(crate) fn validate_last_round_coverage(
     original: &[Message],
     replacement: &[Message],
 ) -> Result<()> {
+    let post_provenance = history_is_post_provenance(original);
     let last_round = protected_last_round(original);
     if last_round.is_empty() {
         return Ok(());
@@ -366,10 +431,16 @@ pub(crate) fn validate_last_round_coverage(
     // tool-bearing turn, so the round routinely spans two user messages -- and
     // checking only the earliest let a rewrite drop the *latest* one, which is
     // the turn this whole contract exists to keep.
-    for text in last_round.iter().copied().filter_map(user_prompt_text_of) {
-        if !survives(&text, replacement, user_prompt_text_of) {
+    for text in last_round
+        .iter()
+        .copied()
+        .filter_map(|message| user_prompt_text_of(post_provenance, message))
+    {
+        if !survives(&text, replacement, |message| {
+            user_prompt_text_of(post_provenance, message)
+        }) {
             anyhow::bail!(
-                "Compaction coverage floor: a last-round user message was dropped; history was not replaced."
+                "Making room stopped: a last-round user message was dropped; history was not replaced."
             );
         }
     }
@@ -378,8 +449,9 @@ pub(crate) fn validate_last_round_coverage(
             .iter()
             .any(|message| has_tool_result_id(message, &id))
         {
+            let label = tool_call_identity_label(&id);
             anyhow::bail!(
-                "Compaction coverage floor: last-round tool result {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool result {label} was dropped; history was not replaced."
             );
         }
     }
@@ -390,8 +462,9 @@ pub(crate) fn validate_last_round_coverage(
             .iter()
             .any(|message| has_tool_use_id(message, &id))
         {
+            let label = tool_call_identity_label(&id);
             anyhow::bail!(
-                "Compaction coverage floor: last-round tool call {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool call {label} was dropped; history was not replaced."
             );
         }
     }
@@ -401,7 +474,7 @@ pub(crate) fn validate_last_round_coverage(
     for text in last_round.iter().copied().filter_map(assistant_text_of) {
         if !survives(&text, replacement, assistant_text_of) {
             anyhow::bail!(
-                "Compaction coverage floor: last-round assistant output was dropped; history was not replaced."
+                "Making room stopped: last-round assistant output was dropped; history was not replaced."
             );
         }
     }
@@ -413,7 +486,7 @@ pub(crate) fn validate_last_round_coverage(
             .any(|message| message.role.is_assistant_like())
     {
         anyhow::bail!(
-            "Compaction coverage floor: last-round assistant output was dropped; history was not replaced."
+            "Making room stopped: last-round assistant output was dropped; history was not replaced."
         );
     }
     Ok(())
@@ -436,7 +509,7 @@ pub(crate) fn require_text_survives(
         })
     });
     if !kept {
-        anyhow::bail!("Compaction coverage floor: {label} was dropped; history was not replaced.");
+        anyhow::bail!("Making room stopped: {label} was dropped; history was not replaced.");
     }
     Ok(())
 }
@@ -447,18 +520,32 @@ pub(crate) fn validate_survival_contract(
     anchors: Option<&str>,
 ) -> Result<()> {
     validate_last_round_coverage(original, replacement)?;
+    // The receipt count reads the replacement in its own era: a replacement
+    // carrying the engine-stamped receipt is modern, so retained turns that
+    // paste a bare header do not count as duplicated summaries, while a
+    // legacy-shaped replacement keeps the loose count that the fixture
+    // matrix pins. A post-provenance *original* raises the bar instead: the
+    // engine stamps every replacement it builds, and the stamped carrier is
+    // the only form request rewriting relocates, so a replacement of a
+    // modern history without a stamp is a dropped receipt even where a
+    // retained pasted turn would loosely count as one.
+    let receipt_recognition = if history_is_post_provenance(original) {
+        true
+    } else {
+        history_is_post_provenance(replacement)
+    };
     let checkpoints = replacement
         .iter()
-        .filter(|message| is_compaction_checkpoint_message(message))
+        .filter(|message| is_compaction_checkpoint_message_in_era(message, receipt_recognition))
         .count();
     if checkpoints == 0 {
         anyhow::bail!(
-            "Compaction coverage floor: checkpoint receipt was dropped; history was not replaced."
+            "Making room stopped: checkpoint receipt was dropped; history was not replaced."
         );
     }
     if checkpoints > 1 {
         anyhow::bail!(
-            "Compaction coverage floor: prior summaries were duplicated; history was not replaced."
+            "Making room stopped: prior summaries were duplicated; history was not replaced."
         );
     }
     if let Some(anchors) = anchors {
@@ -511,9 +598,123 @@ pub(super) fn build_replacement_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compaction::{COMPACTION_SUMMARY_MARKER, compaction_checkpoint_message};
+    use crate::compaction::{
+        COMPACTION_SUMMARY_MARKER, LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+        compaction_checkpoint_message,
+    };
     use codewhale_models::{ContentBlock, Role};
     use serde_json::json;
+
+    #[test]
+    fn coverage_requires_the_original_execution_and_provider_pair() {
+        let original: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"keep this exchange"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"local","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"local","content":"kept"}]}
+        ])).unwrap();
+        assert!(validate_last_round_coverage(&original, &original).is_ok());
+        for identity in [None, Some("different")] {
+            let mut replacement = original.clone();
+            for block in replacement
+                .iter_mut()
+                .flat_map(|message| &mut message.content)
+            {
+                match block {
+                    ContentBlock::ToolUse { execution_id, .. }
+                    | ContentBlock::ToolResult { execution_id, .. } => {
+                        *execution_id = identity.map(str::to_string)
+                    }
+                    _ => {}
+                }
+            }
+            assert!(validate_last_round_coverage(&original, &replacement).is_err());
+        }
+        let mut replacement = original.clone();
+        if let ContentBlock::ToolResult { tool_use_id, .. } = &mut replacement[2].content[0] {
+            *tool_use_id = "wrong-wire".to_string();
+        }
+        let error = validate_last_round_coverage(&original, &replacement).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Making room stopped: last-round tool result execution local (provider call wire) was dropped; history was not replaced."
+        );
+        let mut replacement = original.clone();
+        if let ContentBlock::ToolUse { id, .. } = &mut replacement[1].content[0] {
+            *id = "wrong-wire".to_string();
+        }
+        let error = validate_last_round_coverage(&original, &replacement).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Making room stopped: last-round tool call execution local (provider call wire) was dropped; history was not replaced."
+        );
+    }
+
+    #[test]
+    fn confined_pinned_anchors_require_workspace_trust() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _lock = lock_test_env();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config.path().join("config.toml"));
+        let legacy = workspace.path().join(".deepseek");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("anchors.md"), " legacy anchor \n").unwrap();
+        std::fs::write(legacy.join("trusted"), "true").unwrap();
+        assert_eq!(pinned_anchors_text(None), None);
+        assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+
+        crate::config::save_workspace_trust(workspace.path()).unwrap();
+        assert!(crate::config::is_workspace_trusted(workspace.path()));
+        assert_eq!(
+            pinned_anchors_text(Some(workspace.path())).as_deref(),
+            Some("legacy anchor")
+        );
+        let primary = workspace.path().join(".codewhale");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::write(primary.join("anchors.md"), " primary anchor \n").unwrap();
+        assert_eq!(
+            pinned_anchors_text(Some(workspace.path())).as_deref(),
+            Some("primary anchor")
+        );
+        std::fs::write(primary.join("anchors.md"), " \n").unwrap();
+        assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_pinned_anchors_refuse_linked_files_and_directories() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::os::unix::fs::symlink;
+        let _lock = lock_test_env();
+        let config = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config.path().join("config.toml"));
+        for directory in [".codewhale", ".deepseek"] {
+            for linked_directory in [false, true] {
+                let workspace = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                crate::config::save_workspace_trust(workspace.path()).unwrap();
+                assert!(crate::config::is_workspace_trusted(workspace.path()));
+                let target = outside.path().join("anchors.md");
+                std::fs::write(&target, "separate anchor").unwrap();
+                let parent = workspace.path().join(directory);
+                if linked_directory {
+                    symlink(outside.path(), &parent).unwrap();
+                } else {
+                    std::fs::create_dir(&parent).unwrap();
+                    symlink(&target, parent.join("anchors.md")).unwrap();
+                }
+                assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+                // A dangling preferred path must not select legacy content.
+                if directory == ".codewhale" {
+                    let legacy = workspace.path().join(".deepseek");
+                    std::fs::create_dir(&legacy).unwrap();
+                    std::fs::write(legacy.join("anchors.md"), "legacy anchor").unwrap();
+                }
+                std::fs::remove_file(&target).unwrap();
+                assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+            }
+        }
+    }
 
     fn msg(role: &str, text: &str) -> Message {
         Message {
@@ -529,6 +730,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -542,6 +744,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -554,6 +757,164 @@ mod tests {
         compaction_checkpoint_message(&SystemPrompt::Text(format!(
             "{COMPACTION_SUMMARY_MARKER}: {summary}"
         )))
+    }
+
+    #[test]
+    fn replacement_keeps_only_latest_complete_prompt_snapshot_and_withdrawal() {
+        use crate::runtime_handoff::{
+            extension_prompt_contributions_display, extension_prompt_contributions_runtime_message,
+        };
+        let old = extension_prompt_contributions_runtime_message(Some("old instructions"));
+        let current_text = "current instructions ".repeat(400);
+        for current in [
+            extension_prompt_contributions_runtime_message(Some(&current_text)),
+            extension_prompt_contributions_runtime_message(None),
+        ] {
+            let quoted = msg(
+                "user",
+                &user_text_of(&current).expect("runtime snapshot has text"),
+            );
+            let original = vec![
+                old.clone(),
+                quoted.clone(),
+                current.clone(),
+                msg("user", "Continue this task."),
+                tool_use("first", "Read", json!({"path": "first"})),
+                tool_result("first", "first output"),
+                tool_use("second", "Read", json!({"path": "second"})),
+                tool_result("second", "second output"),
+                tool_use("third", "Read", json!({"path": "third"})),
+                tool_result("third", "third output"),
+            ];
+            let kept = replacement_messages(&original, 20_000);
+            let snapshots: Vec<_> = kept
+                .iter()
+                .filter(|message| extension_prompt_contributions_display(message).is_some())
+                .collect();
+            assert_eq!(snapshots, [&current]);
+            assert!(
+                kept.contains(&quoted),
+                "a person's quote is ordinary user text"
+            );
+            assert_eq!(
+                replacement_messages(&kept, 20_000)
+                    .iter()
+                    .filter(|message| extension_prompt_contributions_display(message).is_some())
+                    .count(),
+                1,
+                "repeated compaction must not accumulate snapshots"
+            );
+        }
+    }
+
+    /// The handoff header tells the next turn what survived. It must match
+    /// what the replacement history keeps: only the last steps of a long
+    /// round, with long tool output shortened and marked.
+    #[test]
+    fn profile_constitution_compaction_keeps_only_the_complete_latest_snapshot() {
+        use crate::runtime_handoff::{constitution_display, constitution_runtime_message};
+        let old = constitution_runtime_message(Some("old instructions"));
+        let current_text = "current instructions ".repeat(400);
+        for current in [
+            constitution_runtime_message(Some(&current_text)),
+            constitution_runtime_message(None),
+        ] {
+            let quoted = msg(
+                "user",
+                &user_text_of(&current).expect("runtime snapshot has text"),
+            );
+            let original = vec![
+                old.clone(),
+                quoted.clone(),
+                current.clone(),
+                msg("user", "Continue this task."),
+                tool_use("first", "Read", json!({"path": "first"})),
+                tool_result("first", "first output"),
+                tool_use("second", "Read", json!({"path": "second"})),
+                tool_result("second", "second output"),
+                tool_use("third", "Read", json!({"path": "third"})),
+                tool_result("third", "third output"),
+            ];
+            let kept = replacement_messages(&original, 20_000);
+            let snapshots: Vec<_> = kept
+                .iter()
+                .filter(|message| constitution_display(message).is_some())
+                .collect();
+            assert_eq!(snapshots, [&current]);
+            assert!(
+                kept.contains(&quoted),
+                "a person's quote is ordinary user text"
+            );
+            assert_eq!(
+                replacement_messages(&kept, 20_000)
+                    .iter()
+                    .filter(|message| constitution_display(message).is_some())
+                    .count(),
+                1,
+                "repeated compaction must not accumulate snapshots"
+            );
+        }
+    }
+
+    /// The handoff header tells the next turn what survived. It must match
+    /// what the replacement history keeps: only the last steps of a long
+    /// round, with long tool output shortened and marked.
+    #[test]
+    fn summary_header_matches_what_replacement_history_keeps() {
+        let long_output = "x".repeat(LAST_ROUND_TOOL_RESULT_MAX_CHARS * 2);
+        let original = vec![
+            msg("user", "Fix the build."),
+            tool_use("first", "Bash", json!({"command": "cargo check"})),
+            tool_result("first", "first step output"),
+            tool_use("second", "Bash", json!({"command": "cargo build"})),
+            tool_result("second", "second step output"),
+            tool_use("third", "Bash", json!({"command": "cargo test"})),
+            tool_result("third", &long_output),
+        ];
+        let kept = replacement_messages(&original, 20_000);
+        let kept_ids: Vec<&str> = kept
+            .iter()
+            .flat_map(tool_result_ids)
+            .map(|(_, wire)| wire)
+            .collect();
+        assert_eq!(kept_ids, ["second", "third"], "earlier steps are dropped");
+        assert!(
+            kept.iter()
+                .any(|m| user_text_of(m).as_deref() == Some("Fix the build."))
+        );
+        let shortened = kept
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "third" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the last tool result is kept");
+        assert!(shortened.len() < long_output.len());
+        assert!(shortened.starts_with("[tool result retained-history truncated from"));
+
+        let header = crate::compaction::SUMMARY_HEADER;
+        assert!(
+            header.contains("last steps of the current round"),
+            "{header}"
+        );
+        assert!(
+            header.contains("including earlier steps of this round"),
+            "{header}"
+        );
+        assert!(
+            header.contains("Long tool output there is shortened"),
+            "{header}"
+        );
+        assert!(
+            header.contains("with a marker where it was cut"),
+            "{header}"
+        );
+        assert!(!header.contains("as they were"), "{header}");
     }
 
     #[test]
@@ -747,16 +1108,20 @@ mod tests {
                 user_text_of(message).as_deref() == Some(long_question.as_str())
             })
         );
-        assert!(
-            second
-                .iter()
-                .any(|message| has_tool_use_id(message, "call_1"))
-        );
-        assert!(
-            second
-                .iter()
-                .any(|message| has_tool_result_id(message, "call_1"))
-        );
+        assert!(second.iter().any(|message| has_tool_use_id(
+            message,
+            &(
+                codewhale_models::ToolCallKey::LegacyProvider("call_1"),
+                "call_1"
+            )
+        )));
+        assert!(second.iter().any(|message| has_tool_result_id(
+            message,
+            &(
+                codewhale_models::ToolCallKey::LegacyProvider("call_1"),
+                "call_1"
+            )
+        )));
         let without_question = second
             .iter()
             .filter(|message| user_text_of(message).as_deref() != Some(long_question.as_str()))
@@ -833,6 +1198,68 @@ mod tests {
     }
 
     #[test]
+    fn compaction_replaces_v0_10_0_operate_contract_with_current() {
+        // A v0.10.0 session that entered Operate after a tool round, resumed on
+        // a later build: the protected round reaches back past both contracts.
+        let shipped = crate::runtime_handoff::v0_10_0_operate_contract_runtime_message();
+        let current = crate::runtime_handoff::operate_contract_runtime_message();
+        let original = vec![
+            msg("user", "Run the failing test."),
+            tool_use("live", "Bash", json!({"command": "cargo test"})),
+            tool_result("live", "test session_store::roundtrip ... FAILED"),
+            shipped.clone(),
+            msg("user", "Fix it."),
+            msg("assistant", "Fixed."),
+            current.clone(),
+            msg("user", "Continue"),
+            msg("assistant", "Working"),
+        ];
+        assert_eq!(last_round_start(&original), 0);
+        let replaced = build_replacement_history(
+            &original,
+            &format!("{COMPACTION_SUMMARY_MARKER}: work continues"),
+            None,
+            1,
+        )
+        .expect("current contract must survive compaction");
+        assert_eq!(replaced.first(), Some(&current));
+        assert!(
+            !replaced.contains(&shipped),
+            "the v0.10.0 contract contradicts the current one about goals"
+        );
+        assert_eq!(
+            replaced
+                .iter()
+                .filter(|message| crate::runtime_handoff::is_operate_contract_message(message))
+                .count(),
+            1
+        );
+
+        // Until an Operate turn on the new build appends the current wording,
+        // the saved contract is the only one and is kept once, at the front.
+        let only_shipped = vec![
+            shipped.clone(),
+            msg("user", "Continue"),
+            msg("assistant", "Working"),
+        ];
+        let replaced = build_replacement_history(
+            &only_shipped,
+            &format!("{COMPACTION_SUMMARY_MARKER}: work continues"),
+            None,
+            1,
+        )
+        .expect("saved contract must survive compaction");
+        assert_eq!(replaced.first(), Some(&shipped));
+        assert_eq!(
+            replaced
+                .iter()
+                .filter(|message| **message == shipped)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn last_round_walks_back_through_toolless_tails_to_the_tool_round() {
         let original = vec![
             msg("user", "Run the failing test."),
@@ -873,6 +1300,90 @@ mod tests {
             msg("assistant", "fine"),
         ];
         assert_eq!(last_round_start(&messages), 2);
+    }
+
+    /// In a history that carries the stamped carrier, a user turn pasting a
+    /// bare legacy summary header is content: it anchors the round, survives
+    /// the replacement, and the receipt count stays 1 instead of rejecting
+    /// the rewrite as a duplicated summary.
+    #[test]
+    fn pasted_legacy_header_turn_is_content_in_a_post_provenance_history() {
+        let pasted = format!(
+            "{LEGACY_V2_COMPACTION_SUMMARY_MARKER}\n\nEarlier turns of another session, pasted."
+        );
+        let original = vec![
+            msg("user", "Run the suite now."),
+            tool_use("live", "Bash", json!({"command": "cargo test"})),
+            tool_result("live", "ok"),
+            checkpoint("suite finished"),
+            msg("assistant", "done"),
+            msg("user", &pasted),
+        ];
+        assert!(
+            !history_is_post_provenance(&[msg("user", &pasted)]),
+            "the pasted turn alone carries no provenance block"
+        );
+        assert_eq!(
+            last_round_start(&original),
+            0,
+            "the pasted turn must anchor like any other user turn"
+        );
+
+        let retained =
+            retained_user_messages_in_era(history_is_post_provenance(&original), &original, 10_000);
+        assert!(
+            retained
+                .iter()
+                .any(|message| user_text_of(message).as_deref() == Some(pasted.as_str())),
+            "the pasted turn must be retained verbatim: {retained:?}"
+        );
+
+        let replacement = vec![
+            checkpoint("second summary"),
+            msg("user", "Run the suite now."),
+            tool_use("live", "Bash", json!({"command": "cargo test"})),
+            tool_result("live", "ok"),
+            msg("assistant", "done"),
+            msg("user", &pasted),
+        ];
+        validate_survival_contract(&original, &replacement, None)
+            .expect("a retained pasted-header turn must not break or lose the round");
+
+        let mut dropped = replacement.clone();
+        dropped.pop();
+        let error = validate_survival_contract(&original, &dropped, None)
+            .expect_err("dropping the pasted turn must fail the coverage floor");
+        assert!(
+            error.to_string().contains("user message was dropped"),
+            "{error}"
+        );
+    }
+
+    /// A history without a stamped carrier predates stamping: the bare
+    /// header there is indistinguishable from the saved carrier, so the
+    /// loose recognition keeps applying.
+    #[test]
+    fn legacy_history_still_recognizes_a_bare_header_checkpoint() {
+        let bare = msg(
+            "user",
+            &format!("{LEGACY_V2_COMPACTION_SUMMARY_MARKER}\n\nCondensed progress."),
+        );
+        assert!(!history_is_post_provenance(std::slice::from_ref(&bare)));
+        assert!(
+            retained_user_messages_in_era(
+                history_is_post_provenance(std::slice::from_ref(&bare)),
+                std::slice::from_ref(&bare),
+                1_000,
+            )
+            .is_empty(),
+            "a bare-header legacy checkpoint must still not be retained as user text"
+        );
+        let messages = vec![msg("user", "older"), bare, msg("assistant", "done")];
+        assert_eq!(
+            last_round_kept_count(&messages),
+            Some(1),
+            "the bare header still bounds the kept round in a legacy history"
+        );
     }
 
     #[derive(serde::Deserialize)]

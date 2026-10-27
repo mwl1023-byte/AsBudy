@@ -14,6 +14,95 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 const KEY: &str = "catalog-key-canary-7f092";
 const CURSOR: &str = "cursor/second +?&=雪-canary";
 
+#[tokio::test]
+async fn chatgpt_models_http_uses_visible_roster_and_rejects_secret_labels() {
+    let server = MockServer::start().await;
+    let client = CodewhaleClient::new(&Config {
+        provider: Some("openai-codex".into()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                api_key: Some(KEY.into()),
+                base_url: Some(format!("{}/v1", server.uri())),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    })
+    .expect("explicit local ChatGPT protocol fixture");
+    mount_models_json(
+        &server,
+        200,
+        json!({"models":[
+            {"slug":"gpt-z","display_name":"GPT Z","visibility":"list"},
+            {"slug":"gpt-hidden","display_name":"Hidden","visibility":"hidden"},
+            {"slug":"gpt-a","display_name":"GPT A","visibility":"list"}
+        ]}),
+    )
+    .await;
+    let models = client.list_models().await.expect("account roster");
+    assert_eq!(
+        models.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["gpt-z", "gpt-a"]
+    );
+    assert_eq!(models[0].display_name.as_deref(), Some("GPT Z"));
+    let delta = client
+        .fetch_catalog_delta()
+        .await
+        .expect("same parsed roster");
+    assert_eq!(
+        delta
+            .offerings
+            .iter()
+            .map(|row| row.wire_model_id.as_str())
+            .collect::<Vec<_>>(),
+        ["gpt-z", "gpt-a"]
+    );
+    for request in server.received_requests().await.expect("requests") {
+        assert_eq!(request.url.path(), "/v1/models");
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            &format!("Bearer {KEY}")
+        );
+    }
+    server.reset().await;
+    mount_models_json(
+        &server,
+        200,
+        json!({"models":[
+            {"slug":"gpt-a","display_name":KEY,"visibility":"list"}
+        ]}),
+    )
+    .await;
+    let error = client
+        .list_models()
+        .await
+        .expect_err("credential echo is never cached");
+    assert!(!error.to_string().contains(KEY));
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/other"))
+        .mount(&server)
+        .await;
+    let response = client
+        .http_client
+        .post(format!("{}/v1/responses", server.uri()))
+        .send()
+        .await
+        .expect("local response");
+    assert_eq!(response.status().as_u16(), 307);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request count")
+            .len(),
+        1,
+        "a plan grant must not follow a redirected inference endpoint"
+    );
+}
+
 fn anthropic_client(base_url: &str) -> CodewhaleClient {
     let mut client = CodewhaleClient::new(&Config {
         provider: Some("anthropic".into()),
@@ -371,7 +460,7 @@ async fn models_redirects_never_reach_another_server_from_any_consumer() {
         recovery.maybe_probe_recovery().await;
         assert!(recovery.connection_health.lock().await.last_probe.is_some());
         assert!(
-            verify_provider_api_key(ApiProvider::Anthropic, KEY, &server.uri())
+            verify_provider_api_key(ProviderKind::Anthropic, KEY, &server.uri())
                 .await
                 .is_err()
         );
@@ -704,10 +793,12 @@ async fn raw_rows_keep_duplicate_known_fields_invalid_in_existing_parsers() {
             body.contains(malformed),
             "collector must retain original row fields"
         );
-        assert_eq!(
-            parse_openrouter_models_response(&body).unwrap_err(),
-            CatalogRefreshError::InvalidResponse
-        );
+        // OpenRouter decodes per row (#6690): the ambiguous row is skipped as
+        // malformed, never accepted with a last-wins value, and the valid row
+        // survives.
+        let openrouter = parse_openrouter_models_response(&body).unwrap();
+        let ids: Vec<&str> = openrouter.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["first"]);
         assert_eq!(
             parse_baseten_models_response(&body).unwrap_err(),
             CatalogRefreshError::InvalidResponse
@@ -1026,4 +1117,136 @@ async fn unpaginated_custom_identities_keep_exact_identity_and_endpoint_ownershi
         cache.record_success(delta, 3600);
     }
     assert_eq!(cache.entries.len(), 3);
+}
+
+/// `models` is the wider spelling some relays echo beside the OpenAI `data`
+/// roster, and it is often a stub. It is not a second name for `data`: when it
+/// was declared as one (`alias = "models"`), a body carrying both keys failed
+/// the whole probe with `duplicate field`, so a route whose roster was present
+/// and well-formed reported `invalid_response` and listed nothing. `data` is
+/// the roster this envelope reads first; `models` stays for hosts that serve
+/// only that spelling.
+#[tokio::test]
+async fn roster_envelope_carrying_data_and_models_reads_the_data_roster() {
+    let server = MockServer::start().await;
+    mount_models_json(
+        &server,
+        200,
+        json!({
+            "object": "list",
+            "data": [{"id": "relay-real-a"}, {"id": "relay-real-b"}],
+            "models": [{"id": "wider-spelling-stub"}],
+            "total_count": 2,
+        }),
+    )
+    .await;
+    let client = custom_mock_client_for_identity(&server, "relay-private");
+    let delta = client
+        .fetch_catalog_delta()
+        .await
+        .expect("both spellings present is a complete roster, not an invalid response");
+    assert_eq!(
+        delta
+            .offerings
+            .iter()
+            .map(|row| row.wire_model_id.as_str())
+            .collect::<Vec<_>>(),
+        ["relay-real-a", "relay-real-b"]
+    );
+}
+
+/// An empty `data` roster beside a populated `models` array is an empty
+/// listing, not a reason to read the other key. A present `data` is the
+/// OpenAI-compatible roster; only a host that serves no `data` at all falls
+/// back to the wider spelling.
+#[tokio::test]
+async fn roster_envelope_with_empty_data_is_an_empty_listing_not_a_models_fallback() {
+    let server = MockServer::start().await;
+    mount_models_json(
+        &server,
+        200,
+        json!({
+            "object": "list",
+            "data": [],
+            "models": [{"id": "wider-spelling-stub"}],
+        }),
+    )
+    .await;
+    let client = custom_mock_client_for_identity(&server, "relay-private");
+    assert_eq!(
+        client
+            .fetch_catalog_delta()
+            .await
+            .expect_err("an empty data roster is an empty listing"),
+        CatalogRefreshError::EmptyList
+    );
+}
+
+/// A custom table is reached through the OpenAI-compatible surface, so its
+/// `/models` listing follows the OpenAI auth convention even when the table
+/// declares `wire = "anthropic"` for Messages. A relay can answer
+/// `/v1/messages` on either header and still reject `x-api-key` on
+/// `/v1/models` with `401 missing_api_key`, so the listing must not inherit
+/// the Messages choice.
+#[tokio::test]
+async fn custom_messages_wire_listing_authenticates_with_bearer() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockServer::start().await;
+    mount_models_json(
+        &server,
+        200,
+        json!({"object": "list", "data": [{"id": "relay-model"}]}),
+    )
+    .await;
+    let mut providers = ProvidersConfig::default();
+    providers.custom.insert(
+        "relay-messages-wire".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            api_key: Some(KEY.to_string()),
+            base_url: Some(format!("{}/v1", server.uri())),
+            model: Some("relay-model".to_string()),
+            wire: Some("anthropic".to_string()),
+            ..ProviderConfig::default()
+        },
+    );
+    let client = CodewhaleClient::new(&Config {
+        provider: Some("relay-messages-wire".to_string()),
+        providers: Some(providers),
+        ..Config::default()
+    })
+    .expect("custom Messages-wire relay client");
+
+    let delta = client
+        .fetch_catalog_delta()
+        .await
+        .expect("the relay's listing answers on its own terms");
+    assert_eq!(
+        delta
+            .offerings
+            .iter()
+            .map(|row| row.wire_model_id.as_str())
+            .collect::<Vec<_>>(),
+        ["relay-model"]
+    );
+
+    let request = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .pop()
+        .expect("one listing request");
+    let expected = format!("Bearer {KEY}");
+    assert_eq!(
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "the listing follows the OpenAI auth convention"
+    );
+    assert!(
+        request.headers.get("x-api-key").is_none(),
+        "the listing must not inherit the Messages x-api-key convention"
+    );
 }

@@ -1,27 +1,17 @@
-//! Recursive Language Model (RLM) loop — paper-spec Algorithm 1.
+//! Recursive Language Model presentation and persistent Python context.
 //!
-//! Implements Zhang, Kraska & Khattab (arXiv:2512.24601, §2 Algorithm 1):
+//! The serving Engine captures one call-local route, policy, service and
+//! cancellation receipt. `llm_query` and `rlm_query` submit bounded invocations
+//! to the same `Engine::run_turn`; this module owns no provider/code loop.
 //!
-//! ```text
-//! state ← InitREPL(prompt=P)
-//! state ← AddFunction(state, sub_RLM)
-//! hist ← [Metadata(state)]
-//! while True:
-//!     code ← LLM(hist)
-//!     (state, stdout) ← REPL(state, code)
-//!     hist ← hist ∥ code ∥ Metadata(stdout)
-//!     if state[Final] is set:
-//!         return state[Final]
-//! ```
-//!
-//! Invariants:
-//! - `P` is held only as a REPL variable (`context` / `ctx`); never
-//!   appears in the root LLM's window.
-//! - The root LLM receives small metadata messages — length, preview,
-//!   helper list, prior-round summary.
-//! - Code rounds and sub-LLM calls travel over a single stdin/stdout
-//!   pipe to a long-lived Python subprocess. No HTTP sidecar.
+//! Long input stays in `_context` (`_ctx` / `content` compatibility aliases).
+//! Core's session keeps initial metadata plus every code/result round until
+//! FINAL, the strict partial-response refusal or the bounded deadline/cap.
+//! Python kernels retain variables and pipes, never their borrowed dispatcher
+//! or caller. The persistent `rlm` action surface is caller-session scoped;
+//! `share_session=true` explicitly refuses. No HTTP sidecar is created.
 
+#[cfg(test)]
 use codewhale_models::Usage;
 
 pub mod bridge;
@@ -29,48 +19,9 @@ pub mod prompt;
 pub mod session;
 pub mod turn;
 
-pub(crate) use bridge::ModelClientRlmAdapter;
-pub use bridge::RlmBridge;
+pub(crate) use bridge::RlmBridge;
 pub use prompt::rlm_system_prompt;
-pub use turn::{RlmTermination, RlmTurnResult, run_rlm_turn, run_rlm_turn_with_root};
-
-fn add_usage_with_prompt_cache(total: &mut Usage, delta: &Usage) {
-    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
-    total.prompt_cache_hit_tokens =
-        add_optional_usage(total.prompt_cache_hit_tokens, delta.prompt_cache_hit_tokens);
-    total.prompt_cache_miss_tokens = add_optional_usage(
-        total.prompt_cache_miss_tokens,
-        delta.prompt_cache_miss_tokens,
-    );
-    total.prompt_cache_write_tokens = add_optional_usage(
-        total.prompt_cache_write_tokens,
-        delta.prompt_cache_write_tokens,
-    );
-    total.reasoning_tokens = add_optional_usage(total.reasoning_tokens, delta.reasoning_tokens);
-    total.reasoning_replay_tokens =
-        add_optional_usage(total.reasoning_replay_tokens, delta.reasoning_replay_tokens);
-    if let Some(delta_server) = delta.server_tool_use.as_ref() {
-        let total_server = total.server_tool_use.get_or_insert_default();
-        total_server.code_execution_requests = add_optional_usage(
-            total_server.code_execution_requests,
-            delta_server.code_execution_requests,
-        );
-        total_server.tool_search_requests = add_optional_usage(
-            total_server.tool_search_requests,
-            delta_server.tool_search_requests,
-        );
-    }
-}
-
-fn add_optional_usage(total: Option<u32>, delta: Option<u32>) -> Option<u32> {
-    match (total, delta) {
-        (Some(total), Some(delta)) => Some(total.saturating_add(delta)),
-        (None, Some(delta)) => Some(delta),
-        (Some(total), None) => Some(total),
-        (None, None) => None,
-    }
-}
+pub use turn::{RlmTermination, RlmTurnResult};
 
 #[cfg(test)]
 mod tests {
@@ -99,7 +50,7 @@ mod tests {
             ..Usage::default()
         };
 
-        add_usage_with_prompt_cache(&mut total, &delta);
+        crate::core::turn::add_usage_to(&mut total, &delta);
 
         assert_eq!(total.input_tokens, 150);
         assert_eq!(total.output_tokens, 15);

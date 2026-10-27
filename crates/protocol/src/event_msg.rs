@@ -124,7 +124,7 @@ pub struct RouteBillingEnvelope {
 /// Provider/model route resolved for a model-backed turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnRoute {
-    /// `ApiProvider` key (`deepseek`, `openai`, `custom`, ...).
+    /// `ProviderKind` key (`deepseek`, `openai`, `custom`, ...).
     pub provider: String,
     /// Exact non-secret configured route key.
     pub provider_identity: String,
@@ -300,6 +300,18 @@ pub enum EventMsg {
         omitted_tool_count: u64,
     },
 
+    RequestImageWindow {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        provider: String,
+        model: String,
+        total: u64,
+        elided: u64,
+        cap: u64,
+        cap_source: String,
+        message: String,
+    },
+
     /// Workspace snapshots (undo) are off for this workspace. `reason` is one
     /// rendered, localized line: the consequence, the gate that refused, and
     /// the recovery that actually lifts *that* gate (the size cap's config key
@@ -356,12 +368,43 @@ pub enum EventMsg {
         thread_id: ThreadId,
         session_id: SessionId,
     },
+    ToolExecutionStarted {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        tool_call_id: String,
+    },
+    ToolResultContent {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        tool_call_id: String,
+        blocks: Value,
+    },
     ToolCallComplete {
         thread_id: ThreadId,
         session_id: SessionId,
         tool_call_id: String,
         tool_name: String,
         result: ToolCallOutcome,
+    },
+    /// Trusted Engine-owned activity for an operation that passed dispatch
+    /// and authority checks. No arguments, command, or result is
+    /// included in the pet-facing activity contract.
+    OperationActivityStarted {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        span_id: String,
+        activity_kind: crate::engine_owner::OwnerActivityKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
+    },
+    OperationActivityCompleted {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        span_id: String,
+        activity_kind: crate::engine_owner::OwnerActivityKind,
+        outcome: crate::engine_owner::OwnerOperationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
     },
 
     // === Turn lifecycle ===
@@ -372,10 +415,27 @@ pub enum EventMsg {
         created_at: DateTime<Utc>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<TurnRoute>,
+        /// Host submission correlation echo: the token an in-process host
+        /// stamped on its `SendMessage`/`EditLastTurn` op, echoed verbatim by
+        /// that turn's start; `None` for every engine self-started turn.
+        /// Additive and default-absent on the wire. Only in-process engine
+        /// handles can stamp a token — the wire `Op` carries no correlation
+        /// field — so wire submitters only ever observe `None` here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
     },
     /// Bounded tool-field projection from a prepared model-client request
     /// (`ToolInspectionSnapshot` serialized).
     ToolRequestSnapshot {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        snapshot: Value,
+    },
+    /// A workspace snapshot the engine took for the running turn
+    /// (`WorkspaceSnapshotRef` serialized: `kind`, `snapshot_id`, `tree_id`,
+    /// `session_id`, optional `tool_call_id`, `write_paths` and
+    /// `changed_paths`).
+    WorkspaceSnapshotTaken {
         thread_id: ThreadId,
         session_id: SessionId,
         snapshot: Value,
@@ -390,10 +450,19 @@ pub enum EventMsg {
     TurnComplete {
         thread_id: ThreadId,
         session_id: SessionId,
-        /// The engine's `TurnComplete` carries no turn id; the emitter fills
-        /// it from the envelope when it knows it.
+        /// Actual started turn; absent when a submitted operation fails
+        /// before starting.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        /// Host submission correlation, including preflight rejection. Runtime
+        /// self-starts do not carry a host token. Older producers default to
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
+        /// Manual compaction operation identity, never the surrounding host
+        /// submission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
         status: TurnOutcomeStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -409,6 +478,12 @@ pub enum EventMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
     },
+    ProviderRequestReceipt {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        receipt: Value,
+    },
+
     /// Usage for one model call within the turn.
     TurnUsage {
         #[serde(
@@ -529,6 +604,10 @@ pub enum EventMsg {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route_source: Option<String>,
+        /// The name the agent goes by (workflow task label, dispatch name, or
+        /// role). Absent from older producers; never the raw id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     AgentProgress {
         thread_id: ThreadId,
@@ -555,6 +634,8 @@ pub enum EventMsg {
         spawn_depth: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuable: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     SubAgentFollowUp {
         thread_id: ThreadId,
@@ -651,6 +732,11 @@ pub enum EventMsg {
         intent_summary: Option<String>,
         approval_force_prompt: bool,
     },
+    ApprovalWithdrawn {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        id: String,
+    },
     UserInputRequired {
         thread_id: ThreadId,
         session_id: SessionId,
@@ -741,6 +827,7 @@ pub struct EventEnvelope {
 /// proves the list and `kind_str` agree.
 pub const EVENT_KINDS: &[&str] = &[
     "tool_projection_warning",
+    "request_image_window",
     "message_started",
     "response_delta",
     "message_complete",
@@ -749,8 +836,11 @@ pub const EVENT_KINDS: &[&str] = &[
     "tool_call_started",
     "tool_call_heartbeat",
     "tool_call_complete",
+    "operation_activity_started",
+    "operation_activity_completed",
     "turn_started",
     "tool_request_snapshot",
+    "workspace_snapshot_taken",
     "route_dispatched",
     "turn_complete",
     "turn_usage",
@@ -779,6 +869,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "pause_events",
     "resume_events",
     "approval_required",
+    "approval_withdrawn",
     "user_input_required",
     "session_updated",
     "elevation_required",
@@ -793,6 +884,7 @@ impl EventMsg {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::ToolProjectionWarning { .. } => "tool_projection_warning",
+            Self::RequestImageWindow { .. } => "request_image_window",
             Self::SnapshotsDisabled { .. } => "snapshots_disabled",
             Self::MessageStarted { .. } => "message_started",
             Self::ResponseDelta { .. } => "response_delta",
@@ -801,11 +893,17 @@ impl EventMsg {
             Self::ThinkingComplete { .. } => "thinking_complete",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallHeartbeat { .. } => "tool_call_heartbeat",
+            Self::ToolExecutionStarted { .. } => "tool_execution_started",
+            Self::ToolResultContent { .. } => "tool_result_content",
             Self::ToolCallComplete { .. } => "tool_call_complete",
+            Self::OperationActivityStarted { .. } => "operation_activity_started",
+            Self::OperationActivityCompleted { .. } => "operation_activity_completed",
             Self::TurnStarted { .. } => "turn_started",
             Self::ToolRequestSnapshot { .. } => "tool_request_snapshot",
+            Self::WorkspaceSnapshotTaken { .. } => "workspace_snapshot_taken",
             Self::RouteDispatched { .. } => "route_dispatched",
             Self::TurnComplete { .. } => "turn_complete",
+            Self::ProviderRequestReceipt { .. } => "provider_request_receipt",
             Self::TurnUsage { .. } => "turn_usage",
             Self::RoutedTurnUsage { .. } => "routed_turn_usage",
             Self::GoalUpdated { .. } => "goal_updated",
@@ -832,6 +930,7 @@ impl EventMsg {
             Self::PauseEvents { .. } => "pause_events",
             Self::ResumeEvents { .. } => "resume_events",
             Self::ApprovalRequired { .. } => "approval_required",
+            Self::ApprovalWithdrawn { .. } => "approval_withdrawn",
             Self::UserInputRequired { .. } => "user_input_required",
             Self::SessionUpdated { .. } => "session_updated",
             Self::ElevationRequired { .. } => "elevation_required",
@@ -846,6 +945,7 @@ impl EventMsg {
     pub fn thread_id(&self) -> &ThreadId {
         match self {
             Self::ToolProjectionWarning { thread_id, .. }
+            | Self::RequestImageWindow { thread_id, .. }
             | Self::SnapshotsDisabled { thread_id, .. }
             | Self::MessageStarted { thread_id, .. }
             | Self::ResponseDelta { thread_id, .. }
@@ -854,11 +954,17 @@ impl EventMsg {
             | Self::ThinkingComplete { thread_id, .. }
             | Self::ToolCallStarted { thread_id, .. }
             | Self::ToolCallHeartbeat { thread_id, .. }
+            | Self::ToolExecutionStarted { thread_id, .. }
+            | Self::ToolResultContent { thread_id, .. }
             | Self::ToolCallComplete { thread_id, .. }
+            | Self::OperationActivityStarted { thread_id, .. }
+            | Self::OperationActivityCompleted { thread_id, .. }
             | Self::TurnStarted { thread_id, .. }
             | Self::ToolRequestSnapshot { thread_id, .. }
+            | Self::WorkspaceSnapshotTaken { thread_id, .. }
             | Self::RouteDispatched { thread_id, .. }
             | Self::TurnComplete { thread_id, .. }
+            | Self::ProviderRequestReceipt { thread_id, .. }
             | Self::TurnUsage { thread_id, .. }
             | Self::RoutedTurnUsage { thread_id, .. }
             | Self::GoalUpdated { thread_id, .. }
@@ -885,6 +991,7 @@ impl EventMsg {
             | Self::PauseEvents { thread_id, .. }
             | Self::ResumeEvents { thread_id, .. }
             | Self::ApprovalRequired { thread_id, .. }
+            | Self::ApprovalWithdrawn { thread_id, .. }
             | Self::UserInputRequired { thread_id, .. }
             | Self::SessionUpdated { thread_id, .. }
             | Self::ElevationRequired { thread_id, .. }
@@ -899,6 +1006,7 @@ impl EventMsg {
     pub fn session_id(&self) -> &SessionId {
         match self {
             Self::ToolProjectionWarning { session_id, .. }
+            | Self::RequestImageWindow { session_id, .. }
             | Self::SnapshotsDisabled { session_id, .. }
             | Self::MessageStarted { session_id, .. }
             | Self::ResponseDelta { session_id, .. }
@@ -907,11 +1015,17 @@ impl EventMsg {
             | Self::ThinkingComplete { session_id, .. }
             | Self::ToolCallStarted { session_id, .. }
             | Self::ToolCallHeartbeat { session_id, .. }
+            | Self::ToolExecutionStarted { session_id, .. }
+            | Self::ToolResultContent { session_id, .. }
             | Self::ToolCallComplete { session_id, .. }
+            | Self::OperationActivityStarted { session_id, .. }
+            | Self::OperationActivityCompleted { session_id, .. }
             | Self::TurnStarted { session_id, .. }
             | Self::ToolRequestSnapshot { session_id, .. }
+            | Self::WorkspaceSnapshotTaken { session_id, .. }
             | Self::RouteDispatched { session_id, .. }
             | Self::TurnComplete { session_id, .. }
+            | Self::ProviderRequestReceipt { session_id, .. }
             | Self::TurnUsage { session_id, .. }
             | Self::RoutedTurnUsage { session_id, .. }
             | Self::GoalUpdated { session_id, .. }
@@ -938,6 +1052,7 @@ impl EventMsg {
             | Self::PauseEvents { session_id, .. }
             | Self::ResumeEvents { session_id, .. }
             | Self::ApprovalRequired { session_id, .. }
+            | Self::ApprovalWithdrawn { session_id, .. }
             | Self::UserInputRequired { session_id, .. }
             | Self::SessionUpdated { session_id, .. }
             | Self::ElevationRequired { session_id, .. }
@@ -1000,6 +1115,17 @@ mod tests {
                 omitted_tool_names: vec!["a".into()],
                 omitted_tool_count: 3,
             },
+            EventMsg::RequestImageWindow {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                provider: "vllm".into(),
+                model: "m".into(),
+                total: 6,
+                elided: 3,
+                cap: 3,
+                cap_source: "provider_rejection".into(),
+                message: "m".into(),
+            },
             EventMsg::MessageStarted {
                 thread_id: t.clone(),
                 session_id: s.clone(),
@@ -1047,17 +1173,38 @@ mod tests {
                     error: ToolCallError::Timeout { seconds: 3 },
                 },
             },
+            EventMsg::OperationActivityStarted {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                span_id: "span-1".into(),
+                activity_kind: crate::engine_owner::OwnerActivityKind::Reading,
+                action_id: Some("read_file".into()),
+            },
+            EventMsg::OperationActivityCompleted {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                span_id: "span-1".into(),
+                activity_kind: crate::engine_owner::OwnerActivityKind::Reading,
+                action_id: Some("read_file".into()),
+                outcome: crate::engine_owner::OwnerOperationOutcome::Succeeded,
+            },
             EventMsg::TurnStarted {
                 thread_id: t.clone(),
                 session_id: s.clone(),
                 turn_id: "turn-1".into(),
                 created_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
                 route: Some(route.clone()),
+                submission_id: None,
             },
             EventMsg::ToolRequestSnapshot {
                 thread_id: t.clone(),
                 session_id: s.clone(),
                 snapshot: json!({"tool_count": 2}),
+            },
+            EventMsg::WorkspaceSnapshotTaken {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                snapshot: json!({"kind": "pre_turn", "tree_id": "t"}),
             },
             EventMsg::RouteDispatched {
                 thread_id: t.clone(),
@@ -1066,6 +1213,8 @@ mod tests {
                 route,
             },
             EventMsg::TurnComplete {
+                submission_id: None,
+                compaction_id: None,
                 thread_id: t.clone(),
                 session_id: s.clone(),
                 turn_id: None,
@@ -1171,6 +1320,7 @@ mod tests {
                 spawn_depth: 1,
                 model: "m".into(),
                 route_source: Some("task.model".into()),
+                display_name: Some("audit docs".into()),
             },
             EventMsg::AgentProgress {
                 thread_id: t.clone(),
@@ -1196,6 +1346,7 @@ mod tests {
                 parent_run_id: None,
                 spawn_depth: Some(1),
                 continuable: Some(false),
+                display_name: Some("audit docs".into()),
             },
             EventMsg::SubAgentFollowUp {
                 thread_id: t.clone(),
@@ -1319,6 +1470,11 @@ mod tests {
                 intent_summary: None,
                 approval_force_prompt: true,
             },
+            EventMsg::ApprovalWithdrawn {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                id: "c1".into(),
+            },
             EventMsg::UserInputRequired {
                 thread_id: t.clone(),
                 session_id: s.clone(),
@@ -1416,8 +1572,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_events_from_producers_without_a_display_name_still_load() {
+        // #6565 added `display_name`; payloads written before it omit it.
+        let mut every = every_variant();
+        every.retain(|msg| {
+            matches!(
+                msg,
+                EventMsg::AgentSpawned { .. } | EventMsg::AgentComplete { .. }
+            )
+        });
+        assert_eq!(every.len(), 2);
+        for msg in every {
+            let mut value = serde_json::to_value(&msg).unwrap();
+            assert_eq!(value["display_name"], "audit docs");
+            value.as_object_mut().unwrap().remove("display_name");
+            let back: EventMsg = serde_json::from_value(value.clone()).unwrap();
+            match &back {
+                EventMsg::AgentSpawned { display_name, .. }
+                | EventMsg::AgentComplete { display_name, .. } => assert_eq!(*display_name, None),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(
+                serde_json::to_value(&back)
+                    .unwrap()
+                    .get("display_name")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn event_msg_roundtrip() {
         let msg = EventMsg::TurnComplete {
+            submission_id: None,
+            compaction_id: None,
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
             turn_id: Some("turn-1".into()),
@@ -1436,6 +1624,49 @@ mod tests {
     }
 
     #[test]
+    fn turn_complete_ownership_is_additive_and_round_trips() {
+        for (turn_id, submission_id, compaction_id) in [
+            (Some("turn-1"), Some("sub-host-1"), None),
+            (None, Some("sub-rejected"), None),
+            (Some("autonomous-turn"), None, None),
+            (None, None, Some("compact-1")),
+            (None, None, None),
+        ] {
+            let msg = EventMsg::TurnComplete {
+                thread_id: ThreadId::new(),
+                session_id: SessionId::new(),
+                turn_id: turn_id.map(str::to_string),
+                submission_id: submission_id.map(str::to_string),
+                compaction_id: compaction_id.map(str::to_string),
+                status: TurnOutcomeStatus::Failed,
+                error: Some("fixture rejection".into()),
+                usage: TokenUsage::default(),
+                parent_route_usage: None,
+                routed_usage_dropped_records: 0,
+                tool_catalog: None,
+                base_url: None,
+            };
+            let value = serde_json::to_value(&msg).unwrap();
+            for (key, expected) in [
+                ("turn_id", turn_id),
+                ("submission_id", submission_id),
+                ("compaction_id", compaction_id),
+            ] {
+                if let Some(expected) = expected {
+                    assert_eq!(value[key], expected);
+                } else {
+                    assert!(value.get(key).is_none(), "{key} must stay absent");
+                }
+            }
+            let back: EventMsg = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                back, msg,
+                "legacy absent fields and owned receipts round-trip"
+            );
+        }
+    }
+
+    #[test]
     fn text_channel_is_elided_on_the_wire() {
         let msg = EventMsg::ResponseDelta {
             thread_id: ThreadId::new(),
@@ -1448,5 +1679,44 @@ mod tests {
         assert!(!json.contains("channel"), "{json}");
         let back: EventMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);
+    }
+
+    /// A host-stamped `submission_id` crosses the wire verbatim, a `None`
+    /// token stays absent, and a payload from a producer that predates the
+    /// field still deserializes (`serde(default)`).
+    #[test]
+    fn turn_started_submission_id_is_additive_and_default_absent() {
+        let msg = EventMsg::TurnStarted {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            turn_id: "turn-1".into(),
+            created_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            route: None,
+            submission_id: Some("sub-host-1".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""submission_id":"sub-host-1""#),
+            "a host-stamped token must be serialized: {json}"
+        );
+        let back: EventMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+
+        let none = EventMsg::TurnStarted {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            turn_id: "turn-2".into(),
+            created_at: DateTime::<Utc>::from_timestamp(2, 0).unwrap(),
+            route: None,
+            submission_id: None,
+        };
+        let value = serde_json::to_value(&none).unwrap();
+        assert!(
+            value.get("submission_id").is_none(),
+            "a self-started turn's None token must stay absent on the wire: {value}"
+        );
+        // An older producer that predates the field: the absent key defaults.
+        let back: EventMsg = serde_json::from_value(value).unwrap();
+        assert_eq!(back, none);
     }
 }

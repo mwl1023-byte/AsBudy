@@ -9,11 +9,8 @@
 //! Codewhale account rosters are memory-only and cleared before each refresh;
 //! a named custom route at either official endpoint follows the same rule.
 //!
-//! This deliberately does not import the legacy `model_catalog` cache at
-//! `catalog/openrouter.json`: that file has no provider/base-URL scope, so
-//! treating it as a provider-owned roster could leak stale facts across custom
-//! endpoints. `model_catalog` remains a read-only compatibility fallback for
-//! older model-metadata consumers while provider-lake/runtime consumers migrate;
+//! The former unscoped OpenRouter cache reader is retired; installed old files
+//! are preserved and never imported as provider authority.
 //! `catalog/provider-catalogs.json` is the sole writer-owned live roster store.
 //! Older per-endpoint `provider-*.json` files also lack the built-in/custom
 //! kind boundary and account-roster exclusion, so they are left untouched and
@@ -36,7 +33,7 @@ use codewhale_config::persistence::atomic_write_json;
 use codewhale_config::pricing::{Currency, OfferingPricing, PricingProvenance};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 
 const CACHE_SCHEMA_VERSION: u32 = 2;
 const CACHE_FILE: &str = "provider-catalogs.json";
@@ -71,7 +68,7 @@ static REFRESH_GENERATIONS: LazyLock<RwLock<BTreeMap<String, u64>>> =
 #[derive(Debug, Clone)]
 pub struct ProviderCatalogRefreshTicket {
     provider: String,
-    provider_kind: ApiProvider,
+    provider_kind: ProviderKind,
     fingerprint: Option<String>,
     generation: u64,
 }
@@ -84,7 +81,7 @@ pub struct ProviderCatalogRefreshTicket {
 /// therefore changes even when two refreshes land in the same Unix second.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderLivePricingQuote {
-    pub(crate) provider: ApiProvider,
+    pub(crate) provider: ProviderKind,
     pub(crate) provider_identity: String,
     pub(crate) wire_model: String,
     pub(crate) endpoint_fingerprint: String,
@@ -93,6 +90,7 @@ pub struct ProviderLivePricingQuote {
     pub(crate) currency: Currency,
     pub(crate) provenance: PricingProvenance,
     pub(crate) cloud_facts: Option<CloudFactsPricingSource>,
+    pub(crate) pricing_schedule: Option<String>,
     pub(crate) input_per_million: Option<String>,
     pub(crate) output_per_million: Option<String>,
     pub(crate) cache_read_per_million: Option<String>,
@@ -112,7 +110,7 @@ pub(crate) struct CloudFactsPricingSource {
 
 #[derive(Serialize, Deserialize)]
 struct ProviderLivePricingQuoteWire {
-    provider: ApiProvider,
+    provider: String,
     provider_identity: String,
     wire_model: String,
     endpoint_fingerprint: String,
@@ -123,6 +121,8 @@ struct ProviderLivePricingQuoteWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_facts: Option<CloudFactsPricingSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pricing_schedule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     input_per_million: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_per_million: Option<String>,
@@ -132,10 +132,16 @@ struct ProviderLivePricingQuoteWire {
     cache_write_per_million: Option<String>,
 }
 
-impl From<&ProviderLivePricingQuote> for ProviderLivePricingQuoteWire {
-    fn from(quote: &ProviderLivePricingQuote) -> Self {
-        Self {
-            provider: quote.provider,
+impl TryFrom<&ProviderLivePricingQuote> for ProviderLivePricingQuoteWire {
+    type Error = &'static str;
+    fn try_from(quote: &ProviderLivePricingQuote) -> Result<Self, Self::Error> {
+        let provider = codewhale_config::descriptors::tui_wire_tag_for_route(
+            quote.provider,
+            &quote.provider_identity,
+        )
+        .ok_or("contradictory pricing provider identity")?;
+        Ok(Self {
+            provider: provider.into(),
             provider_identity: quote.provider_identity.clone(),
             wire_model: quote.wire_model.clone(),
             endpoint_fingerprint: quote.endpoint_fingerprint.clone(),
@@ -144,11 +150,12 @@ impl From<&ProviderLivePricingQuote> for ProviderLivePricingQuoteWire {
             currency: quote.currency.clone(),
             provenance: quote.provenance.clone(),
             cloud_facts: quote.cloud_facts.clone(),
+            pricing_schedule: quote.pricing_schedule.clone(),
             input_per_million: quote.input_per_million.clone(),
             output_per_million: quote.output_per_million.clone(),
             cache_read_per_million: quote.cache_read_per_million.clone(),
             cache_write_per_million: quote.cache_write_per_million.clone(),
-        }
+        })
     }
 }
 
@@ -160,7 +167,9 @@ impl Serialize for ProviderLivePricingQuote {
         if !self.is_structurally_valid() {
             return serializer.serialize_none();
         }
-        ProviderLivePricingQuoteWire::from(self).serialize(serializer)
+        ProviderLivePricingQuoteWire::try_from(self)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
     }
 }
 
@@ -170,8 +179,13 @@ impl<'de> Deserialize<'de> for ProviderLivePricingQuote {
         D: serde::Deserializer<'de>,
     {
         let wire = ProviderLivePricingQuoteWire::deserialize(deserializer)?;
+        let provider = codewhale_config::descriptors::kind_from_tui_wire_tag(
+            &wire.provider,
+            &wire.provider_identity,
+        )
+        .ok_or_else(|| serde::de::Error::custom("contradictory pricing provider identity"))?;
         let quote = Self {
-            provider: wire.provider,
+            provider,
             provider_identity: wire.provider_identity,
             wire_model: wire.wire_model,
             endpoint_fingerprint: wire.endpoint_fingerprint,
@@ -180,6 +194,7 @@ impl<'de> Deserialize<'de> for ProviderLivePricingQuote {
             currency: wire.currency,
             provenance: wire.provenance,
             cloud_facts: wire.cloud_facts,
+            pricing_schedule: wire.pricing_schedule,
             input_per_million: wire.input_per_million,
             output_per_million: wire.output_per_million,
             cache_read_per_million: wire.cache_read_per_million,
@@ -203,6 +218,49 @@ where
 }
 
 impl ProviderLivePricingQuote {
+    /// Whether the quote names at least one rate. A `[[custom_models]]` row
+    /// declared only to add a model to a roster freezes a rate-less quote.
+    #[must_use]
+    pub(crate) fn carries_rates(&self) -> bool {
+        [
+            &self.input_per_million,
+            &self.output_per_million,
+            &self.cache_read_per_million,
+            &self.cache_write_per_million,
+        ]
+        .into_iter()
+        .any(Option::is_some)
+    }
+
+    pub(crate) fn carries_pricing_decision(&self) -> bool {
+        self.carries_rates()
+            || self
+                .pricing_schedule
+                .as_deref()
+                .filter(|schedule| schedule.len() <= 32_768)
+                .and_then(|schedule| {
+                    serde_json::from_str::<(OfferingPricing, Option<OfferingPricing>)>(schedule)
+                        .ok()
+                })
+                .is_some_and(|(pricing, _)| pricing.has_any_price() || pricing.rate_withheld)
+    }
+
+    pub(crate) fn secondary_pricing_for_route(
+        &self,
+        provider: ProviderKind,
+        identity: &str,
+        model: &str,
+        fingerprint: &str,
+        at: u64,
+    ) -> Option<OfferingPricing> {
+        self.pricing_for_route(provider, identity, model, fingerprint, at)?;
+        serde_json::from_str::<(OfferingPricing, Option<OfferingPricing>)>(
+            self.pricing_schedule.as_deref()?,
+        )
+        .ok()?
+        .1
+    }
+
     fn is_structurally_valid(&self) -> bool {
         self.pricing_for_route(
             self.provider,
@@ -218,7 +276,7 @@ impl ProviderLivePricingQuote {
     }
 
     fn revision_for(
-        provider: ApiProvider,
+        provider: ProviderKind,
         provider_identity: &str,
         wire_model: &str,
         endpoint_fingerprint: &str,
@@ -230,10 +288,11 @@ impl ProviderLivePricingQuote {
         cache_read_per_million: &Option<String>,
         cache_write_per_million: &Option<String>,
         cloud_facts: Option<&CloudFactsPricingSource>,
+        pricing_schedule: Option<&str>,
     ) -> Option<String> {
         let payload = serde_json::to_vec(&(
             "codewhale-provider-live-pricing-quote-v1",
-            provider,
+            codewhale_config::descriptors::tui_wire_tag_for_route(provider, provider_identity)?,
             provider_identity,
             wire_model,
             endpoint_fingerprint,
@@ -256,11 +315,17 @@ impl ProviderLivePricingQuote {
             }
             None => payload,
         };
+        let payload = match pricing_schedule {
+            Some(schedule) => {
+                serde_json::to_vec(&("codewhale-pricing-schedule-v2", payload, schedule)).ok()?
+            }
+            None => payload,
+        };
         Some(format!("sha256:{}", crate::hashing::sha256_hex(payload)))
     }
 
     fn from_pricing(
-        provider: ApiProvider,
+        provider: ProviderKind,
         provider_identity: &str,
         wire_model: &str,
         endpoint_fingerprint: &str,
@@ -279,6 +344,11 @@ impl ProviderLivePricingQuote {
         let output_per_million = Self::canonical_rate(pricing.output_per_million);
         let cache_read_per_million = Self::canonical_rate(pricing.cache_read_per_million);
         let cache_write_per_million = Self::canonical_rate(pricing.cache_write_per_million);
+        let mut owned = pricing.clone();
+        owned.provider = provider_identity.into();
+        owned.wire_model_id = wire_model.into();
+        let pricing_schedule =
+            Some(serde_json::to_string(&(owned, Option::<OfferingPricing>::None)).ok()?);
         let catalog_revision = Self::revision_for(
             provider,
             provider_identity,
@@ -292,6 +362,7 @@ impl ProviderLivePricingQuote {
             &cache_read_per_million,
             &cache_write_per_million,
             None,
+            pricing_schedule.as_deref(),
         )?;
         Some(Self {
             provider,
@@ -303,6 +374,7 @@ impl ProviderLivePricingQuote {
             currency: pricing.currency.clone(),
             provenance: pricing.provenance.clone(),
             cloud_facts: None,
+            pricing_schedule,
             input_per_million,
             output_per_million,
             cache_read_per_million,
@@ -323,7 +395,7 @@ impl ProviderLivePricingQuote {
     /// an earlier turn, while malformed or legacy receipts fail closed.
     pub(crate) fn pricing_for_route(
         &self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         provider_identity: &str,
         wire_model: &str,
         endpoint_fingerprint: &str,
@@ -351,14 +423,32 @@ impl ProviderLivePricingQuote {
         }
         match (&self.provenance, &self.cloud_facts) {
             (PricingProvenance::UserOverride, None) => {}
-            (PricingProvenance::ProviderLive, None)
+            (
+                PricingProvenance::ModelsDevBundled
+                | PricingProvenance::ProviderDocs
+                | PricingProvenance::CodewhaleCatalog,
+                None,
+            ) if published_pricing_scope(provider, provider_identity, endpoint_fingerprint) => {}
+            (PricingProvenance::ModelsDevLive, None)
                 if dispatched_at_unix.saturating_sub(self.catalog_fetched_at)
                     < DEFAULT_PROVIDER_CATALOG_TTL_SECS
-                    && reviewed_provider_live_scope(
+                    && published_pricing_scope(
                         provider,
                         provider_identity,
                         endpoint_fingerprint,
                     ) => {}
+            (PricingProvenance::ProviderLive, None)
+                if dispatched_at_unix.saturating_sub(self.catalog_fetched_at)
+                    < DEFAULT_PROVIDER_CATALOG_TTL_SECS
+                    && (reviewed_provider_live_scope(
+                        provider,
+                        provider_identity,
+                        endpoint_fingerprint,
+                    ) || published_pricing_scope(
+                        provider,
+                        provider_identity,
+                        endpoint_fingerprint,
+                    )) => {}
             (PricingProvenance::CloudFacts, Some(source))
                 if source.facts_version > 0
                     && !source.key_id.is_empty()
@@ -383,6 +473,7 @@ impl ProviderLivePricingQuote {
             output: output_per_million,
             cache_read: cache_read_per_million,
             cache_write: cache_write_per_million,
+            ..Default::default()
         };
         if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
             return None;
@@ -399,6 +490,7 @@ impl ProviderLivePricingQuote {
             && cost.cache_read.is_none()
             && cost.cache_write.is_none()
             && self.provenance != PricingProvenance::UserOverride
+            && self.pricing_schedule.is_none()
         {
             return None;
         }
@@ -415,9 +507,50 @@ impl ProviderLivePricingQuote {
             &self.cache_read_per_million,
             &self.cache_write_per_million,
             self.cloud_facts.as_ref(),
+            self.pricing_schedule.as_deref(),
         )?;
         if self.catalog_revision != expected_revision {
             return None;
+        }
+        if let Some(schedule) = self.pricing_schedule.as_deref() {
+            if schedule.len() > 32_768 {
+                return None;
+            }
+            let (pricing, secondary): (OfferingPricing, Option<OfferingPricing>) =
+                serde_json::from_str(schedule).ok()?;
+            if pricing.provider != self.provider_identity
+                || pricing.wire_model_id != self.wire_model
+                || pricing.provenance != self.provenance
+                || pricing.currency != self.currency
+                || pricing.input_per_million != cost.input
+                || pricing.output_per_million != cost.output
+                || pricing.cache_read_per_million != cost.cache_read
+                || pricing.cache_write_per_million != cost.cache_write
+                || !codewhale_config::pricing::catalog_cost_is_valid(&pricing.cost_structure())
+                || (matches!(
+                    self.provenance,
+                    PricingProvenance::ModelsDevLive | PricingProvenance::ProviderLive
+                ) && pricing.fetched_at.or(pricing.effective_at)
+                    != Some(self.catalog_fetched_at))
+                || (self.provenance == PricingProvenance::ProviderLive
+                    && pricing.endpoint_fingerprint.as_deref()
+                        != Some(self.endpoint_fingerprint.as_str()))
+                || (self.provenance != PricingProvenance::ModelsDevBundled
+                    && pricing
+                        .expires_at
+                        .is_some_and(|expires| dispatched_at_unix >= expires))
+                || secondary.as_ref().is_some_and(|row| {
+                    row.provider != self.provider_identity
+                        || row.wire_model_id != self.wire_model
+                        || row.currency != Currency::Cny
+                        || row.provenance != self.provenance
+                        || self.provenance != PricingProvenance::ProviderDocs
+                        || !codewhale_config::pricing::catalog_cost_is_valid(&row.cost_structure())
+                })
+            {
+                return None;
+            }
+            return Some(pricing);
         }
         Some(OfferingPricing {
             provider: self.provider_identity.clone(),
@@ -431,6 +564,8 @@ impl ProviderLivePricingQuote {
             provenance: self.provenance.clone(),
             effective_at: Some(self.catalog_fetched_at),
             endpoint_fingerprint: Some(self.endpoint_fingerprint.clone()),
+
+            ..Default::default()
         })
     }
 }
@@ -476,15 +611,78 @@ fn canonical_provider_scope(provider: &str) -> String {
 }
 
 #[cfg(test)]
-fn inferred_provider_kind(identity: &str) -> ApiProvider {
+fn inferred_provider_kind(identity: &str) -> ProviderKind {
     // No recognized built-in spelling resolves to a compatible-template id,
     // so the parse fallback below already answers Custom for every named
     // custom table (#6289).
-    ApiProvider::parse(identity).unwrap_or(ApiProvider::Custom)
+    ProviderKind::parse(identity).unwrap_or(ProviderKind::Custom)
 }
 
-fn storage_provider(kind: ApiProvider, identity: &str) -> String {
+fn storage_provider(kind: ProviderKind, identity: &str) -> String {
     format!("{}:{}", kind.as_str(), identity.trim())
+}
+
+/// Providers whose model list is owned by their own `/v1/models` roster
+/// rather than the cross-provider Models.dev snapshot: the named live
+/// gateways, custom hosts whose private roster no snapshot can serve, and any
+/// builtin name pointed at an endpoint outside its official family (#6289
+/// widened).
+///
+/// `base_url` is what separates the last two: `openai` against
+/// `api.openai.com` is the reviewed snapshot row, while `openai` against a
+/// relay is a private roster only its own listing can describe. A vendor-named
+/// table that actually relays a private host is as unserved by the snapshot as
+/// a `[providers.<name>]` table is. The active-provider refresh and the
+/// picker's freshness receipt both gate on this one predicate, so they cannot
+/// drift apart.
+#[cfg(test)]
+#[test]
+fn orcarouter_and_existing_custom_routes_own_live_catalogs() {
+    assert!(provider_owns_live_catalog(ProviderKind::Orcarouter, ""));
+    assert!(provider_owns_live_catalog(ProviderKind::Custom, ""));
+    assert!(provider_owns_live_catalog(ProviderKind::Openrouter, ""));
+    assert!(provider_owns_live_catalog(ProviderKind::Ollama, ""));
+    // A builtin name on its own official endpoint keeps the snapshot row.
+    assert!(!provider_owns_live_catalog(
+        ProviderKind::Openai,
+        "https://api.openai.com/v1"
+    ));
+    // The same name on a private relay owns its roster.
+    assert!(provider_owns_live_catalog(
+        ProviderKind::Openai,
+        "https://relay.example.test/v1"
+    ));
+}
+
+pub(crate) fn provider_owns_live_catalog(provider: ProviderKind, base_url: &str) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Openrouter
+            | ProviderKind::Orcarouter
+            | ProviderKind::Telecomjs
+            | ProviderKind::Edenai
+            | ProviderKind::Zenmux
+            | ProviderKind::Concentrate
+            | ProviderKind::Codewhale
+            | ProviderKind::Ollama
+    ) || provider == ProviderKind::Custom
+        || codewhale_config::provider_preserves_custom_base_url_model(provider, base_url)
+}
+
+/// Whether a persisted `/models` partition is current evidence for its route.
+///
+/// A route that owns its own roster (a relay, a private endpoint) is
+/// authoritative even when the fetch is old: nothing else describes it. For an
+/// official endpoint the partition competes with the catalog snapshot, and an
+/// old or failed fetch is not evidence about what is served today, so it must
+/// not shadow a fresher roster.
+pub(crate) fn cached_roster_is_authoritative(
+    kind: ProviderKind,
+    base_url: &str,
+    entry: &codewhale_config::catalog::CachedProviderCatalog,
+) -> bool {
+    provider_owns_live_catalog(kind, base_url)
+        || entry.is_fresh(codewhale_config::catalog::now_unix())
 }
 
 /// Whether a catalog scope holds an account-scoped roster that must never be
@@ -494,9 +692,24 @@ fn storage_provider(kind: ApiProvider, identity: &str) -> String {
 /// endpoint fingerprint — never by table name. The Codewhale API's own rows
 /// are fenced the same way.
 fn is_account_scoped_scope(provider: &str, fingerprint: &str) -> bool {
-    provider.starts_with("codewhale:")
+    crate::plugins::providers::is_account_catalog_scope(provider, fingerprint)
+        || provider.starts_with("codewhale:")
         || fingerprint == base_url_fingerprint(codewhale_config::catalog::BASETEN_BASE_URL)
-        || fingerprint == base_url_fingerprint(ApiProvider::Codewhale.default_base_url())
+        || fingerprint
+            == base_url_fingerprint(ProviderKind::Codewhale.provider().default_base_url())
+}
+
+pub(crate) fn route_is_account_scoped(
+    config: &Config,
+    identity: &crate::config::ProviderIdentity,
+) -> bool {
+    is_account_scoped_scope(
+        &storage_provider(
+            identity.provider,
+            &canonical_provider_scope(identity.key.as_str()),
+        ),
+        &base_url_fingerprint(&config.base_url_for_route(identity)),
+    )
 }
 
 fn cache_lock_path(path: &Path) -> PathBuf {
@@ -618,20 +831,61 @@ fn load_from_disk_unlocked_with_limit(path: &Path, max_bytes: u64) -> Option<Pro
     if cache.entries.len() > MAX_CACHE_SCOPES || cached_row_count(&cache) > MAX_CACHE_ROWS {
         return None;
     }
-    if !cache.entries.iter().all(|(key, entry)| {
-        let Some((kind, identity)) = entry.provider.split_once(':') else { return false; };
-        ApiProvider::parse(kind).is_some_and(|parsed| parsed.as_str() == kind)
+    let scopes_before = cache.entries.len();
+    cache.entries.retain(|key, entry| {
+        let Some((kind, identity)) = entry.provider.split_once(':') else {
+            return false;
+        };
+        let scope_valid = ProviderKind::parse_config_identity(kind)
+            .is_some_and(|parsed| parsed.as_str() == kind)
             && !identity.is_empty()
-            && key == &ProviderCatalogCache::cache_key(&entry.provider, &entry.base_url_fingerprint)
-            && entry.offerings.iter().all(|row| {
-                row.provider == identity
-                    && crate::provider_lake::valid_catalog_model_id(&row.wire_model_id)
-                    && provider_cost_source_allowed(row)
-                    && matches!(&row.source, codewhale_config::catalog::CatalogSource::Live {
-                        base_url_fingerprint, fetched_at
-                    } if base_url_fingerprint == &entry.base_url_fingerprint && *fetched_at == entry.fetched_at)
-            })
-    }) { return None; }
+            && key
+                == &ProviderCatalogCache::cache_key(&entry.provider, &entry.base_url_fingerprint);
+        if !scope_valid {
+            tracing::debug!(
+                target: "provider_catalog",
+                scope = %entry.provider,
+                "dropping invalid provider catalog scope"
+            );
+            return false;
+        }
+        let entry_fingerprint = entry.base_url_fingerprint.clone();
+        let entry_fetched_at = entry.fetched_at;
+        let rows_before = entry.offerings.len();
+        entry.offerings.retain(|row| {
+            row.provider == identity
+                && crate::provider_lake::valid_catalog_model_id(&row.wire_model_id)
+                && provider_cost_source_allowed(row)
+                && matches!(&row.source, codewhale_config::catalog::CatalogSource::Live {
+                    base_url_fingerprint, fetched_at
+                } if base_url_fingerprint == &entry_fingerprint && *fetched_at == entry_fetched_at)
+        });
+        if entry.offerings.len() != rows_before {
+            tracing::warn!(
+                target: "provider_catalog",
+                scope = %entry.provider,
+                rejected = rows_before - entry.offerings.len(),
+                kept = entry.offerings.len(),
+                "dropped unusable rows from a cached provider catalog"
+            );
+        }
+        if rows_before > 0 && entry.offerings.is_empty() {
+            tracing::debug!(
+                target: "provider_catalog",
+                scope = %entry.provider,
+                "dropping provider catalog scope whose every row was unusable"
+            );
+            return false;
+        }
+        true
+    });
+    if cache.entries.len() != scopes_before {
+        tracing::debug!(
+            target: "provider_catalog",
+            dropped = scopes_before - cache.entries.len(),
+            "provider catalog cache loaded with invalid scopes dropped"
+        );
+    }
     // Older builds could durably cache account-scoped rosters. Scrub
     // those entries on every load so upgrading cannot attach one workspace's
     // catalog to a different credential.
@@ -702,7 +956,7 @@ fn ensure_cache_loaded() -> Result<()> {
 
 /// Read one exact cached route without creating a client or fetching credentials.
 pub(crate) fn cached_entry_for_route(
-    kind: ApiProvider,
+    kind: ProviderKind,
     identity: &str,
     base_url: &str,
 ) -> Result<Option<codewhale_config::catalog::CachedProviderCatalog>> {
@@ -716,6 +970,63 @@ pub(crate) fn cached_entry_for_route(
             &base_url_fingerprint(base_url),
         )
         .cloned())
+}
+
+/// Borrow one exact cached route for the duration of `read`.
+///
+/// The picker asks about one route once per model row, and on a relay
+/// publishing a few hundred models that turned into one full deep clone of the
+/// whole catalog entry per row. Callers that only need to look something up
+/// (rather than keep the entry) use this instead.
+pub(crate) fn with_cached_entry_for_route<R>(
+    kind: ProviderKind,
+    identity: &str,
+    base_url: &str,
+    read: impl FnOnce(&codewhale_config::catalog::CachedProviderCatalog) -> R,
+) -> Result<Option<R>> {
+    ensure_cache_loaded()?;
+    let cache = CACHE
+        .read()
+        .map_err(|_| anyhow::anyhow!("catalog cache unavailable"))?;
+    Ok(cache
+        .get(
+            &storage_provider(kind, identity),
+            &base_url_fingerprint(base_url),
+        )
+        .map(read))
+}
+
+/// Whether a saved `(provider, model)` pin is absent from that exact route's
+/// FRESH live roster (#6035). `None` when no fresh roster exists: a stale,
+/// failed, or absent roster cannot prove drift, and bundled catalog rows say
+/// nothing about what the account serves today. Absence is a warning, never a
+/// reason to rewrite the pin: the id may still answer (soft deprecation) and
+/// other hosts may serve it on their own routes.
+pub(crate) fn pin_missing_from_fresh_roster(
+    config: &Config,
+    provider: &str,
+    model: &str,
+) -> Option<bool> {
+    let captured = config.resolve_provider_pin_identity(provider).ok()?;
+    let kind = captured.provider;
+    let identity = captured.key.as_str();
+    let base_url = config.base_url_for_route(&captured);
+    // `status_for_route` reads memory only. A fresh process (doctor, a
+    // just-started TUI) must see the roster an earlier process persisted.
+    ensure_cache_loaded().ok()?;
+    if status_for_route(kind, identity, &base_url) != CatalogStatus::Fresh {
+        return None;
+    }
+    let listed = cached_entry_for_route(kind, identity, &base_url)
+        .ok()
+        .flatten()
+        .is_some_and(|entry| {
+            entry.offerings.iter().any(|offering| {
+                offering.wire_model_id == model
+                    || offering.canonical_model.as_deref() == Some(model)
+            })
+        });
+    Some(!listed)
 }
 
 fn merge_durable_scope(
@@ -978,7 +1289,7 @@ fn persist_failure_scope(
 
 fn publish_exact_scope_for_identity(
     cache: &ProviderCatalogCache,
-    provider_kind: ApiProvider,
+    provider_kind: ProviderKind,
     provider_identity: &str,
     fingerprint: &str,
 ) -> usize {
@@ -1001,13 +1312,14 @@ fn publish_exact_scope_for_identity(
 /// A cache created for another custom endpoint or for an old endpoint override
 /// is retained on disk but cannot leak into the active picker.
 pub fn maybe_load_persisted_cache_for_config(config: &Config) -> usize {
-    let provider = config.api_provider();
-    let provider_identity = canonical_provider_scope(&config.provider_identity_for(provider));
-    let fingerprint = base_url_fingerprint(&config.active_route_base_url());
-    if is_account_scoped_scope(
-        &storage_provider(provider, &provider_identity),
-        &fingerprint,
-    ) {
+    let Ok(identity) = config.active_provider_identity() else {
+        return 0;
+    };
+    let provider = identity.provider;
+    let provider_identity = canonical_provider_scope(identity.key.as_str());
+    let base_url = config.base_url_for_route(&identity);
+    let fingerprint = base_url_fingerprint(&base_url);
+    if route_is_account_scoped(config, &identity) {
         forget_account_scoped_provider(provider, &provider_identity);
         return 0;
     }
@@ -1031,12 +1343,23 @@ pub fn maybe_load_persisted_cache_for_config(config: &Config) -> usize {
     CACHE
         .read()
         .map(|guard| {
-            publish_exact_scope_for_identity(&guard, provider, &provider_identity, &fingerprint)
+            if provider_owns_live_catalog(provider, &base_url) {
+                publish_exact_scope_for_identity(&guard, provider, &provider_identity, &fingerprint)
+            } else {
+                // Models.dev owns this provider's roster, so a persisted /models
+                // partition can only shadow fresher snapshot rows (#6396).
+                crate::provider_lake::replace_provider_live_snapshot_for_identity(
+                    provider,
+                    &provider_identity,
+                    CatalogSnapshot::default(),
+                );
+                0
+            }
         })
         .unwrap_or(0)
 }
 
-fn forget_account_scoped_provider(provider_kind: ApiProvider, provider: &str) {
+fn forget_account_scoped_provider(provider_kind: ProviderKind, provider: &str) {
     let provider = canonical_provider_scope(provider);
     if let Ok(mut cache) = CACHE.write() {
         cache
@@ -1061,7 +1384,7 @@ pub fn begin_refresh(provider: &str) -> ProviderCatalogRefreshTicket {
 }
 
 pub fn begin_refresh_for_identity(
-    provider_kind: ApiProvider,
+    provider_kind: ProviderKind,
     provider: &str,
     base_url: &str,
 ) -> ProviderCatalogRefreshTicket {
@@ -1073,7 +1396,7 @@ pub fn begin_refresh_for_identity(
 }
 
 fn begin_refresh_inner(
-    provider_kind: ApiProvider,
+    provider_kind: ProviderKind,
     provider: &str,
     fingerprint: Option<String>,
 ) -> ProviderCatalogRefreshTicket {
@@ -1185,7 +1508,7 @@ pub(crate) fn status_for_fingerprint(provider: &str, fingerprint: &str) -> Catal
 }
 
 pub(crate) fn status_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
 ) -> CatalogStatus {
@@ -1193,7 +1516,7 @@ pub(crate) fn status_for_route(
 }
 
 fn status_for_route_fingerprint(
-    kind: ApiProvider,
+    kind: ProviderKind,
     provider: &str,
     fingerprint: &str,
 ) -> CatalogStatus {
@@ -1211,17 +1534,17 @@ fn status_for_route_fingerprint(
 /// read guard. The returned value owns every fact needed by later auditing, so
 /// completion-time code never re-opens mutable catalog or provider-lake state.
 fn reviewed_provider_live_scope(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: &str,
     endpoint_fingerprint: &str,
 ) -> bool {
     match provider {
-        ApiProvider::Openrouter => {
-            provider_identity == ApiProvider::Openrouter.as_str()
+        ProviderKind::Openrouter => {
+            provider_identity == ProviderKind::Openrouter.as_str()
                 && endpoint_fingerprint
                     == base_url_fingerprint(crate::config::DEFAULT_OPENROUTER_BASE_URL)
         }
-        ApiProvider::Custom => {
+        ProviderKind::Custom => {
             endpoint_fingerprint
                 == base_url_fingerprint(codewhale_config::catalog::BASETEN_BASE_URL)
         }
@@ -1229,9 +1552,17 @@ fn reviewed_provider_live_scope(
     }
 }
 
+fn published_pricing_scope(provider: ProviderKind, identity: &str, fingerprint: &str) -> bool {
+    !matches!(
+        provider,
+        ProviderKind::Custom | ProviderKind::OpenaiCodex | ProviderKind::OpencodeGo
+    ) && identity == provider.as_str()
+        && fingerprint == base_url_fingerprint(provider.provider().default_base_url())
+}
+
 #[must_use]
 pub(crate) fn fresh_provider_live_pricing_quote_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: &str,
     wire_model: &str,
     endpoint_fingerprint: &str,
@@ -1269,7 +1600,7 @@ pub(crate) fn fresh_provider_live_pricing_quote_at(
         || pricing.wire_model_id.trim() != wire_model
         || pricing.currency != Currency::Usd
         || pricing.provenance != PricingProvenance::ProviderLive
-        || pricing.effective_at != Some(entry.fetched_at)
+        || pricing.fetched_at.or(pricing.effective_at) != Some(entry.fetched_at)
         || pricing.endpoint_fingerprint.as_deref() != Some(endpoint_fingerprint)
         || pricing.input_per_million.is_none()
         || pricing.output_per_million.is_none()
@@ -1301,9 +1632,8 @@ pub(crate) fn fresh_provider_live_pricing_quote_at(
 /// The one condition that is this file's own: the *configured* identity must be
 /// the canonical provider. A differently-named provider table pointing at the
 /// official host is a separate credential and billing relationship.
-fn cloud_pricing_scope(provider: ApiProvider, identity: &str, base_url: &str) -> bool {
-    identity == provider.as_str()
-        && crate::provider_lake::cloud_facts_apply_to_route(provider, base_url)
+fn cloud_pricing_scope(provider: ProviderKind, identity: &str, base_url: &str) -> bool {
+    crate::provider_lake::cloud_facts_apply_to_route(provider, identity, base_url)
 }
 
 /// Capture the effective mutable price authority once. Provider-owned live
@@ -1311,13 +1641,13 @@ fn cloud_pricing_scope(provider: ApiProvider, identity: &str, base_url: &str) ->
 /// canonical official route. The historical wire field name remains stable.
 pub(crate) fn configured_dispatch_pricing_quote_at(
     models: &[codewhale_config::catalog::configured::ConfiguredModel],
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     model: &str,
     base_url: &str,
     dispatched_at: u64,
 ) -> Option<ProviderLivePricingQuote> {
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         return None;
     }
     codewhale_config::catalog::configured::validate_configured_models(models).ok()?;
@@ -1334,9 +1664,28 @@ pub(crate) fn configured_dispatch_pricing_quote_at(
         output_per_million: cost.output,
         cache_read_per_million: cost.cache_read,
         cache_write_per_million: cost.cache_write,
+        reasoning_per_million: cost.reasoning,
+        input_audio_per_million: cost.input_audio,
+        output_audio_per_million: cost.output_audio,
+        context_tiers: cost.context_tiers(),
+        rate_withheld: declared.cost.is_some()
+            && !OfferingPricing {
+                input_per_million: cost.input,
+                output_per_million: cost.output,
+                cache_read_per_million: cost.cache_read,
+                cache_write_per_million: cost.cache_write,
+                reasoning_per_million: cost.reasoning,
+                input_audio_per_million: cost.input_audio,
+                output_audio_per_million: cost.output_audio,
+                context_tiers: cost.context_tiers(),
+                ..Default::default()
+            }
+            .has_any_price(),
         provenance: PricingProvenance::UserOverride,
         effective_at: None,
         endpoint_fingerprint: Some(base_url_fingerprint(base_url)),
+
+        ..Default::default()
     };
     // Freeze even an unpriced declaration: missing rates must not fall through
     // to a same-named bundled or subsequently refreshed price.
@@ -1350,8 +1699,32 @@ pub(crate) fn configured_dispatch_pricing_quote_at(
     )
 }
 
+/// Pick the dispatch quote from an operator declaration and the endpoint's
+/// catalog. A declared rate wins. A declaration with no rates yields to the
+/// catalog's price for the same exact endpoint (#6690), and is kept (frozen,
+/// rate-less) only when the catalog has none, so a same-named bundled price
+/// still cannot fill the gap.
+pub(crate) fn declared_or_catalog_quote(
+    declared: Option<ProviderLivePricingQuote>,
+    catalog: impl FnOnce() -> Option<ProviderLivePricingQuote>,
+) -> Option<ProviderLivePricingQuote> {
+    match declared {
+        Some(quote) if quote.carries_pricing_decision() => Some(quote),
+        declared => catalog()
+            .filter(|quote| {
+                matches!(
+                    quote.provenance,
+                    PricingProvenance::ProviderLive
+                        | PricingProvenance::ModelsDevLive
+                        | PricingProvenance::CloudFacts
+                )
+            })
+            .or(declared),
+    }
+}
+
 pub(crate) fn fresh_dispatch_pricing_quote_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: &str,
     wire_model: &str,
     base_url: &str,
@@ -1367,6 +1740,140 @@ pub(crate) fn fresh_dispatch_pricing_quote_at(
     ) {
         return Some(quote);
     }
+    if crate::provider_lake::live_catalog_origin(provider, wire_model)
+        == Some(crate::provider_lake::LiveSource::ModelsDev)
+        && crate::provider_lake::catalog_offering_for_model_identity(
+            provider,
+            Some(provider_identity),
+            wire_model,
+        )
+        .is_some_and(|row| {
+            matches!(
+                row.source,
+                codewhale_config::catalog::CatalogSource::Live { .. }
+            )
+        })
+    {
+        return None;
+    }
+    if !published_pricing_scope(provider, provider_identity, &endpoint_fingerprint) {
+        if let Some(quote) = fresh_cloud_dispatch_pricing_quote_at(
+            provider,
+            provider_identity,
+            wire_model,
+            base_url,
+            dispatched_at_unix,
+        ) {
+            return Some(quote);
+        }
+        return None;
+    }
+    let at = chrono::DateTime::from_timestamp(i64::try_from(dispatched_at_unix).ok()?, 0)?;
+    let hand = crate::pricing::provider_owned_hand_quote_rows(provider, wire_model, at);
+    let needs_schedule = matches!(
+        provider,
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+    );
+    let catalog = crate::provider_lake::catalog_offering_for_route(
+        provider,
+        provider_identity,
+        base_url,
+        wire_model,
+    )
+    .filter(|offering| offering.wire_model_id == wire_model)
+    .map(|mut offering| {
+        if crate::provider_lake::live_catalog_origin(provider, wire_model)
+            == Some(crate::provider_lake::LiveSource::ModelsDev)
+            && let codewhale_config::catalog::CatalogSource::Live { fetched_at, .. } =
+                offering.pricing_source()
+        {
+            offering.cost_source = Some(codewhale_config::catalog::CatalogSource::ModelsDevLive {
+                fetched_at: *fetched_at,
+            });
+        }
+        offering
+    })
+    .and_then(|offering| OfferingPricing::from_catalog_offering_at(&offering, dispatched_at_unix))
+    .filter(|pricing| {
+        pricing
+            .live_pricing_defect(
+                Some(&endpoint_fingerprint),
+                Some(dispatched_at_unix),
+                DEFAULT_PROVIDER_CATALOG_TTL_SECS,
+            )
+            .is_none()
+    });
+    let catalog_is_live = catalog.as_ref().is_some_and(|pricing| {
+        matches!(
+            pricing.provenance,
+            PricingProvenance::ModelsDevLive | PricingProvenance::ProviderLive
+        )
+    });
+    let (pricing, mut secondary) = if needs_schedule && hand.is_some() {
+        hand?
+    } else if catalog_is_live {
+        catalog.map(|pricing| (pricing, None)).or(hand)?
+    } else if hand.is_some() {
+        hand?
+    } else if let Some(quote) = fresh_cloud_dispatch_pricing_quote_at(
+        provider,
+        provider_identity,
+        wire_model,
+        base_url,
+        dispatched_at_unix,
+    ) {
+        return Some(quote);
+    } else {
+        catalog.map(|pricing| (pricing, None))?
+    };
+    let mut quote = ProviderLivePricingQuote::from_pricing(
+        provider,
+        provider_identity,
+        wire_model,
+        &endpoint_fingerprint,
+        pricing.fetched_at.unwrap_or(dispatched_at_unix),
+        &pricing,
+    )?;
+    if let Some(row) = secondary.as_mut() {
+        row.provider = provider_identity.into();
+        row.wire_model_id = wire_model.into();
+        let (primary, _): (OfferingPricing, Option<OfferingPricing>) =
+            serde_json::from_str(quote.pricing_schedule.as_deref()?).ok()?;
+        quote.pricing_schedule = Some(serde_json::to_string(&(primary, secondary)).ok()?);
+        quote.catalog_revision = ProviderLivePricingQuote::revision_for(
+            quote.provider,
+            &quote.provider_identity,
+            &quote.wire_model,
+            &quote.endpoint_fingerprint,
+            quote.catalog_fetched_at,
+            &quote.currency,
+            &quote.provenance,
+            &quote.input_per_million,
+            &quote.output_per_million,
+            &quote.cache_read_per_million,
+            &quote.cache_write_per_million,
+            None,
+            quote.pricing_schedule.as_deref(),
+        )?;
+    }
+    quote.pricing_for_route(
+        provider,
+        provider_identity,
+        wire_model,
+        &endpoint_fingerprint,
+        dispatched_at_unix,
+    )?;
+    Some(quote)
+}
+
+fn fresh_cloud_dispatch_pricing_quote_at(
+    provider: ProviderKind,
+    provider_identity: &str,
+    wire_model: &str,
+    base_url: &str,
+    dispatched_at_unix: u64,
+) -> Option<ProviderLivePricingQuote> {
+    let endpoint_fingerprint = base_url_fingerprint(base_url);
     if !cloud_pricing_scope(provider, provider_identity, base_url) {
         return None;
     }
@@ -1429,6 +1936,7 @@ pub(crate) fn fresh_dispatch_pricing_quote_at(
         &quote.cache_read_per_million,
         &quote.cache_write_per_million,
         quote.cloud_facts.as_ref(),
+        quote.pricing_schedule.as_deref(),
     )?;
     quote.pricing_for_route(
         provider,
@@ -1451,16 +1959,27 @@ pub fn record_success(delta: ProviderCatalogDelta) -> CatalogStatus {
 }
 
 fn record_success_for_identity(
-    kind: ApiProvider,
+    kind: ProviderKind,
     mut delta: ProviderCatalogDelta,
 ) -> CatalogStatus {
     let provider = canonical_provider_scope(&delta.provider);
     delta.provider = storage_provider(kind, &provider);
-    if delta.offerings.iter().any(|row| {
-        row.provider != provider
-            || !crate::provider_lake::valid_catalog_model_id(&row.wire_model_id)
-            || !provider_cost_source_allowed(row)
-    }) {
+    let submitted = delta.offerings.len();
+    delta.offerings.retain(|row| {
+        row.provider == provider
+            && crate::provider_lake::valid_catalog_model_id(&row.wire_model_id)
+            && provider_cost_source_allowed(row)
+    });
+    if delta.offerings.len() < submitted {
+        tracing::warn!(
+            target: "provider_catalog",
+            scope = %provider,
+            rejected = submitted - delta.offerings.len(),
+            kept = delta.offerings.len(),
+            "dropping unusable rows from a provider catalog refresh"
+        );
+    }
+    if submitted > 0 && delta.offerings.is_empty() {
         return record_failure_for_identity(
             kind,
             &provider,
@@ -1499,7 +2018,7 @@ pub fn record_failure(
 }
 
 fn record_failure_for_identity(
-    kind: ApiProvider,
+    kind: ProviderKind,
     provider: &str,
     fingerprint: &str,
     reason: CatalogRefreshError,
@@ -1526,7 +2045,7 @@ pub(crate) fn reset_cache_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, ProviderConfig, ProvidersConfig};
+    use crate::config::{ProviderConfig, ProviderKind, ProvidersConfig};
     use crate::test_support::{EnvVarGuard, lock_test_env};
     use codewhale_config::catalog::{CatalogOffering, CatalogSource};
 
@@ -1631,7 +2150,7 @@ mod tests {
         ));
         assert!(
             crate::provider_lake::all_catalog_models_for_provider_identity(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 Some(codewhale_config::catalog::BASETEN_PROVIDER_ID),
             )
             .contains(&"workspace-a-only-model".to_string())
@@ -1671,7 +2190,7 @@ mod tests {
         ));
         assert!(
             !crate::provider_lake::all_catalog_models_for_provider_identity(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 Some(codewhale_config::catalog::BASETEN_PROVIDER_ID),
             )
             .contains(&"workspace-a-only-model".to_string()),
@@ -1979,14 +2498,14 @@ mod tests {
 
         assert!(
             crate::provider_lake::all_catalog_models_for_provider_identity(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 Some(alias),
             )
             .contains(&"alias-workspace-model".to_string())
         );
         assert!(
             !crate::provider_lake::all_catalog_models_for_provider_identity(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 Some(codewhale_config::catalog::BASETEN_PROVIDER_ID),
             )
             .contains(&"alias-workspace-model".to_string()),
@@ -2027,23 +2546,23 @@ mod tests {
         );
 
         assert_eq!(
-            publish_exact_scope_for_identity(&cache, ApiProvider::Custom, "baseten", "old-fp"),
+            publish_exact_scope_for_identity(&cache, ProviderKind::Custom, "baseten", "old-fp"),
             1
         );
         assert_eq!(
             crate::provider_lake::all_catalog_models_for_provider_identity(
-                crate::config::ApiProvider::Custom,
+                crate::config::ProviderKind::Custom,
                 Some("baseten"),
             ),
             vec!["old-endpoint-model".to_string()]
         );
 
         assert_eq!(
-            publish_exact_scope_for_identity(&cache, ApiProvider::Custom, "baseten", "new-fp"),
+            publish_exact_scope_for_identity(&cache, ProviderKind::Custom, "baseten", "new-fp"),
             0
         );
         let after_switch = crate::provider_lake::all_catalog_models_for_provider_identity(
-            crate::config::ApiProvider::Custom,
+            crate::config::ProviderKind::Custom,
             Some("baseten"),
         );
         assert!(
@@ -2075,20 +2594,21 @@ mod tests {
             }),
             ..Config::default()
         };
-        let provider = config.provider_identity_for(config.api_provider());
+        let identity = config.active_provider_identity().unwrap();
+        let provider = identity.key.as_str();
         let fingerprint = base_url_fingerprint(&config.active_route_base_url());
         let fetched_at = now_unix();
         let ids: Vec<String> = (0..600)
             .map(|index| format!("synthetic/openrouter-model-{index:03}"))
             .collect();
         let status = record_success(ProviderCatalogDelta {
-            provider: provider.clone(),
+            provider: provider.to_string(),
             base_url_fingerprint: fingerprint,
             fetched_at,
             offerings: ids
                 .iter()
                 .map(|id| CatalogOffering {
-                    provider: provider.clone(),
+                    provider: provider.to_string(),
                     wire_model_id: id.clone(),
                     endpoint_key: "chat".to_string(),
                     source: CatalogSource::Live {
@@ -2102,13 +2622,13 @@ mod tests {
         assert_eq!(status, CatalogStatus::Fresh);
         assert!(cache_path().is_some_and(|path| path.is_file()));
         assert_eq!(
-            crate::provider_lake::all_catalog_models_for_provider(ApiProvider::Openrouter),
+            crate::provider_lake::all_catalog_models_for_provider(ProviderKind::Openrouter),
             ids,
             "the string compatibility publisher must retain built-in OpenRouter ownership"
         );
         assert!(
             crate::provider_lake::all_catalog_models_for_provider_identity(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 Some("openrouter"),
             )
             .is_empty(),
@@ -2124,7 +2644,7 @@ mod tests {
 
         assert_eq!(maybe_load_persisted_cache_for_config(&config), 600);
         let visible =
-            crate::provider_lake::all_catalog_models_for_provider(ApiProvider::Openrouter);
+            crate::provider_lake::all_catalog_models_for_provider(ProviderKind::Openrouter);
         assert_eq!(visible.len(), 600);
         assert_eq!(visible.first(), ids.first());
         assert_eq!(visible.last(), ids.last());
@@ -2144,8 +2664,8 @@ mod tests {
         crate::provider_lake::clear_live_snapshot();
         let endpoint = "https://api.openai.com/v1";
         let fingerprint = base_url_fingerprint(endpoint);
-        let built_in = begin_refresh_for_identity(ApiProvider::Openai, "openai", endpoint);
-        let custom = begin_refresh_for_identity(ApiProvider::Custom, "openai", endpoint);
+        let built_in = begin_refresh_for_identity(ProviderKind::Openai, "openai", endpoint);
+        let custom = begin_refresh_for_identity(ProviderKind::Custom, "openai", endpoint);
         assert_eq!(
             record_success_if_current(
                 &built_in,
@@ -2160,8 +2680,8 @@ mod tests {
         reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
         for (kind, expected) in [
-            (ApiProvider::Openai, "built-in-model"),
-            (ApiProvider::Custom, "custom-model"),
+            (ProviderKind::Openai, "built-in-model"),
+            (ProviderKind::Custom, "custom-model"),
         ] {
             let entry = cached_entry_for_route(kind, "openai", endpoint)
                 .unwrap()
@@ -2170,7 +2690,7 @@ mod tests {
             assert_eq!(entry.offerings[0].provider, "openai");
         }
         assert!(
-            cached_entry_for_route(ApiProvider::Custom, "OpenAI", endpoint)
+            cached_entry_for_route(ProviderKind::Custom, "OpenAI", endpoint)
                 .unwrap()
                 .is_none()
         );
@@ -2187,7 +2707,7 @@ mod tests {
         crate::provider_lake::clear_live_snapshot();
         let first_url = "https://first.invalid/v1";
         let second_url = "https://second.invalid/v1";
-        let first = begin_refresh_for_identity(ApiProvider::Custom, "ExactRoute", first_url);
+        let first = begin_refresh_for_identity(ProviderKind::Custom, "ExactRoute", first_url);
         assert!(
             record_success_if_current(
                 &first,
@@ -2199,7 +2719,7 @@ mod tests {
             )
             .is_none()
         );
-        let second = begin_refresh_for_identity(ApiProvider::Custom, "ExactRoute", second_url);
+        let second = begin_refresh_for_identity(ProviderKind::Custom, "ExactRoute", second_url);
         assert!(
             record_failure_if_current(
                 &second,
@@ -2232,13 +2752,13 @@ mod tests {
             .is_none()
         );
         assert!(
-            cached_entry_for_route(ApiProvider::Custom, "ExactRoute", first_url)
+            cached_entry_for_route(ProviderKind::Custom, "ExactRoute", first_url)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             crate::provider_lake::catalog_models_for_route(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 "ExactRoute",
                 second_url
             ),
@@ -2257,7 +2777,7 @@ mod tests {
         reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
         let endpoint = codewhale_config::catalog::BASETEN_BASE_URL;
-        let ticket = begin_refresh_for_identity(ApiProvider::Custom, "TeamServing", endpoint);
+        let ticket = begin_refresh_for_identity(ProviderKind::Custom, "TeamServing", endpoint);
         assert_eq!(
             record_success_if_current(
                 &ticket,
@@ -2271,7 +2791,7 @@ mod tests {
         );
         assert_eq!(
             crate::provider_lake::catalog_models_for_route(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 "TeamServing",
                 endpoint
             ),
@@ -2283,10 +2803,10 @@ mod tests {
                 .contains("private-workspace-model")
         );
         let _new_credentials =
-            begin_refresh_for_identity(ApiProvider::Custom, "TeamServing", endpoint);
+            begin_refresh_for_identity(ProviderKind::Custom, "TeamServing", endpoint);
         assert!(
             crate::provider_lake::catalog_models_for_route(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 "TeamServing",
                 endpoint
             )
@@ -2294,7 +2814,7 @@ mod tests {
         );
         reset_cache_for_test();
         assert!(
-            cached_entry_for_route(ApiProvider::Custom, "TeamServing", endpoint)
+            cached_entry_for_route(ProviderKind::Custom, "TeamServing", endpoint)
                 .unwrap()
                 .is_none()
         );
@@ -2311,19 +2831,19 @@ mod tests {
         crate::provider_lake::clear_live_snapshot();
         for (kind, identity, endpoint) in [
             (
-                ApiProvider::Codewhale,
+                ProviderKind::Codewhale,
                 "codewhale",
-                ApiProvider::Codewhale.default_base_url(),
+                ProviderKind::Codewhale.provider().default_base_url(),
             ),
             (
-                ApiProvider::Codewhale,
+                ProviderKind::Codewhale,
                 "codewhale",
                 "https://codewhale.account.invalid/v1",
             ),
             (
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 "PrivateAccount",
-                ApiProvider::Codewhale.default_base_url(),
+                ProviderKind::Codewhale.provider().default_base_url(),
             ),
         ] {
             let fingerprint = base_url_fingerprint(endpoint);
@@ -2427,7 +2947,7 @@ mod tests {
 
     fn install_cloud_quote_fixture(
         channel: &str,
-        provider: ApiProvider,
+        provider: ProviderKind,
         version: u64,
         input: f64,
         now: u64,
@@ -2487,10 +3007,10 @@ mod tests {
         let now = chrono::Utc::now();
         let at = now.timestamp() as u64;
         let base = crate::config::DEFAULT_OPENAI_BASE_URL;
-        install_cloud_quote_fixture("quote-frozen", ApiProvider::Openai, 91, 1.0, at);
+        install_cloud_quote_fixture("quote-frozen", ProviderKind::Openai, 91, 1.0, at);
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "openai",
             "cloud-quote-fixture",
             Some(base),
@@ -2505,9 +3025,9 @@ mod tests {
         assert_eq!(quote.input_per_million.as_deref(), Some("1"));
         assert!(quote.cache_read_per_million.is_none());
         let encoded = serde_json::to_string(&route).unwrap();
-        install_cloud_quote_fixture("quote-frozen", ApiProvider::Openai, 92, 9.0, at);
+        install_cloud_quote_fixture("quote-frozen", ProviderKind::Openai, 92, 9.0, at);
         let newer = fresh_dispatch_pricing_quote_at(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "openai",
             "cloud-quote-fixture",
             base,
@@ -2519,7 +3039,7 @@ mod tests {
         codewhale_config::cloud_facts::overlay::clear();
         assert!(
             fresh_dispatch_pricing_quote_at(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "openai",
                 "cloud-quote-fixture",
                 base,
@@ -2535,7 +3055,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .pricing_for_route(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "openai",
                 "cloud-quote-fixture",
                 &base_url_fingerprint(base),
@@ -2547,7 +3067,7 @@ mod tests {
         assert!(
             quote
                 .pricing_for_route(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     "openai",
                     "cloud-quote-fixture",
                     &base_url_fingerprint(base),
@@ -2569,9 +3089,9 @@ mod tests {
         crate::provider_lake::clear_live_snapshot();
         let at = now_unix();
         let base = crate::config::DEFAULT_OPENAI_BASE_URL;
-        install_cloud_quote_fixture("quote-binding", ApiProvider::Openai, 93, 1.0, at);
+        install_cloud_quote_fixture("quote-binding", ProviderKind::Openai, 93, 1.0, at);
         let quote = fresh_dispatch_pricing_quote_at(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "openai",
             "cloud-quote-fixture",
             base,
@@ -2579,11 +3099,11 @@ mod tests {
         )
         .unwrap();
         for (provider, identity, endpoint) in [
-            (ApiProvider::Openai, "openai", "https://proxy.example/v1"),
-            (ApiProvider::Custom, "openai", base),
-            (ApiProvider::Openai, "named-openai", base),
+            (ProviderKind::Openai, "openai", "https://proxy.example/v1"),
+            (ProviderKind::Custom, "openai", base),
+            (ProviderKind::Openai, "named-openai", base),
             (
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "openai",
                 "https://secret@api.openai.com/v1",
             ),
@@ -2619,7 +3139,7 @@ mod tests {
         assert!(
             quote
                 .pricing_for_route(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     "openai",
                     "different-model",
                     &base_url_fingerprint(base),
@@ -2640,7 +3160,7 @@ mod tests {
         reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
         let at = now_unix();
-        let base = ApiProvider::Codewhale.default_base_url();
+        let base = ProviderKind::Codewhale.provider().default_base_url();
         let private = "https://private.example/v1?api_key=public-test-marker";
         let declared = EnvVarGuard::set("CODEWHALE_API_BASE", private);
         // The ordinary runtime credential contract intentionally accepts this
@@ -2649,10 +3169,10 @@ mod tests {
             codewhale_config::ProviderKind::Codewhale,
             private,
         ));
-        install_cloud_quote_fixture("quote-static", ApiProvider::Codewhale, 94, 1.0, at);
+        install_cloud_quote_fixture("quote-static", ProviderKind::Codewhale, 94, 1.0, at);
         assert!(
             fresh_dispatch_pricing_quote_at(
-                ApiProvider::Codewhale,
+                ProviderKind::Codewhale,
                 "codewhale",
                 "cloud-quote-fixture",
                 private,
@@ -2661,7 +3181,7 @@ mod tests {
             .is_none()
         );
         let quote = fresh_dispatch_pricing_quote_at(
-            ApiProvider::Codewhale,
+            ProviderKind::Codewhale,
             "codewhale",
             "cloud-quote-fixture",
             base,
@@ -2684,7 +3204,7 @@ mod tests {
         assert!(
             quote
                 .pricing_for_route(
-                    ApiProvider::Codewhale,
+                    ProviderKind::Codewhale,
                     "codewhale",
                     "cloud-quote-fixture",
                     &base_url_fingerprint(base),
@@ -2727,7 +3247,41 @@ mod tests {
             forged.cache.entries.values_mut().next().unwrap().offerings[0].cost_source =
                 Some(source);
             fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
-            assert!(load_from_disk_unlocked(&path).is_none());
+            let loaded = load_from_disk_unlocked(&path).expect("valid scopes still load");
+            assert!(loaded.entries.is_empty(), "forged scope must be dropped");
         }
+    }
+
+    #[test]
+    fn pin_drift_reads_a_fresh_roster_persisted_by_an_earlier_process() {
+        // #6035: `codewhale doctor` and a just-started TUI have not touched
+        // the in-process cache yet; the durable fresh roster must still count.
+        let _env = lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        reset_cache_for_test();
+        let config = Config::default();
+        let base_url = config.base_url_for_route(
+            &config
+                .resolve_provider_selection_identity("deepseek")
+                .unwrap(),
+        );
+        let fingerprint = base_url_fingerprint(&base_url);
+        assert_eq!(
+            record_success(delta("deepseek", &fingerprint, &["deepseek-flash"])),
+            CatalogStatus::Fresh
+        );
+        // A new process: nothing loaded in memory, the roster only on disk.
+        reset_cache_for_test();
+        assert_eq!(
+            pin_missing_from_fresh_roster(&config, "deepseek", "deepseek-retired"),
+            Some(true)
+        );
+        assert_eq!(
+            pin_missing_from_fresh_roster(&config, "deepseek", "deepseek-flash"),
+            Some(false)
+        );
+        reset_cache_for_test();
     }
 }

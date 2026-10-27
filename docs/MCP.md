@@ -19,6 +19,13 @@ Server mode note:
 - `codewhale mcp-server` is an equivalent stdio entrypoint on the same
   consolidated runtime.
 
+In 0.10.1, the old child-server aggregation proxy is removed. `mcp-server`
+now uses the same native tool server as `serve --mcp`; it does not launch the
+legacy `mcp.server_definitions` list. Saved definitions are left intact. Configure
+external servers in `mcp.json` for the existing MCP client, or connect to those
+servers directly from your external client. Native server write tools remain
+withheld unless the operator explicitly permits them in its server configuration.
+
 ## Setup wizard vs manual MCP setup (#3407)
 
 The `/setup` hub includes an optional **Tools and MCP**
@@ -165,12 +172,19 @@ Codewhale keeps its stricter rule: provenance and foreign policy are display
 metadata only, never inherited trust or automatic installation. For full
 bundle and marketplace semantics, see [Plugin bundles](PLUGIN_BUNDLES.md).
 
-`/mcp validate` (alias `/mcp doctor`) reconnects for UI discovery only: it
-refreshes the manager snapshot you see in the pager, not the catalog the model
-gets.
+`/mcp validate` (alias `/mcp doctor`) with no name reports each server's state
+from the last MCP snapshot the TUI recorded, in a pager over
+**Extensions → MCP**. That snapshot is usually the engine pool's latest report,
+but some actions, such as `/mcp import`, replace it with a separate UI
+discovery pass that also connects `lazy` servers the engine has not started.
+Validate also re-reads the MCP config files without connecting: it
+reports a config load error first, lists configured servers the snapshot has
+not observed, and says when a `/mcp reload` is pending. It does not reconnect
+anything or change the catalog the model gets; `/mcp reload` is the fresh
+probe.
 
 `/mcp reload` (aliases `/mcp reconnect`, `/mcp restart`) is the hot-reload path.
-It re-reads the MCP config sources and reconnects through the engine-owned pool,
+It re-reads the MCP config sources and reconnects the servers session boot starts (see [Connection Lifecycle](#connection-lifecycle)) through the engine-owned pool,
 so the rebuilt catalog is the exact one the next model turn uses — no TUI
 restart. Config edits made from the TUI are written immediately and the manager
 marks the snapshot reload-required until you run it; a failed reload leaves the
@@ -332,6 +346,62 @@ the Hugging Face provider route, Hugging Face MCP, and explicit Hub workflows.
 
 Official docs: <https://huggingface.co/docs/hub/hf-mcp-server>
 
+## OpenDesign
+
+[OpenDesign](https://github.com/nexu-io/open-design) ships a stdio MCP server
+(`od mcp`) that lets an agent read files from local OpenDesign projects and
+create project-scoped artifacts. Its `od mcp install` has no Codewhale target,
+so add the entry by hand:
+
+1. Start OpenDesign so its daemon is running.
+2. Copy the launch spec your install generated, from **Settings → MCP server**
+   in the desktop app or from `curl -s http://127.0.0.1:7456/api/mcp/install-info`
+   (use your daemon's port). It has a `command` (the absolute path of
+   OpenDesign's Node-compatible runtime), `args` (the absolute path of its CLI
+   entry, then `mcp`, then `--daemon-url http://127.0.0.1:<port>` unless the
+   daemon runs as a sidecar) and an `env` map that pins `OD_DATA_DIR`.
+3. Put those three fields under one server name in your resolved MCP config,
+   inside the server map the file already has. Files written by
+   `codewhale mcp init` and `codewhale mcp add` use `servers`; OpenDesign's
+   generic snippet uses `mcpServers`. Keep exactly one of the two keys: a file
+   with both fails to parse.
+4. Run `/mcp reload`, or check from a shell with
+   `codewhale mcp tools open-design`.
+
+A placeholder-only shape:
+
+```json
+{
+  "servers": {
+    "open-design": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/open-design/cli.js", "mcp", "--daemon-url", "http://127.0.0.1:7456"],
+      "env": { "OD_DATA_DIR": "/absolute/path/to/open-design-data" }
+    }
+  }
+}
+```
+
+Copy every `env` entry the snippet gives you; a packaged app adds more, such
+as `ELECTRON_RUN_AS_NODE=1` when `command` is the app's own binary.
+`codewhale mcp add` cannot set `env`, so edit the file instead. By default the
+`od mcp` process exits after 30 idle minutes; set `OD_MCP_STDIO_IDLE_EXIT_MS`
+to `"0"` in `env` to keep it running until Codewhale disconnects.
+
+OpenDesign can also launch Codewhale as its agent. Its "DeepSeek TUI" runtime
+adapter runs `deepseek`, falling back to `codewhale`, as
+`exec --auto [--model <id>] <prompt>`, reads plain-text output, and caps the
+prompt at 30,000 bytes of argv. A dedicated adapter could instead pipe the
+prompt into `codewhale exec --auto --output-format stream-json --prompt-file -`,
+list models with `codewhale models --json`, and continue a run with
+`codewhale exec --resume <id>`, taking the id from the `saved_session_id` field
+of the `session_capture` event; the terminal `metadata` event carries only a
+fingerprint. `--auto` enables Full Access by default (no Codewhale shell
+sandbox, trust mode on); adding `--sandbox workspace-write` keeps the shell
+sandbox and file-tool workspace restrictions, with trust mode off. These
+tool-offering exec runs are saved with either plain-text or streaming output.
+[Agent runtime](AGENT_RUNTIME.md#event-vocabulary) describes the event stream.
+
 ## Config File Location
 
 Default path:
@@ -378,8 +448,8 @@ The CLI also exposes helper tools when MCP is enabled:
 ```json
 {
   "timeouts": {
-    "connect_timeout": 10,
-    "execute_timeout": 60,
+    "connect_timeout": 30,
+    "execute_timeout": 1800,
     "read_timeout": 120
   },
   "servers": {
@@ -474,14 +544,63 @@ codewhale mcp tools codewhale
 
 ## Connection Lifecycle
 
-Session boot is lazy (#6033): a configured server is not spawned until
-something asks for it — a turn whose `allowed_tools`/`tools.always_load`
-selection covers its `mcp_<server>_*` names, a model call that resolves to
-one of its tools, or an explicit `/mcp` connect/retry. Servers marked
-`required` still connect eagerly at boot so their failure surfaces before the
-first turn. A configured-but-unstarted server shows as `configured`, never
-`connecting`; the connecting label only describes handshakes actually in
-flight.
+Session boot connects in the background: every enabled, allowed server —
+user-configured or contributed by an enabled plugin — is started at session
+start, concurrently and without holding the first turn. A plugin server passes
+the same review, trust and enablement checks at session start as it does on
+first use. Mark a heavy user-configured server `lazy = true` to keep it
+unstarted until something asks for it — a turn whose
+`allowed_tools`/`tools.always_load` selection covers its `mcp_<server>_*`
+names, a model call that resolves to one of its tools, or an explicit
+`/mcp retry <name>`. Servers marked `required` connect at boot even if
+`lazy`, so their failure surfaces before the first turn. A server that has not
+connected yet shows as `not connected` in `/mcp`, never `connecting`; the
+connecting label only describes handshakes actually in flight. After an OAuth
+login finishes, that one server reconnects automatically. `codewhale mcp tools`
+and `codewhale mcp connect` run in their own process, so a server they just
+reached from the shell still reads `not connected` inside a running session
+until that session connects it.
+
+`/new`, `/resume`, `/load`, switching sessions from the resume picker, and a
+provider, profile or plugin change keep user-configured stdio servers running:
+each live process moves to the new conversation or engine without a restart,
+provided its config, the workspace and the MCP backend are unchanged. Anything
+the server holds in memory, such as a browser session and its logins, comes
+along; run `/mcp reload` for fresh servers. HTTP/SSE servers reconnect, so they
+pick up current credentials and `[network]` policy. Servers added at runtime
+and plugin-contributed servers are not handed over and close at each of these
+boundaries, even when the conversation continues; plugin-contributed servers
+connect again with the next session boot, while a server added at runtime must
+be started again. A workspace switch restarts
+every server. If an MCP call from the previous conversation is still running
+at the boundary, nothing is handed over and the servers restart as before;
+otherwise later calls from that conversation's background work fail instead of
+reconnecting.
+
+An MCP-focused `tool_search` is also explicit discovery intent: search a
+configured server name (for example `engram`), an exact `mcp_<server>_...`
+name, or use `{"query":"mcp_.*","match":"regex"}`. The current turn's
+allow/deny ceiling filters the configured servers before a batch of at most
+eight connects; the existing five-second wait and cancellation remain in
+force. General searches do not boot all optional servers. Only actual
+`tools/list` schemas enter the deferred catalogue; failed, disabled, or
+revoked servers do not acquire fabricated tools. Narrow a broad search by
+server name when more than eight configured servers match.
+
+So that a plain question can reach a server the user never names, each turn
+tells the model which configured servers it may load: one short runtime note
+in session history listing the enabled, allowed server names (at most 24) and
+asking it to `tool_search` a name before searching files or reporting that no
+tool exists. The note is appended to history, never to the cached system
+prompt, and is repeated only when the list changes or a compaction dropped
+it. It carries names only — no server is started and no schema is loaded
+until the model searches. Disabled or denied servers are never named.
+
+`codewhale mcp connect`, `validate`, and `tools` inspect their own process's
+pool. They do not attach transports to a running TUI or exec session. Use
+in-session discovery or explicit tool selection. In the TUI,
+`/mcp retry <name>` connects through the current session's pool;
+`/mcp reload` re-reads its MCP configuration.
 
 ## Server Fields
 
@@ -490,10 +609,16 @@ Per-server settings:
 - `command` (string, required)
 - `args` (array of strings, optional)
 - `env` (object, optional)
-- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional)
+- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional). A per-server value overrides the global `timeouts` block, and each budget is independent of the others:
+  - `connect_timeout` (default 30) covers spawn, `initialize` and the first `tools/list`, so a cold `uvx`/`npx` package download counts against it.
+  - `execute_timeout` (default 1800) is the budget for each `tools/call` and `prompts/get`. An explicit shorter value is respected, and `read_timeout` never cuts a running tool short.
+  - `read_timeout` (default 120) bounds each reply wait during the handshake and tool discovery, and is the budget for `resources/read`.
+  - A request that runs out of budget fails with a timeout. The connection is kept, and a reply that arrives later is discarded instead of being handed to another call. Interrupting the turn stops the wait at once, but Codewhale does not send `notifications/cancelled` yet, so a server that handles one request at a time finishes the abandoned call before it answers the next one.
+  - Streamable HTTP servers return the reply inside the POST itself; the request's own budget bounds that POST too. A request that expires while still sending closes the connection, which is rebuilt before the next call.
 - `disabled` (bool, optional)
 - `enabled` (bool, optional, default `true`)
 - `required` (bool, optional): startup/connect validation fails if this server cannot initialize.
+- `lazy` (bool, optional, default `false`): keep this server unstarted until a turn, tool call or `/mcp retry` asks for it. Without it, the server connects at session start. Plugin manifests have no `lazy` field: an enabled plugin's servers connect at session start, and disabling the plugin stops them.
 - `enabled_tools` (array, optional): allowlist of tool names for this server.
 - `disabled_tools` (array, optional): denylist applied after `enabled_tools`.
 - `url` (string, optional): Streamable HTTP endpoint for a remote MCP server.
@@ -520,8 +645,11 @@ Avoid committing literal `Authorization` headers. Prefer `env_headers`,
 ## Troubleshooting
 
 - Run `codewhale doctor` to confirm the MCP config path it resolved and whether it exists.
-- In the TUI, run `/mcp validate` to refresh the visible server/tool snapshot.
+- In the TUI, run `/mcp validate` to see each server's state from the last
+  recorded MCP snapshot, plus any config load error and configured servers that
+  have not connected.
 - If tools are missing from the model's catalog after a config or credential
-  change, run `/mcp reload` — `/mcp validate` only refreshes the UI snapshot.
+  change, run `/mcp reload` — `/mcp validate` only reports the last recorded
+  snapshot and never reconnects.
 - If the MCP config is missing, run `codewhale mcp init --force` to regenerate it.
 - If tools don’t appear, verify the server command works from your shell and that the server supports MCP `tools/list`.

@@ -1,5 +1,6 @@
 const path = require("path");
 const os = require("os");
+const compiledHosts = require("./compiled-hosts");
 
 const CHECKSUM_MANIFEST = "codewhale-artifacts-sha256.txt";
 const BUNDLE_CHECKSUM_MANIFEST = "codewhale-bundles-sha256.txt";
@@ -60,8 +61,8 @@ const ASSET_MATRIX = {
   },
 };
 
-// HarmonyPC (openharmony) is an x86_64 Linux-compatible environment; map it to
-// the linux binary family so npm install succeeds without a separate build target.
+// Native HarmonyOS/OpenHarmony (openharmony) gets the static musl Linux build as
+// a best effort; that build is untested on native HarmonyOS.
 const PLATFORM_ALIASES = {
   openharmony: "linux",
 };
@@ -101,17 +102,28 @@ function unsupportedBuildHint() {
     "No prebuilt binary is available for this platform/architecture combo.",
     "You can still run codewhale by building from source with Cargo (single binary):",
     "",
-    "  # Requires Rust 1.88+ (https://rustup.rs)",
+    "  # Requires Rust 1.89+ (https://rustup.rs)",
     "  cargo install codewhale-cli --locked   # provides `codewhale`",
     "",
     "Or build from a checkout:",
     "",
-    "  git clone https://github.com/Hmbown/CodeWhale.git",
+    "  git clone https://github.com/codewhale-hq/CodeWhale.git",
     "  cd CodeWhale",
     "  cargo install --path crates/cli --locked   # single binary",
     "",
-    "See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md",
+    "See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md",
     "for cross-compilation, mirror, Linux ARM64, FreeBSD, and winget specifics.",
+  ].join("\n");
+}
+
+function openHarmonyDirections() {
+  return [
+    "On a HarmonyOS PC, install Codewhale inside the Linux subsystem (融合开发引擎, openEuler):",
+    "",
+    "  curl -fsSL https://codewhale.net/install.sh | sh",
+    "",
+    "Or build the native aarch64-unknown-linux-ohos binary from source by following",
+    "\"Cross-Compiling To OpenHarmony\" in docs/HarmonyOS.md of codewhale-hq/CodeWhale.",
   ].join("\n");
 }
 
@@ -134,7 +146,7 @@ function ensureTrailingSlash(baseUrl) {
   return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
 }
 
-function githubReleaseBaseUrl(version, repo = "Hmbown/CodeWhale") {
+function githubReleaseBaseUrl(version, repo = "codewhale-hq/CodeWhale") {
   return `https://github.com/${repo}/releases/download/v${version}/`;
 }
 
@@ -173,7 +185,7 @@ function isCnbSupportedTarget(
   return platform === "linux" && arch === "x64";
 }
 
-function releaseBaseUrl(version, repo = "Hmbown/CodeWhale") {
+function releaseBaseUrl(version, repo = "codewhale-hq/CodeWhale") {
   // CODEWHALE_RELEASE_BASE_URL is the canonical override.
   // DEEPSEEK_TUI_RELEASE_BASE_URL / DEEPSEEK_RELEASE_BASE_URL are legacy aliases.
   const override = explicitReleaseBase();
@@ -205,7 +217,7 @@ function shouldRaceFirstPartyMirrors(
   );
 }
 
-function firstPartyReleaseSources(version, repo = "Hmbown/CodeWhale") {
+function firstPartyReleaseSources(version, repo = "codewhale-hq/CodeWhale") {
   return [
     {
       id: "github",
@@ -235,11 +247,11 @@ function assertCnbMirrorSupportedPlatform(
   );
 }
 
-function releaseAssetUrl(baseName, version, repo = "Hmbown/CodeWhale") {
+function releaseAssetUrl(baseName, version, repo = "codewhale-hq/CodeWhale") {
   return releaseAssetUrlFromBase(baseName, releaseBaseUrl(version, repo));
 }
 
-function checksumManifestUrl(version, repo = "Hmbown/CodeWhale") {
+function checksumManifestUrl(version, repo = "codewhale-hq/CodeWhale") {
   return releaseAssetUrl(CHECKSUM_MANIFEST, version, repo);
 }
 
@@ -257,7 +269,7 @@ function allAssetNames() {
   return Array.from(new Set(names));
 }
 
-function allReleaseAssetNames() {
+function allReleaseAssetNames(catalog) {
   return [
     ...allAssetNames(),
     ...LEGACY_TUI_BRIDGE_ASSET_NAMES,
@@ -265,11 +277,12 @@ function allReleaseAssetNames() {
     WINDOWS_INSTALLER_ASSET,
     BUNDLE_CHECKSUM_MANIFEST,
     CHECKSUM_MANIFEST,
+    ...compiledHosts.assets(catalog),
   ];
 }
 
-function checksummedReleaseAssetNames() {
-  return allReleaseAssetNames().filter((name) => name !== CHECKSUM_MANIFEST);
+function checksummedReleaseAssetNames(catalog) {
+  return allReleaseAssetNames(catalog).filter((name) => name !== CHECKSUM_MANIFEST);
 }
 
 module.exports = {
@@ -292,6 +305,7 @@ module.exports = {
   hasExplicitReleaseBase,
   isCnbSupportedTarget,
   LEGACY_TUI_BRIDGE_ASSET_NAMES,
+  openHarmonyDirections,
   releaseAssetUrl,
   releaseAssetUrlFromBase,
   releaseBaseUrl,

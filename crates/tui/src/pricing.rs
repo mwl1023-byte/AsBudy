@@ -8,14 +8,14 @@
 use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Timelike, Utc, Weekday};
 use codewhale_config::pricing::{
     Currency, LIVE_PRICING_MAX_AGE_SECS, LivePricingDefect, OfferingPricing, PricingProvenance,
-    TokenClass, TokenUsage,
+    PricingQuoteError, TokenClass, TokenUsage,
 };
 
 #[cfg(test)]
 use crate::config::DEFAULT_STEPFUN_MODEL;
 use crate::config::{
-    ApiProvider, DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC,
-    DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_PLAN_BASE_URL, canonical_model_id_for_provider,
+    DEEPSEEK_ALIAS_RETIREMENT_UTC, DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_PLAN_BASE_URL,
+    ProviderKind, canonical_model_id_for_provider,
 };
 use codewhale_models::{Usage, has_date_snapshot_suffix};
 
@@ -399,6 +399,25 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Historical Codex backend receipts retain their original quota basis.
+/// New Sign in with ChatGPT requests use the public API and additionally need
+/// captured grant provenance; this endpoint check never proves that grant.
+pub(crate) fn is_chatgpt_codex_backend(base_url: &str) -> bool {
+    let Some(shape) = endpoint_shape(base_url) else {
+        return false;
+    };
+    shape.host == "chatgpt.com"
+        && (shape.path == "/backend-api" || shape.path.starts_with("/backend-api/"))
+}
+
+/// The public API base documented for official ChatGPT plan inference.
+/// The same endpoint accepts metered API keys: this shape alone is not a
+/// subscription claim. [`crate::route_billing`] also requires a verified grant.
+pub(crate) fn is_official_chatgpt_api(base_url: &str) -> bool {
+    endpoint_shape(base_url)
+        .is_some_and(|shape| shape.host == "api.openai.com" && shape.path == "/v1")
+}
+
 /// Reduce a concrete request endpoint to non-secret billing provenance.
 ///
 /// Every reachable endpoint now gets a positive classification, including
@@ -407,26 +426,34 @@ fn host_of(url: &str) -> Option<String> {
 /// also treated as unknown downstream. Nothing here consults credentials or
 /// echoes a URL, so the result is safe to persist and log.
 pub(crate) fn billing_surface_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: Option<&str>,
 ) -> Option<&'static str> {
     // Routes whose billing shape is a property of the provider itself, not of
     // the endpoint spelling.
     match provider {
-        ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => {
+        ProviderKind::Ollama | ProviderKind::Sglang | ProviderKind::Vllm => {
             return Some(LOCAL_BILLING_SURFACE);
         }
         // Ollama Cloud publishes plan/account terms, not a Codewhale-owned
         // per-token rate. Hosted is not local/free, but it is also not proof
         // of PAYG dollars: keep it in money coverage as unclassified until an
         // authoritative billing surface is available.
-        ApiProvider::OllamaCloud => return Some(UNCLASSIFIED_BILLING_SURFACE),
-        ApiProvider::OpenaiCodex | ApiProvider::OpencodeGo => {
-            return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE);
+        ProviderKind::OllamaCloud => return Some(UNCLASSIFIED_BILLING_SURFACE),
+        ProviderKind::OpencodeGo => return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE),
+        // Preserve historical backend provenance, but public API plan access
+        // is credential-shaped. Without the captured official grant it stays
+        // unknown, including when no endpoint was supplied.
+        ProviderKind::OpenaiCodex => {
+            return Some(if base_url.is_some_and(is_chatgpt_codex_backend) {
+                OAUTH_SUBSCRIPTION_BILLING_SURFACE
+            } else {
+                UNCLASSIFIED_BILLING_SURFACE
+            });
         }
         // A named custom endpoint is never assumed to be metered; the billing
         // presentation layer decides that from explicit config.
-        ApiProvider::Custom => return Some(UNCLASSIFIED_BILLING_SURFACE),
+        ProviderKind::Custom => return Some(UNCLASSIFIED_BILLING_SURFACE),
         _ => {}
     }
 
@@ -436,21 +463,21 @@ pub(crate) fn billing_surface_for_route(
     };
 
     let surface = match provider {
-        ApiProvider::Stepfun => stepfun_surface(&shape),
-        ApiProvider::Zai => zai_surface(&shape),
-        ApiProvider::Moonshot => moonshot_surface(&shape),
-        ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => minimax_surface(&shape),
-        ApiProvider::Csdn => csdn_surface(&shape),
-        ApiProvider::XiaomiMimo => xiaomi_surface(&shape),
-        ApiProvider::ModelstudioTokenPlan
-        | ApiProvider::ModelstudioTokenPlanAnthropic
-        | ApiProvider::ModelstudioCodingPlan
-        | ApiProvider::ModelstudioCodingPlanAnthropic => modelstudio_surface(&shape),
-        ApiProvider::Volcengine => volcengine_surface(&shape),
-        ApiProvider::Openrouter
-        | ApiProvider::NvidiaNim
-        | ApiProvider::OpencodeZen
-        | ApiProvider::Orcarouter => {
+        ProviderKind::Stepfun => stepfun_surface(&shape),
+        ProviderKind::Zai => zai_surface(&shape),
+        ProviderKind::Moonshot => moonshot_surface(&shape),
+        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => minimax_surface(&shape),
+        ProviderKind::Csdn => csdn_surface(&shape),
+        ProviderKind::XiaomiMimo => xiaomi_surface(&shape),
+        ProviderKind::ModelstudioTokenPlan
+        | ProviderKind::ModelstudioTokenPlanAnthropic
+        | ProviderKind::ModelstudioCodingPlan
+        | ProviderKind::ModelstudioCodingPlanAnthropic => modelstudio_surface(&shape),
+        ProviderKind::Volcengine => volcengine_surface(&shape),
+        ProviderKind::Openrouter
+        | ProviderKind::NvidiaNim
+        | ProviderKind::OpencodeZen
+        | ProviderKind::Orcarouter => {
             is_official_default_endpoint(provider, &shape).then_some(AGGREGATOR_BILLING_SURFACE)
         }
         _ => is_official_default_endpoint(provider, &shape)
@@ -584,8 +611,10 @@ fn xiaomi_surface(shape: &EndpointShape) -> Option<&'static str> {
 /// billing surface.  This allowlist keeps `https://proxy.example/v1` from
 /// inheriting OpenAI/Anthropic/DeepSeek/OpenRouter prices merely because the
 /// selected protocol/provider name is familiar.
-fn is_official_default_endpoint(provider: ApiProvider, shape: &EndpointShape) -> bool {
-    let Some(default) = endpoint_shape(provider.default_base_url()) else {
+fn is_official_default_endpoint(provider: ProviderKind, shape: &EndpointShape) -> bool {
+    let Some(default) =
+        endpoint_shape(codewhale_config::descriptors::compatibility_for_kind(provider).base_url)
+    else {
         return false;
     };
     if shape.host != default.host {
@@ -595,12 +624,12 @@ fn is_official_default_endpoint(provider: ApiProvider, shape: &EndpointShape) ->
         return true;
     }
     match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
+        ProviderKind::Deepseek => {
             matches!(shape.path.as_str(), "" | "/v1" | "/beta")
         }
-        ApiProvider::DeepseekAnthropic => shape.path == "/anthropic",
-        ApiProvider::Openai => matches!(shape.path.as_str(), "" | "/v1"),
-        ApiProvider::Anthropic => matches!(shape.path.as_str(), "" | "/v1"),
+        ProviderKind::DeepseekAnthropic => shape.path == "/anthropic",
+        ProviderKind::Openai => matches!(shape.path.as_str(), "" | "/v1"),
+        ProviderKind::Anthropic => matches!(shape.path.as_str(), "" | "/v1"),
         _ => false,
     }
 }
@@ -624,11 +653,11 @@ fn stepfun_payg_pricing(model: &str) -> Option<ModelPricing> {
 }
 
 fn pricing_for_billing_surface(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
 ) -> Option<ModelPricing> {
-    if provider == ApiProvider::Stepfun
+    if provider == ProviderKind::Stepfun
         && billing_surface
             .is_some_and(|surface| surface.eq_ignore_ascii_case(STEPFUN_PAYG_BILLING_SURFACE))
     {
@@ -638,8 +667,8 @@ fn pricing_for_billing_surface(
     }
 }
 
-fn route_requires_billing_surface(provider: ApiProvider, model: &str) -> bool {
-    provider == ApiProvider::Stepfun || stepfun_payg_pricing(model).is_some()
+fn route_requires_billing_surface(provider: ProviderKind, model: &str) -> bool {
+    provider == ProviderKind::Stepfun || stepfun_payg_pricing(model).is_some()
 }
 
 /// Look up pricing for a model name.
@@ -657,7 +686,7 @@ pub fn has_pricing_for_model(model: &str) -> bool {
 /// pricing for this model without endpoint provenance. ChatGPT/Codex OAuth is
 /// subscription/account scoped, while StepFun needs PAYG-vs-Plan provenance.
 #[must_use]
-pub fn has_pricing_for_provider(provider: ApiProvider, model: &str) -> bool {
+pub fn has_pricing_for_provider(provider: ProviderKind, model: &str) -> bool {
     calculate_turn_cost_estimate_for_provider(provider, model, &Usage::default()).is_some()
 }
 
@@ -666,7 +695,7 @@ pub fn has_pricing_for_provider(provider: ApiProvider, model: &str) -> bool {
 #[cfg(test)]
 #[must_use]
 pub(crate) fn has_pricing_for_billing_surface(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
 ) -> bool {
@@ -692,155 +721,38 @@ fn pricing_for_model_at(model: &str, now: DateTime<Utc>) -> Option<ModelPricing>
     }
     // A new or expiring model ID does not inherit a neighboring model's
     // rates. Keep this metadata lookup as exact as the billing route owner.
-    match lower.as_str() {
+    deepseek_time_aware_pricing(&lower, now)
+}
+
+fn deepseek_time_aware_pricing(model_lower: &str, now: DateTime<Utc>) -> Option<ModelPricing> {
+    match model_lower {
         "deepseek-v4-pro" => Some(deepseek_v4_pro_pricing(now)),
-        "deepseek-v4-flash" => Some(deepseek_v4_flash_pricing(now)),
-        "deepseek-flash" => Some(deepseek_flash_pricing(now)),
+        "deepseek-v4-flash" | "deepseek-flash" => Some(deepseek_v4_flash_pricing(now)),
+        "deepseek-v4-flash-vision-exp" => {
+            (now >= deepseek_flash_effective_from()).then(|| deepseek_flash_pricing(now))
+        }
         _ => None,
     }
 }
 
 fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
-    let explicit = match model_lower {
-        "openai/gpt-5.6" | "openai/gpt-5.6-sol" | "gpt-5.6" | "gpt-5.6-sol" => {
-            Some(usd_only_pricing(0.50, 5.00, 30.00))
-        }
-        // GPT-5.6 Terra / Luna short-context (<=272K) rates, re-verified
-        // 2026-08-17 against the model pages (Input / Cached / Output):
-        // https://developers.openai.com/api/docs/models/gpt-5.6-terra
-        // https://developers.openai.com/api/docs/models/gpt-5.6-luna
-        // The >272K tier is refused by `direct_openai_long_context_tier_is_unpriced`.
-        "openai/gpt-5.6-terra" | "gpt-5.6-terra" => Some(usd_only_pricing(0.20, 2.00, 12.00)),
-        "openai/gpt-5.6-luna" | "gpt-5.6-luna" => Some(usd_only_pricing(0.02, 0.20, 1.20)),
-        "meta/muse-spark-1.1" | "muse-spark-1.1" => Some(usd_only_pricing(0.15, 1.25, 4.25)),
-        "meta/muse-spark-1.2" | "muse-spark-1.2" => Some(usd_only_pricing(0.15, 1.25, 4.25)),
-        "meta/muse-spark-1.2-contributor" | "muse-spark-1.2-contributor" => {
-            Some(usd_only_pricing(0.002, 0.10, 0.20))
-        }
-        // Grok 4.6 / 4.5 / 4.3 double all token rates when the prompt reaches
-        // 200K. Metadata-only lookups use the standard tier; turn auditing
-        // below selects the exact usage-aware tier for the direct xAI route.
-        "grok-4.6" | "grok-4.5" | "grok-4.3" => grok_tiered_pricing(model_lower, false),
-        // Anthropic first-party rates including the published cache-read
-        // discounts and 5-minute cache-write rates (2026-07-09 audit,
-        // https://platform.claude.com/docs/en/about-claude/pricing). These sit
-        // above the catalog lookup because the bundled catalog cannot carry
-        // cache-read/write rates yet. 1h write is 2x input; we price the
-        // common 5m tier (1.25x input) here (#4318).
-        "claude-opus-4-8" => Some(usd_pricing_with_write(0.50, 5.00, 25.00, 6.25)),
-        // Claude Opus 5 (GA 2026-07-24): same card as Opus 4.8 — $5 in /
-        // $25 out, cache read 0.50, 5m cache write 6.25 (1h write 10.00).
-        // Re-verified 2026-08-17 against
-        // https://platform.claude.com/docs/en/about-claude/pricing and
-        // https://platform.claude.com/docs/en/about-claude/models/overview.
-        "claude-opus-5" => Some(usd_pricing_with_write(0.50, 5.00, 25.00, 6.25)),
-        "claude-sonnet-4-6" => Some(usd_pricing_with_write(0.30, 3.00, 15.00, 3.75)),
-        "claude-haiku-4-5" => Some(usd_pricing_with_write(0.10, 1.00, 5.00, 1.25)),
-        // Claude Fable 5 (GA 2026-06-09). Its newer tokenizer produces ~30%
-        // more tokens for the same text than prior Claude models, so raw
-        // per-token rate comparisons against other Claude rows undercount its
-        // effective cost. Cache-write is 12.50 (5m) / 20.00 (1h) upstream.
-        "claude-fable-5" => Some(usd_pricing_with_write(1.00, 10.00, 50.00, 12.50)),
-        // Z.ai GLM-5.2 cache-read rate per https://docs.z.ai/guides/overview/pricing
-        // (cache storage limited-time free).
-        "z-ai/glm-5.2" | "glm-5.2" => Some(usd_only_pricing(0.26, 1.40, 4.40)),
-        // GLM-5.3-Flash list rates (2026-08-26). Promo 50% off until
-        // 2026-09-09 UTC+8 is not the durable row.
-        "z-ai/glm-5.3-flash" | "glm-5.3-flash" => Some(usd_only_pricing(0.03, 0.15, 0.50)),
-        // Moonshot K2.7 Code cache-read rate per
-        // https://platform.kimi.ai/docs/pricing/chat-k27-code
-        "moonshotai/kimi-k2.7-code" | "kimi-k2.7-code" => Some(usd_only_pricing(0.19, 0.95, 4.00)),
-        // Moonshot K2.7 Code high-speed tier (same model, ~2x rates), per the
-        // same page (re-verified 2026-08-17: cache-hit 0.38 / cache-miss 1.90
-        // / output 8.00 per 1M).
-        "moonshotai/kimi-k2.7-code-highspeed" | "kimi-k2.7-code-highspeed" => {
-            Some(usd_only_pricing(0.38, 1.90, 8.00))
-        }
-        // Moonshot K3 direct pay-as-you-go platform rate (re-verified
-        // 2026-08-17): cache-hit 0.30 / cache-miss 3.00 / output 15.00 per 1M,
-        // https://platform.kimi.ai/docs/pricing/chat-k3. The Kimi Code
-        // membership id `k3` is quota-billed and deliberately has no row.
-        "moonshotai/kimi-k3" | "kimi-k3" => Some(usd_only_pricing(0.30, 3.00, 15.00)),
-        // MiniMax-M3 uses the lower standard tier for metadata-only lookups;
-        // cost estimation selects the correct tier from total input usage.
-        "minimax-m3" => Some(minimax_m3_standard_pricing(false)),
-        "minimax-m2.7" => Some(usd_pricing_with_write(0.06, 0.30, 1.20, 0.375)),
-        // MiniMax-M2.7-highspeed: input 0.6 / output 2.4 / cache read 0.06 /
-        // cache write 0.375 per 1M (re-verified 2026-08-17),
-        // https://platform.minimax.io/docs/guides/pricing-paygo
-        "minimax-m2.7-highspeed" => Some(usd_pricing_with_write(0.06, 0.60, 2.40, 0.375)),
-        // gpt-5-codex is deprecated upstream on the ChatGPT-OAuth path
-        // (successor: gpt-5.3-codex); API usage is still billed at these rates.
-        // https://developers.openai.com/api/docs/models/gpt-5.3-codex
-        "openai/gpt-5-codex" | "gpt-5-codex" => Some(usd_only_pricing(0.125, 1.25, 10.00)),
-        "openai/gpt-5.3-codex" | "gpt-5.3-codex" => Some(usd_only_pricing(0.175, 1.75, 14.00)),
-        _ => None,
-    };
-    if explicit.is_some() {
-        return explicit;
+    let reviewed = codewhale_config::catalog::reviewed::bundled_reviewed();
+    if let Some(policy) = reviewed.reference_price_policies.get(model_lower) {
+        return match policy.as_str() {
+            "grok" => grok_tiered_pricing(model_lower, false),
+            "minimax_m3" => Some(minimax_m3_standard_pricing(false)),
+            _ => None,
+        };
     }
-    if let Some((input_usd_per_million, output_usd_per_million)) =
-        codewhale_models::model_catalog::resolved_usd_pricing(model_lower)
-    {
-        return Some(usd_only_pricing(
-            input_usd_per_million,
-            input_usd_per_million,
-            output_usd_per_million,
-        ));
-    }
-    match model_lower {
-        "moonshotai/kimi-k2.6" | "kimi-k2.6" => Some(usd_only_pricing(0.16, 0.95, 4.00)),
-        "z-ai/glm-5.1" | "glm-5.1" => Some(usd_only_pricing(0.26, 1.40, 4.40)),
-        // GLM-5 Turbo pricing per https://docs.z.ai/guides/overview/pricing
-        "z-ai/glm-5-turbo" | "glm-5-turbo" => Some(usd_only_pricing(0.24, 1.20, 4.00)),
-        // Arcee publishes no cache rate for Trinity Large Thinking, so the
-        // cache-hit rate equals the input rate (no-discount representation).
-        // https://docs.arcee.ai/get-started/pricing
-        "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => {
-            Some(usd_only_pricing(0.25, 0.25, 0.80))
-        }
-        "openai/gpt-5.5" | "gpt-5.5" => Some(usd_only_pricing(0.50, 5.00, 30.00)),
-        // GPT-5.5 Pro does not offer a cached input discount, so the cache-hit
-        // rate equals the input rate.
-        // https://developers.openai.com/api/docs/models/gpt-5.5-pro
-        "openai/gpt-5.5-pro" | "gpt-5.5-pro" => Some(usd_only_pricing(30.00, 30.00, 180.00)),
-        // Mistral la Plateforme standard rates (Input / Cached input /
-        // Output per 1M), re-verified 2026-08-17 against
-        // https://docs.mistral.ai/inference/pricing: Mistral Medium 3.5
-        // $1.5 / $0.15 / $7.5, Mistral Large 3 $0.5 / $0.05 / $1.5, Mistral
-        // Small 4 $0.15 / $0.015 / $0.6, Codestral $0.3 / $0.03 / $0.9. The
-        // `-latest` ids resolve to those generations on /v1/models (see
-        // `models.rs`); no cache-write rate is published, so it stays
-        // unpriced rather than assumed.
-        "mistral-medium-latest"
-        | "mistral-medium-3-5"
-        | "mistral-medium-3.5"
-        | "mistral-medium-2604" => Some(usd_only_pricing(0.15, 1.50, 7.50)),
-        "mistral-large-latest" | "mistral-large-2512" => Some(usd_only_pricing(0.05, 0.50, 1.50)),
-        "mistral-small-latest" | "mistral-small-2603" => Some(usd_only_pricing(0.015, 0.15, 0.60)),
-        "mistral-code-latest" | "codestral-latest" | "codestral" => {
-            Some(usd_only_pricing(0.03, 0.30, 0.90))
-        }
-        "qwen/qwen3.6-flash" => Some(usd_only_pricing(0.1875, 0.1875, 1.125)),
-        "qwen/qwen3.6-35b-a3b" => Some(usd_only_pricing(0.05, 0.14, 1.00)),
-        "qwen/qwen3.6-max-preview" => Some(usd_only_pricing(1.04, 1.04, 6.24)),
-        "qwen/qwen3.6-27b" => Some(usd_only_pricing(0.15, 0.285, 2.40)),
-        "qwen/qwen3.6-plus" => Some(usd_only_pricing(0.325, 0.325, 1.95)),
-        // Cache-write is 0.40 upstream (#4318).
-        "qwen/qwen3.7-plus" => Some(usd_pricing_with_write(0.064, 0.32, 1.28, 0.40)),
-        "qwen/qwen3.7-max" => Some(usd_only_pricing(0.25, 1.25, 3.75)),
-        // OpenRouter durable list prices (models.dev 2026-08-26, no promo):
-        // input 0.16 / output 0.47 / cache_read 0.016 / cache_write 0.20 per 1M.
-        "qwen/qwen3.8-flash" => Some(usd_pricing_with_write(0.016, 0.16, 0.47, 0.20)),
-
-        "google/gemma-4-31b-it" => Some(usd_only_pricing(0.09, 0.12, 0.35)),
-        "google/gemma-4-26b-a4b-it" => Some(usd_only_pricing(0.06, 0.06, 0.33)),
-        "tencent/hy3-preview" => Some(usd_only_pricing(0.021, 0.063, 0.21)),
-        "nvidia/nemotron-3-ultra-550b-a55b" | "nvidia/nemotron-3-ultra" => {
-            Some(usd_only_pricing(0.10, 0.50, 2.20))
-        }
-        _ => None,
-    }
+    reviewed.reference_prices.get(model_lower).map(|row| {
+        usd_pricing(
+            row.cache_read,
+            row.input,
+            row.output,
+            row.cache_write
+                .map_or(CacheWritePolicy::Unpublished, CacheWritePolicy::Rate),
+        )
+    })
 }
 
 /// A USD row whose provider publishes input/cache-read/output rates but **no**
@@ -901,7 +813,7 @@ const OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD: u32 = 272_000;
 /// <https://developers.openai.com/api/docs/models/gpt-5.5>
 /// <https://developers.openai.com/api/docs/models/gpt-5.6-sol>
 fn direct_openai_long_context_tier_is_unpriced(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     input_tokens: u32,
 ) -> bool {
@@ -915,10 +827,13 @@ fn direct_openai_long_context_tier_is_unpriced(
             | "gpt-5.6-sol"
             | "gpt-5.6-terra"
             | "gpt-5.6-luna"
+            | "gpt-6-sol"
+            | "gpt-6.1-sol"
+            | "gpt-6-luna"
     ) || has_date_snapshot_suffix(&model_lower, "gpt-5.4-")
         || has_date_snapshot_suffix(&model_lower, "gpt-5.4-pro-")
         || has_date_snapshot_suffix(&model_lower, "gpt-5.5-");
-    provider == ApiProvider::Openai
+    provider == ProviderKind::Openai
         && input_tokens > OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD
         && affected_model
 }
@@ -942,12 +857,14 @@ fn is_minimax_m3(model: &str) -> bool {
 /// doubled tier once a prompt reaches 200K tokens. Verified 2026-08-17 against
 /// the model pages, whose embedded price tables carry both the standard and
 /// `LongContext` columns at exactly 2x:
+/// - <https://docs.x.ai/docs/models/grok-4.7>: 0.50 / 2.00 / 6.00 (verified
+///   2026-09-23: $4.00 / $1.00 / $12.00 at or above 200K)
 /// - <https://docs.x.ai/docs/models/grok-4.6>: 0.50 / 2.00 / 6.00
 /// - <https://docs.x.ai/docs/models/grok-4.5>: 0.30 / 2.00 / 6.00
 /// - <https://docs.x.ai/docs/models/grok-4.3>: 0.20 / 1.25 / 2.50
 fn grok_tiered_pricing(model_lower: &str, long_context: bool) -> Option<ModelPricing> {
     let (cache_read, input, output) = match model_lower {
-        "grok-4.6" => (0.50, 2.00, 6.00),
+        "grok-4.7" | "grok-4.6" => (0.50, 2.00, 6.00),
         "grok-4.5" => (0.30, 2.00, 6.00),
         "grok-4.3" => (0.20, 1.25, 2.50),
         _ => return None,
@@ -963,10 +880,11 @@ fn grok_tiered_pricing(model_lower: &str, long_context: bool) -> Option<ModelPri
 fn is_grok_tiered(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "grok-4.6" | "grok-4.5" | "grok-4.3"
+        "grok-4.7" | "grok-4.6" | "grok-4.5" | "grok-4.3"
     )
 }
 
+#[cfg(test)]
 fn pricing_for_model_and_usage(model: &str, usage: &Usage) -> Option<ModelPricing> {
     if is_minimax_m3(model) {
         return Some(minimax_m3_standard_pricing(
@@ -1056,11 +974,7 @@ fn deepseek_is_peak(now: DateTime<Utc>) -> bool {
 #[must_use]
 pub(crate) fn deepseek_time_tier(model: &str, now: DateTime<Utc>) -> Option<bool> {
     let lower = model.trim().to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash"
-    )
-    .then(|| deepseek_is_peak(now))
+    deepseek_time_aware_pricing(&lower, now).map(|_| deepseek_is_peak(now))
 }
 
 fn deepseek_v4_pro_pricing(now: DateTime<Utc>) -> ModelPricing {
@@ -1136,7 +1050,16 @@ fn deepseek_flash_pricing(now: DateTime<Utc>) -> ModelPricing {
     }
 }
 
+fn deepseek_flash_effective_from() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 9, 10, 4, 0, 0)
+        .single()
+        .expect("2026-09-10T04:00Z is a valid UTC instant")
+}
+
 fn deepseek_v4_flash_pricing(now: DateTime<Utc>) -> ModelPricing {
+    if now >= deepseek_flash_effective_from() {
+        return deepseek_flash_pricing(now);
+    }
     let peak = deepseek_is_peak(now);
     let (hit, miss, out) = if peak {
         (0.014, 0.44, 1.32)
@@ -1185,27 +1108,27 @@ pub fn calculate_turn_cost_estimate_from_usage(model: &str, usage: &Usage) -> Op
 /// Only cache-write can fail here: input, cache-read, and output rates are
 /// mandatory on every hand row, while a cache-creation rate exists only where a
 /// provider publishes one or documents that writes cost nothing extra.
+#[cfg(test)]
 fn cost_estimate_with_pricing_checked(
     pricing: ModelPricing,
     usage: &Usage,
 ) -> Result<CostEstimate, Vec<TokenClass>> {
     let classes = token_usage_for_pricing(usage);
-    if classes.cache_write > 0
-        && pricing
-            .usd
-            .cache_write
-            .rate(pricing.usd.input_cache_miss_per_million)
-            .is_none()
-    {
-        return Err(vec![TokenClass::CacheWrite]);
+    let usd = currency_offering_pricing(pricing.usd, Currency::Usd);
+    let missing = usd.unpriced_used_classes(&classes);
+    if !missing.is_empty() {
+        return Err(missing);
     }
-    Ok(CostEstimate {
-        usd: calculate_turn_cost_from_usage_with_pricing(pricing.usd, usage),
-        cny: pricing
-            .cny
-            .map(|pricing| calculate_turn_cost_from_usage_with_pricing(pricing, usage))
-            .unwrap_or(0.0),
-    })
+    let Some(usd) = usd.estimate_cost(&classes) else {
+        return Err(Vec::new());
+    };
+    let cny = match pricing.cny {
+        Some(pricing) => currency_offering_pricing(pricing, Currency::Cny)
+            .estimate_cost(&classes)
+            .ok_or_else(Vec::new)?,
+        None => 0.0,
+    };
+    Ok(CostEstimate { usd, cny })
 }
 
 /// Unchecked projection for the legacy model-only test helpers, which construct
@@ -1216,13 +1139,8 @@ fn cost_estimate_with_pricing_checked(
 /// input rate.
 #[cfg(test)]
 fn cost_estimate_with_pricing(pricing: ModelPricing, usage: &Usage) -> CostEstimate {
-    CostEstimate {
-        usd: calculate_turn_cost_from_usage_with_pricing(pricing.usd, usage),
-        cny: pricing
-            .cny
-            .map(|pricing| calculate_turn_cost_from_usage_with_pricing(pricing, usage))
-            .unwrap_or(0.0),
-    }
+    cost_estimate_with_pricing_checked(pricing, usage)
+        .expect("validated hand row and usage classes")
 }
 
 /// Calculate cost from provider/model usage when that pair identifies a single
@@ -1231,7 +1149,7 @@ fn cost_estimate_with_pricing(pricing: ModelPricing, usage: &Usage) -> CostEstim
 /// unpriced here rather than fabricating spend.
 #[must_use]
 pub fn calculate_turn_cost_estimate_for_provider(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     usage: &Usage,
 ) -> Option<CostEstimate> {
@@ -1247,7 +1165,7 @@ pub fn calculate_turn_cost_estimate_for_provider(
 #[must_use]
 #[cfg(test)]
 pub fn calculate_turn_cost_estimate_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     usage: &Usage,
     billing: crate::route_billing::BillingPresentation,
@@ -1261,7 +1179,7 @@ pub fn calculate_turn_cost_estimate_for_route(
 #[must_use]
 #[cfg(test)]
 pub(crate) fn calculate_turn_cost_estimate_for_billing_surface(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
     usage: &Usage,
@@ -1272,7 +1190,7 @@ pub(crate) fn calculate_turn_cost_estimate_for_billing_surface(
 /// Deterministic provider-aware estimate at the turn's recorded time.
 #[must_use]
 pub(crate) fn calculate_turn_cost_estimate_for_provider_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     usage: &Usage,
     recorded_at: DateTime<Utc>,
@@ -1346,6 +1264,7 @@ pub enum UnpricedReason {
     /// reported input total. Pricing that contradictory partition would
     /// over-count input, so the call is retained but fails closed.
     InconsistentUsage,
+    MissingUsageBreakdown,
 }
 
 impl UnpricedReason {
@@ -1368,6 +1287,7 @@ impl UnpricedReason {
             "invalid_pricing_row" => Self::InvalidPricingRow,
             "unsupported_currency" | "currency_not_published" => Self::UnsupportedCurrency,
             "inconsistent_usage" => Self::InconsistentUsage,
+            "missing_usage_breakdown" => Self::MissingUsageBreakdown,
             "late_usage_ledger_unavailable" => Self::LateUsageUnavailable,
             "late_usage_ledger_overflow" => Self::LateUsageOverflow,
             _ => Self::UnrecordedCoverage,
@@ -1395,6 +1315,7 @@ impl UnpricedReason {
             Self::InvalidPricingRow => MessageId::CostReasonInvalidRate,
             Self::UnsupportedCurrency => MessageId::CostReasonCurrencyMissing,
             Self::InconsistentUsage => MessageId::CostReasonUsageConflict,
+            Self::MissingUsageBreakdown => MessageId::CostReasonUsageBreakdown,
         }
     }
 
@@ -1419,6 +1340,7 @@ impl UnpricedReason {
             Self::InvalidPricingRow => "invalid_pricing_row",
             Self::UnsupportedCurrency => "unsupported_currency",
             Self::InconsistentUsage => "inconsistent_usage",
+            Self::MissingUsageBreakdown => "missing_usage_breakdown",
         }
     }
 
@@ -1462,6 +1384,8 @@ pub struct TurnCostAudit {
     /// be inferred from `estimate > 0`.
     pub usd_priced: bool,
     pub cny_priced: bool,
+    pub exact_usd: Option<String>,
+    pub exact_cny: Option<String>,
 }
 
 impl TurnCostAudit {
@@ -1479,6 +1403,8 @@ impl TurnCostAudit {
             live_pricing_defect: None,
             usd_priced,
             cny_priced,
+            exact_usd: None,
+            exact_cny: None,
         }
     }
 
@@ -1491,6 +1417,8 @@ impl TurnCostAudit {
             live_pricing_defect: None,
             usd_priced: false,
             cny_priced: false,
+            exact_usd: None,
+            exact_cny: None,
         }
     }
 
@@ -1503,6 +1431,8 @@ impl TurnCostAudit {
             live_pricing_defect: None,
             usd_priced: false,
             cny_priced: false,
+            exact_usd: None,
+            exact_cny: None,
         }
     }
 
@@ -1517,6 +1447,8 @@ impl TurnCostAudit {
             live_pricing_defect: Some(defect),
             usd_priced: false,
             cny_priced: false,
+            exact_usd: None,
+            exact_cny: None,
         }
     }
 
@@ -1564,7 +1496,7 @@ impl TurnCostAudit {
 /// [`audit_turn_cost_for_provider_on_endpoint_at`] when the base URL is known.
 #[must_use]
 pub(crate) fn audit_turn_cost_for_provider_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     usage: &Usage,
     recorded_at: DateTime<Utc>,
@@ -1579,7 +1511,7 @@ pub(crate) fn audit_turn_cost_for_provider_at(
 /// reporting completeness from another.
 #[must_use]
 pub(crate) fn audit_turn_cost_for_provider_on_endpoint_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     endpoint_fingerprint: Option<&str>,
     usage: &Usage,
@@ -1599,14 +1531,14 @@ pub(crate) fn audit_turn_cost_for_provider_on_endpoint_at(
 
 /// Identity-aware provider audit for named compatible routes.
 ///
-/// `ApiProvider::Custom` is only a transport family, so it is never sufficient
+/// `ProviderKind::Custom` is only a transport family, so it is never sufficient
 /// pricing provenance on its own. Baseten is the first reviewed compatible
 /// provider whose authenticated live catalog can price actual usage; every
 /// other custom identity stays unknown until it receives an equivalent
 /// provider/endpoint contract.
 #[must_use]
 fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     model: &str,
     endpoint_fingerprint: Option<&str>,
@@ -1618,10 +1550,10 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
     if !usage_cache_partition_is_consistent(usage) {
         return TurnCostAudit::unpriced(UnpricedReason::InconsistentUsage);
     }
-    if provider == ApiProvider::OpenaiCodex {
-        return TurnCostAudit::unpriced(UnpricedReason::NotMoneyMetered);
+    if provider == ProviderKind::OpenaiCodex {
+        return TurnCostAudit::unpriced(UnpricedReason::AmbiguousBillingSurface);
     }
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         // A transport family plus current mutable catalog state is not a
         // billing receipt. Reviewed custom routes are priced only by the
         // frozen dispatch quote handled in the route-audit path below.
@@ -1634,7 +1566,7 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
     let model_lower = normalized_model.to_ascii_lowercase();
     let direct_deepseek = matches!(
         provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
     );
     let Some(canonical_model) = canonical_model_id_for_provider(provider, normalized_model) else {
         return TurnCostAudit::unpriced(UnpricedReason::NoPricingRow);
@@ -1648,7 +1580,15 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         if recorded_at >= retirement.with_timezone(&Utc) {
             return TurnCostAudit::unpriced(UnpricedReason::RetiredAlias);
         }
-        DEEPSEEK_ALIAS_REPLACEMENT.to_string()
+        "deepseek-v4-flash".to_string()
+    } else if direct_deepseek
+        && matches!(
+            model_lower.as_str(),
+            "flash-vision" | "deepseek-v4flashvisionexp"
+        )
+        && recorded_at < deepseek_flash_effective_from()
+    {
+        "deepseek-v4-flash-vision-exp".to_string()
     } else {
         canonical_model
     };
@@ -1657,41 +1597,27 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         return TurnCostAudit::unpriced(UnpricedReason::UnrepresentedTier);
     }
 
-    // MiniMax-M3 doubles its published rates above 512K total input. The
-    // catalog row is necessarily static, so retain the usage-aware first-party
-    // table for both direct wire protocols after provider/model provenance has
-    // been canonicalized.
-    if matches!(
-        provider,
-        ApiProvider::Minimax | ApiProvider::MinimaxAnthropic
-    ) && catalog_model.eq_ignore_ascii_case("minimax-m3")
-    {
-        return hand_priced_audit(pricing_for_model_and_usage(&catalog_model, usage), usage);
-    }
-
-    // xAI doubles Grok 4.6 / 4.5 / 4.3 input, cached-input, and output rates
-    // once the prompt reaches 200K tokens. Keep this provider-owned and
-    // usage-aware so a third-party route reusing the model slug never
-    // inherits xAI billing.
-    if provider == ApiProvider::Xai && is_grok_tiered(&catalog_model) {
-        return hand_priced_audit(pricing_for_model_and_usage(&catalog_model, usage), usage);
-    }
-
     // Direct DeepSeek pricing carries an authoritative CNY row and recorded-time
-    // peak/off-peak tiers that a static catalog row cannot represent; Sonnet 5
-    // keeps riding the same recorded-time hand row (its rate is flat again
-    // since Anthropic cancelled the 2026-09-01 increase, but the contract that
-    // first-party Anthropic prices Sonnet 5 from its own row stays). These
+    // peak/off-peak tiers that a static catalog row cannot represent. These
     // exact first-party routes intentionally override the catalog; no other
     // provider/model text match is allowed to do so.
+    if matches!(
+        provider,
+        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic
+    ) && catalog_model.eq_ignore_ascii_case("minimax-m3")
+    {
+        return hand_provider_audit(provider, &catalog_model, usage, recorded_at);
+    }
+
+    if provider == ProviderKind::Xai && is_grok_tiered(&catalog_model) {
+        return hand_provider_audit(provider, &catalog_model, usage, recorded_at);
+    }
+
     if direct_deepseek
-        || (provider == ApiProvider::Anthropic
+        || (provider == ProviderKind::Anthropic
             && catalog_model.eq_ignore_ascii_case("claude-sonnet-5"))
     {
-        return hand_priced_audit(
-            provider_owned_hand_pricing_at(provider, &catalog_model, recorded_at),
-            usage,
-        );
+        return hand_provider_audit(provider, &catalog_model, usage, recorded_at);
     }
 
     if let Some(pricing) = frozen_cloud_pricing {
@@ -1726,7 +1652,10 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         VerifiedOffering::Absent => None,
     };
 
-    if let Some(audit) = offering.as_ref().and_then(invalid_catalog_pricing_audit) {
+    if let Some(audit) = offering
+        .as_ref()
+        .and_then(|offering| refused_catalog_pricing_audit(offering, usage))
+    {
         return audit.with_live_defect(live_defect);
     }
 
@@ -1734,31 +1663,7 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         && let Some(pricing) =
             effective_offering_pricing(provider, &catalog_model, offering, &classes)
     {
-        if let Some(estimate) =
-            catalog_cost_estimate_for_route(provider, &catalog_model, offering, usage)
-        {
-            let (usd_priced, cny_priced) = match pricing.currency {
-                Currency::Usd => (true, false),
-                Currency::Cny => (false, true),
-                Currency::Other(_) => (false, false),
-            };
-            return TurnCostAudit::priced(
-                estimate,
-                pricing.provenance.clone(),
-                usd_priced,
-                cny_priced,
-            )
-            .with_live_defect(live_defect);
-        }
-        let classes = pricing.unpriced_used_classes(&classes);
-        if classes.is_empty() {
-            // Every used class is priced, so the only way the estimate failed
-            // is a currency CodeWhale does not carry. Never convert.
-            return TurnCostAudit::unpriced(UnpricedReason::UnsupportedCurrency)
-                .with_live_defect(live_defect);
-        }
-        return TurnCostAudit::missing_classes(pricing.provenance, classes)
-            .with_live_defect(live_defect);
+        return audit_offering_pricing(pricing, usage).with_live_defect(live_defect);
     }
 
     // A few first-party rows predate or intentionally omit a Models.dev entry
@@ -1777,24 +1682,31 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         // verified scoped offerings and operator overrides above authoritative;
         // absent those, do not inherit a model owner's or aggregate rate.
         // https://concentrate.ai/docs/api-reference/endpoint/auto-routing
-        (None, None) if provider == ApiProvider::Concentrate => {
+        (None, None) if provider == ProviderKind::Concentrate => {
             TurnCostAudit::unpriced(UnpricedReason::RoutingDependentPrice)
         }
         (defect, hand_row) => hand_priced_audit(hand_row, usage).with_live_defect(defect),
     }
 }
 
-/// Convert malformed catalog numerics into an explicit runtime audit reason.
+/// Convert malformed catalog numerics, or a context tier this turn reached,
+/// into an explicit runtime audit reason.
 /// Keeping this distinct from the ordinary `None` projection prevents a bad
 /// published row from becoming indistinguishable from an absent price.
-fn invalid_catalog_pricing_audit(
+fn refused_catalog_pricing_audit(
     offering: &codewhale_config::catalog::CatalogOffering,
+    usage: &Usage,
 ) -> Option<TurnCostAudit> {
-    offering
-        .cost
-        .as_ref()
-        .is_some_and(|cost| !codewhale_config::pricing::catalog_cost_is_valid(cost))
-        .then(|| TurnCostAudit::unpriced(UnpricedReason::InvalidPricingRow))
+    let cost = offering.cost.as_ref()?;
+    if !codewhale_config::pricing::catalog_cost_is_valid(cost) {
+        return Some(TurnCostAudit::unpriced(UnpricedReason::InvalidPricingRow));
+    }
+    let pricing = OfferingPricing::from_catalog_offering(offering)?;
+    matches!(
+        pricing.quote_cost(&token_usage_for_pricing(usage)),
+        Err(PricingQuoteError::UnsupportedTier)
+    )
+    .then(|| TurnCostAudit::unpriced(UnpricedReason::UnrepresentedTier))
 }
 
 /// Outcome of checking a catalog row's pricing provenance against the route.
@@ -1826,14 +1738,14 @@ enum VerifiedOffering {
 /// live row — so those callers degrade to the bundled snapshot rather than
 /// billing against a rate whose endpoint scope is unproven.
 fn verified_catalog_offering(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     catalog_model: &str,
     endpoint_fingerprint: Option<&str>,
     recorded_at: DateTime<Utc>,
     allow_cloud_catalog: bool,
 ) -> VerifiedOffering {
-    let Some(offering) = crate::provider_lake::catalog_offering_for_model_identity(
+    let Some(mut offering) = crate::provider_lake::catalog_offering_for_model_identity(
         provider,
         provider_identity,
         catalog_model,
@@ -1867,32 +1779,27 @@ fn verified_catalog_offering(
     if cloud_price
         && (!allow_cloud_catalog
             || endpoint_fingerprint.is_some_and(|fingerprint| {
-                codewhale_config::catalog::base_url_fingerprint(provider.default_base_url())
-                    != fingerprint
+                codewhale_config::catalog::base_url_fingerprint(
+                    provider.provider().default_base_url(),
+                ) != fingerprint
             }))
     {
         return crate::provider_lake::bundled_catalog_offering_for_model(provider, catalog_model)
             .map(VerifiedOffering::Usable)
             .unwrap_or(VerifiedOffering::Absent);
     }
-    // Models.dev is a capabilities catalog. A live overlay from that fetch
-    // must never be treated as a rate source — leftover `cost` fields are
-    // not provider prices, and `https://api.codewhale.net/session` 503
-    // (`control_plane_not_attached`) is not a healthy live price list
-    // (#5241). Prefer the bundled snapshot (curated in-repo rates, when
-    // present) and otherwise ignore live cost so hand/bundled fallbacks
-    // can restore a usable session total.
-    if matches!(
-        offering.pricing_source(),
-        codewhale_config::catalog::CatalogSource::ModelsDevLive { .. }
-    ) || (!cloud_price
-        && crate::provider_lake::live_catalog_origin(provider, catalog_model)
-            == Some(crate::provider_lake::LiveSource::ModelsDev))
-    {
-        let offering =
-            crate::provider_lake::bundled_catalog_offering_for_model(provider, catalog_model)
-                .unwrap_or_else(|| capabilities_only_offering(offering));
-        return VerifiedOffering::Usable(offering);
+    let models_dev_live_fetched_at = match offering.pricing_source() {
+        codewhale_config::catalog::CatalogSource::Live { fetched_at, .. }
+            if crate::provider_lake::live_catalog_origin(provider, catalog_model)
+                == Some(crate::provider_lake::LiveSource::ModelsDev) =>
+        {
+            Some(*fetched_at)
+        }
+        _ => None,
+    };
+    if let Some(fetched_at) = models_dev_live_fetched_at {
+        offering.cost_source =
+            Some(codewhale_config::catalog::CatalogSource::ModelsDevLive { fetched_at });
     }
     let Some(pricing) = OfferingPricing::from_catalog_offering_at(
         &offering,
@@ -1904,11 +1811,14 @@ fn verified_catalog_offering(
     // `recorded_at` is the turn's own clock, which is the right reference for
     // "was this price current when the turn happened".
     let now_unix = u64::try_from(recorded_at.timestamp()).ok();
-    if pricing.provenance == PricingProvenance::ProviderLive
-        && pricing
-            .effective_at
-            .zip(now_unix)
-            .is_some_and(|(effective_at, dispatched_at)| effective_at > dispatched_at)
+    if matches!(
+        pricing.provenance,
+        PricingProvenance::ProviderLive | PricingProvenance::ModelsDevLive
+    ) && pricing
+        .fetched_at
+        .or(pricing.effective_at)
+        .zip(now_unix)
+        .is_some_and(|(effective_at, dispatched_at)| effective_at > dispatched_at)
     {
         return VerifiedOffering::FutureEffective;
     }
@@ -1926,15 +1836,6 @@ fn verified_catalog_offering(
     }
 }
 
-/// Drop any cost on a Models.dev live overlay so leftover price fields cannot
-/// be billed as `provider_live` (#5241).
-fn capabilities_only_offering(
-    mut offering: codewhale_config::catalog::CatalogOffering,
-) -> codewhale_config::catalog::CatalogOffering {
-    offering.cost = None;
-    offering
-}
-
 /// Project a hand-sourced provider row into an audit.
 ///
 /// A hand row always publishes input, cache-read, and output rates. Cache-write
@@ -1947,20 +1848,130 @@ fn hand_priced_audit(pricing: Option<ModelPricing>, usage: &Usage) -> TurnCostAu
     let Some(pricing) = pricing else {
         return TurnCostAudit::unpriced(UnpricedReason::NoPricingRow);
     };
-    let has_cny = pricing.cny.is_some();
-    match cost_estimate_with_pricing_checked(pricing, usage) {
-        Ok(estimate) => {
-            TurnCostAudit::priced(estimate, PricingProvenance::ProviderDocs, true, has_cny)
-        }
-        Err(classes) => TurnCostAudit::missing_classes(PricingProvenance::ProviderDocs, classes),
+    audit_pricing_pair(
+        currency_offering_pricing(pricing.usd, Currency::Usd),
+        pricing
+            .cny
+            .map(|row| currency_offering_pricing(row, Currency::Cny)),
+        usage,
+    )
+}
+
+fn audit_pricing_pair(
+    primary: OfferingPricing,
+    secondary: Option<OfferingPricing>,
+    usage: &Usage,
+) -> TurnCostAudit {
+    let mut audit = audit_offering_pricing(primary, usage);
+    if audit.estimate.is_none() {
+        return audit;
     }
+    if let Some(secondary) = secondary {
+        let secondary = audit_offering_pricing(secondary, usage);
+        let Some(cost) = secondary.estimate else {
+            return secondary;
+        };
+        audit.estimate.as_mut().expect("priced primary").cny = cost.cny;
+        audit.cny_priced = secondary.cny_priced;
+        audit.exact_cny = secondary.exact_cny;
+    }
+    audit
+}
+
+pub(crate) fn provider_owned_hand_quote_rows(
+    provider: ProviderKind,
+    model: &str,
+    recorded_at: DateTime<Utc>,
+) -> Option<(OfferingPricing, Option<OfferingPricing>)> {
+    let pricing = provider_owned_hand_pricing_at(provider, model, recorded_at)?;
+    let mut primary = currency_offering_pricing(pricing.usd, Currency::Usd);
+    let mut secondary = pricing
+        .cny
+        .map(|row| currency_offering_pricing(row, Currency::Cny));
+    let tier = if provider == ProviderKind::Xai && is_grok_tiered(model) {
+        Some((
+            u64::from(GROK_4_6_LONG_CONTEXT_THRESHOLD),
+            true,
+            grok_tiered_pricing(&model.to_ascii_lowercase(), true)?,
+        ))
+    } else if matches!(
+        provider,
+        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic
+    ) && is_minimax_m3(model)
+    {
+        Some((
+            u64::from(MINIMAX_M3_LONG_CONTEXT_THRESHOLD),
+            false,
+            minimax_m3_standard_pricing(true),
+        ))
+    } else {
+        None
+    };
+    if let Some((size, inclusive, higher)) = tier {
+        primary
+            .context_tiers
+            .push(codewhale_config::models_dev::ModelsDevCostTier {
+                tier: codewhale_config::models_dev::ModelsDevContextTier {
+                    kind: "context".into(),
+                    size,
+                },
+                cost: currency_offering_pricing(higher.usd, Currency::Usd).cost_structure(),
+            });
+        primary.context_tiers_inclusive = inclusive;
+        if let Some(row) = secondary.as_mut()
+            && let Some(higher) = higher.cny
+        {
+            row.context_tiers
+                .push(codewhale_config::models_dev::ModelsDevCostTier {
+                    tier: codewhale_config::models_dev::ModelsDevContextTier {
+                        kind: "context".into(),
+                        size,
+                    },
+                    cost: currency_offering_pricing(higher, Currency::Cny).cost_structure(),
+                });
+            row.context_tiers_inclusive = inclusive;
+        }
+    }
+    for row in std::iter::once(&mut primary).chain(secondary.iter_mut()) {
+        row.provider = provider.as_str().into();
+        row.wire_model_id = model.into();
+        row.source_ref = Some(
+            match provider {
+                ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic => {
+                    "https://api-docs.deepseek.com/quick_start/pricing"
+                }
+                ProviderKind::Xai => "https://docs.x.ai/docs/models",
+                ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => {
+                    "https://platform.minimax.io/docs/guides/pricing-paygo"
+                }
+                ProviderKind::Anthropic => {
+                    "https://platform.claude.com/docs/en/about-claude/pricing"
+                }
+                _ => "codewhale:reviewed-provider-price",
+            }
+            .into(),
+        );
+    }
+    Some((primary, secondary))
+}
+
+fn hand_provider_audit(
+    provider: ProviderKind,
+    model: &str,
+    usage: &Usage,
+    at: DateTime<Utc>,
+) -> TurnCostAudit {
+    provider_owned_hand_quote_rows(provider, model, at).map_or_else(
+        || TurnCostAudit::unpriced(UnpricedReason::NoPricingRow),
+        |(primary, secondary)| audit_pricing_pair(primary, secondary, usage),
+    )
 }
 
 /// Recorded-time variant with explicit billing-surface provenance.
 #[must_use]
 #[cfg(test)]
 pub(crate) fn calculate_turn_cost_estimate_for_route_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
     usage: &Usage,
@@ -1972,7 +1983,7 @@ pub(crate) fn calculate_turn_cost_estimate_for_route_at(
 /// Audit a turn's cost with endpoint-derived billing provenance.
 #[must_use]
 pub(crate) fn audit_turn_cost_for_route_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
     usage: &Usage,
@@ -1992,7 +2003,7 @@ pub(crate) fn audit_turn_cost_for_route_at(
 /// endpoint fingerprint needed to verify live catalog pricing.
 #[must_use]
 pub(crate) fn audit_turn_cost_for_route_on_endpoint_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
     endpoint_fingerprint: Option<&str>,
@@ -2014,7 +2025,7 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_at(
 /// Identity-aware route audit for an immutable dispatch receipt.
 #[must_use]
 pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     model: &str,
     billing_surface: Option<&str>,
@@ -2023,21 +2034,34 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
     usage: &Usage,
     recorded_at: DateTime<Utc>,
 ) -> TurnCostAudit {
-    let declared_pricing = match provider_live_pricing {
-        Some(quote) if quote.provenance == PricingProvenance::UserOverride => {
-            let pricing = provider_identity
+    if matches!(
+        endpoint_metering_for_billing_surface(billing_surface),
+        EndpointMetering::ExactSubscription | EndpointMetering::LocalNoBill
+    ) {
+        return TurnCostAudit::unpriced(UnpricedReason::NotMoneyMetered);
+    }
+
+    let frozen_pricing = match provider_live_pricing {
+        Some(quote) => {
+            let binding = provider_identity
                 .zip(endpoint_fingerprint)
-                .zip(u64::try_from(recorded_at.timestamp()).ok())
-                .and_then(|((identity, fingerprint), at)| {
-                    quote.pricing_for_route(provider, identity, model, fingerprint, at)
-                });
-            let Some(pricing) = pricing else {
+                .zip(u64::try_from(recorded_at.timestamp()).ok());
+            let Some(((identity, fingerprint), at)) = binding else {
                 return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
             };
-            Some(pricing)
+            let Some(pricing) = quote.pricing_for_route(provider, identity, model, fingerprint, at)
+            else {
+                return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
+            };
+            let secondary =
+                quote.secondary_pricing_for_route(provider, identity, model, fingerprint, at);
+            Some((pricing, secondary))
         }
-        _ => None,
+        None => None,
     };
+    let declared = frozen_pricing
+        .as_ref()
+        .is_some_and(|(pricing, _)| pricing.provenance == PricingProvenance::UserOverride);
     let reviewed_custom_metered = reviewed_custom_route_is_metered(provider, endpoint_fingerprint);
     let reviewed_provider_live =
         reviewed_provider_live_route_is_metered(provider, provider_identity, endpoint_fingerprint);
@@ -2049,9 +2073,7 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
             return TurnCostAudit::unpriced(UnpricedReason::NotMoneyMetered);
         }
         EndpointMetering::Unknown
-            if billing_surface.is_some()
-                && !reviewed_custom_metered
-                && declared_pricing.is_none() =>
+            if billing_surface.is_some() && !reviewed_custom_metered && !declared =>
         {
             return TurnCostAudit::unpriced(UnpricedReason::UnknownBillingBasis);
         }
@@ -2060,21 +2082,14 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
     if !usage_cache_partition_is_consistent(usage) {
         return TurnCostAudit::unpriced(UnpricedReason::InconsistentUsage);
     }
-    if let Some(pricing) = declared_pricing {
-        return audit_offering_pricing(pricing, usage);
+    if declared && let Some((pricing, secondary)) = frozen_pricing.clone() {
+        return audit_pricing_pair(pricing, secondary, usage);
     }
-    if provider == ApiProvider::Stepfun {
+    if provider == ProviderKind::Stepfun {
         return match pricing_for_billing_surface(provider, model, billing_surface) {
             // Each model keeps its documented cache-write policy; unpublished
             // write rates fail closed instead of borrowing another model's rate.
-            Some(pricing) => match cost_estimate_with_pricing_checked(pricing, usage) {
-                Ok(estimate) => {
-                    TurnCostAudit::priced(estimate, PricingProvenance::ProviderDocs, true, false)
-                }
-                Err(classes) => {
-                    TurnCostAudit::missing_classes(PricingProvenance::ProviderDocs, classes)
-                }
-            },
+            Some(pricing) => hand_priced_audit(Some(pricing), usage),
             // The surface classified as per-token but no rates exist for it, or
             // no surface was established at all.
             None => TurnCostAudit::unpriced(match billing_surface {
@@ -2099,69 +2114,26 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
     if billing_surface.is_none() {
         return TurnCostAudit::unpriced(UnpricedReason::UnestablishedEndpoint);
     }
-    if reviewed_provider_live {
-        let Some(provider_identity) = provider_identity.map(str::trim).filter(|id| !id.is_empty())
-        else {
-            return TurnCostAudit::unpriced(UnpricedReason::UnknownBillingBasis);
-        };
-        let Some(endpoint_fingerprint) = endpoint_fingerprint else {
-            return TurnCostAudit::unpriced(UnpricedReason::UnknownBillingBasis);
-        };
-        let Some(dispatched_at_unix) = u64::try_from(recorded_at.timestamp()).ok() else {
-            return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
-        };
-        let pricing = match provider_live_pricing {
-            Some(quote) => {
-                let Some(pricing) = quote.pricing_for_route(
-                    provider,
-                    provider_identity,
-                    model,
-                    endpoint_fingerprint,
-                    dispatched_at_unix,
-                ) else {
-                    return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
-                };
-                pricing
-            }
-            None if provider == ApiProvider::Openrouter => {
-                // An offline/startup OpenRouter dispatch has no mutable live
-                // quote to freeze. Audit it only against the immutable bundled
-                // snapshot (and provider-owned hand rows, if one is added), so
-                // a refresh that lands after dispatch cannot retro-price it.
-                return audit_openrouter_immutable_pricing(model, usage, recorded_at);
-            }
-            None => {
-                // Baseten has no reviewed immutable price card. Its compatible
-                // custom route therefore requires the exact frozen live quote.
-                return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
-            }
-        };
-        return audit_offering_pricing(pricing, usage);
+    if let Some((pricing, secondary)) = frozen_pricing {
+        return audit_pricing_pair(pricing, secondary, usage);
     }
-    if provider == ApiProvider::Openrouter && provider_identity.is_some() {
+    if reviewed_provider_live {
+        return if provider == ProviderKind::Openrouter {
+            audit_openrouter_immutable_pricing(model, usage, recorded_at)
+        } else {
+            TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing)
+        };
+    }
+
+    if provider == ProviderKind::Openrouter && provider_identity.is_some() {
         // A persisted built-in OpenRouter receipt that is missing the exact
         // official identity/endpoint binding (or its frozen quote) must not
         // fall through to the mutable process-wide provider lake.
         return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
     }
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         return TurnCostAudit::unpriced(UnpricedReason::UnknownBillingBasis);
     }
-    let frozen_cloud_pricing = match provider_live_pricing {
-        Some(quote) if quote.provenance == PricingProvenance::CloudFacts => {
-            let pricing = provider_identity
-                .zip(endpoint_fingerprint)
-                .zip(u64::try_from(recorded_at.timestamp()).ok())
-                .and_then(|((identity, fingerprint), dispatched)| {
-                    quote.pricing_for_route(provider, identity, model, fingerprint, dispatched)
-                });
-            let Some(pricing) = pricing else {
-                return TurnCostAudit::unpriced(UnpricedReason::UnverifiedLivePricing);
-            };
-            Some(pricing)
-        }
-        _ => None,
-    };
     audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         provider,
         provider_identity,
@@ -2170,20 +2142,41 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
         usage,
         recorded_at,
         false,
-        frozen_cloud_pricing,
+        None,
     )
 }
 
 fn audit_offering_pricing(pricing: OfferingPricing, usage: &Usage) -> TurnCostAudit {
-    let classes = token_usage_for_pricing(usage);
-    let unpriced = pricing.unpriced_used_classes(&classes);
-    if !unpriced.is_empty() {
-        return TurnCostAudit::missing_classes(pricing.provenance, unpriced);
+    if pricing.rate_withheld {
+        return TurnCostAudit::unpriced(UnpricedReason::NoPricingRow);
     }
-    let Some(amount) = pricing.estimate_cost(&classes) else {
+    let classes = token_usage_for_pricing(usage);
+    let quote = match pricing.quote_cost(&classes) {
+        Ok(quote) => quote,
+        Err(PricingQuoteError::MissingRate(class)) => {
+            let mut missing = pricing.unpriced_used_classes(&classes);
+            if !missing.contains(&class) {
+                missing.push(class);
+            }
+            return TurnCostAudit::missing_classes(pricing.provenance, missing);
+        }
+        Err(PricingQuoteError::MissingUsage(_)) => {
+            return TurnCostAudit::unpriced(UnpricedReason::MissingUsageBreakdown);
+        }
+        Err(PricingQuoteError::UnsupportedTier) => {
+            return TurnCostAudit::unpriced(UnpricedReason::UnrepresentedTier);
+        }
+        Err(PricingQuoteError::InvalidUsage) => {
+            return TurnCostAudit::unpriced(UnpricedReason::InconsistentUsage);
+        }
+        Err(PricingQuoteError::InvalidRate) => {
+            return TurnCostAudit::unpriced(UnpricedReason::InvalidPricingRow);
+        }
+    };
+    let Ok(amount) = quote.amount.parse::<f64>() else {
         return TurnCostAudit::unpriced(UnpricedReason::InvalidPricingRow);
     };
-    let (estimate, usd, cny) = match pricing.currency {
+    let (estimate, usd, cny) = match quote.currency {
         Currency::Usd => (CostEstimate::usd_only(amount), true, false),
         Currency::Cny => (
             CostEstimate {
@@ -2195,7 +2188,13 @@ fn audit_offering_pricing(pricing: OfferingPricing, usage: &Usage) -> TurnCostAu
         ),
         Currency::Other(_) => return TurnCostAudit::unpriced(UnpricedReason::UnsupportedCurrency),
     };
-    TurnCostAudit::priced(estimate, pricing.provenance, usd, cny)
+    let mut audit = TurnCostAudit::priced(estimate, pricing.provenance, usd, cny);
+    if usd {
+        audit.exact_usd = Some(quote.amount);
+    } else {
+        audit.exact_cny = Some(quote.amount);
+    }
+    audit
 }
 
 /// Price an exact official OpenRouter route without consulting mutable live
@@ -2206,49 +2205,24 @@ fn audit_openrouter_immutable_pricing(
     usage: &Usage,
     recorded_at: DateTime<Utc>,
 ) -> TurnCostAudit {
-    let Some(canonical_model) = canonical_model_id_for_provider(ApiProvider::Openrouter, model)
+    let Some(canonical_model) = canonical_model_id_for_provider(ProviderKind::Openrouter, model)
     else {
         return TurnCostAudit::unpriced(UnpricedReason::NoPricingRow);
     };
-    let classes = token_usage_for_pricing(usage);
     if let Some(offering) = crate::provider_lake::bundled_catalog_offering_for_model(
-        ApiProvider::Openrouter,
+        ProviderKind::Openrouter,
         &canonical_model,
     ) {
-        if let Some(audit) = invalid_catalog_pricing_audit(&offering) {
+        if let Some(audit) = refused_catalog_pricing_audit(&offering, usage) {
             return audit;
         }
-        if let Some(pricing) = effective_offering_pricing(
-            ApiProvider::Openrouter,
-            &canonical_model,
-            &offering,
-            &classes,
-        ) {
-            let unpriced_classes = pricing.unpriced_used_classes(&classes);
-            if !unpriced_classes.is_empty() {
-                return TurnCostAudit::missing_classes(pricing.provenance, unpriced_classes);
-            }
-            let Some(estimate) = catalog_cost_estimate_for_route(
-                ApiProvider::Openrouter,
-                &canonical_model,
-                &offering,
-                usage,
-            ) else {
-                return TurnCostAudit::unpriced(UnpricedReason::UnsupportedCurrency);
-            };
-            let (usd_priced, cny_priced) = match pricing.currency {
-                Currency::Usd => (true, false),
-                Currency::Cny => (false, true),
-                Currency::Other(_) => {
-                    return TurnCostAudit::unpriced(UnpricedReason::UnsupportedCurrency);
-                }
-            };
-            return TurnCostAudit::priced(estimate, pricing.provenance, usd_priced, cny_priced);
+        if let Some(pricing) = OfferingPricing::from_catalog_offering(&offering) {
+            return audit_offering_pricing(pricing, usage);
         }
     }
 
     hand_priced_audit(
-        provider_owned_hand_pricing_at(ApiProvider::Openrouter, &canonical_model, recorded_at),
+        provider_owned_hand_pricing_at(ProviderKind::Openrouter, &canonical_model, recorded_at),
         usage,
     )
 }
@@ -2262,10 +2236,10 @@ fn audit_openrouter_immutable_pricing(
 /// never mints metering.
 #[must_use]
 pub(crate) fn reviewed_custom_route_is_metered(
-    provider: ApiProvider,
+    provider: ProviderKind,
     endpoint_fingerprint: Option<&str>,
 ) -> bool {
-    if provider != ApiProvider::Custom {
+    if provider != ProviderKind::Custom {
         return false;
     }
     endpoint_fingerprint.is_some_and(|fingerprint| {
@@ -2285,13 +2259,13 @@ pub(crate) fn reviewed_custom_route_is_metered(
 /// fingerprint and retain their exact, case-sensitive cache ownership.
 #[must_use]
 fn reviewed_provider_live_route_is_metered(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     endpoint_fingerprint: Option<&str>,
 ) -> bool {
     match provider {
-        ApiProvider::Openrouter => {
-            provider_identity.map(str::trim) == Some(ApiProvider::Openrouter.as_str())
+        ProviderKind::Openrouter => {
+            provider_identity.map(str::trim) == Some(ProviderKind::Openrouter.as_str())
                 && endpoint_fingerprint.is_some_and(|fingerprint| {
                     fingerprint
                         == codewhale_config::catalog::base_url_fingerprint(
@@ -2299,7 +2273,7 @@ fn reviewed_provider_live_route_is_metered(
                         )
                 })
         }
-        ApiProvider::Custom => reviewed_custom_route_is_metered(provider, endpoint_fingerprint),
+        ProviderKind::Custom => reviewed_custom_route_is_metered(provider, endpoint_fingerprint),
         _ => false,
     }
 }
@@ -2322,7 +2296,7 @@ fn reviewed_provider_live_route_is_metered(
 #[must_use]
 #[cfg(test)]
 pub fn audit_turn_cost_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
     usage: &Usage,
@@ -2345,7 +2319,7 @@ pub fn audit_turn_cost_for_route(
 #[must_use]
 #[cfg(test)]
 pub fn audit_turn_cost_for_route_on_endpoint(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     billing_surface: Option<&str>,
     endpoint_fingerprint: Option<&str>,
@@ -2388,31 +2362,34 @@ pub fn audit_turn_cost_for_route_on_endpoint(
 }
 
 fn provider_owned_hand_pricing_at(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     recorded_at: DateTime<Utc>,
 ) -> Option<ModelPricing> {
     let model_lower = model.trim().to_ascii_lowercase();
     // Hosted Fireworks / OpenCode Zen rates are provider-owned docs rows, not
     // first-party DeepSeek's $0.0028 cache-hit card and not Models.dev.
-    if provider == ApiProvider::Fireworks {
+    if provider == ProviderKind::Fireworks {
         return fireworks_bundled_fallback_pricing(&model_lower);
     }
-    if provider == ApiProvider::OpencodeZen {
+    if provider == ProviderKind::OpencodeZen {
         return opencode_zen_bundled_fallback_pricing(&model_lower);
     }
     let provider_owns_row = match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic => {
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic => {
             // `deepseek-flash` is V4.1 Flash on the first-party API. Only the
             // first-party family gains it: third-party hosts below keep their
             // own published tables and must not be assumed to serve a model
             // just because DeepSeek does.
             matches!(
                 model_lower.as_str(),
-                "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash"
+                "deepseek-v4-pro"
+                    | "deepseek-v4-flash"
+                    | "deepseek-v4-flash-vision-exp"
+                    | "deepseek-flash"
             )
         }
-        ApiProvider::Openai => matches!(
+        ProviderKind::Openai => matches!(
             model_lower.as_str(),
             "gpt-5-codex"
                 | "gpt-5.3-codex"
@@ -2422,8 +2399,11 @@ fn provider_owned_hand_pricing_at(
                 | "gpt-5.6-sol"
                 | "gpt-5.6-terra"
                 | "gpt-5.6-luna"
+                | "gpt-6-sol"
+                | "gpt-6.1-sol"
+                | "gpt-6-luna"
         ),
-        ApiProvider::Anthropic => matches!(
+        ProviderKind::Anthropic => matches!(
             model_lower.as_str(),
             "claude-opus-4-8"
                 | "claude-sonnet-4-6"
@@ -2431,28 +2411,31 @@ fn provider_owned_hand_pricing_at(
                 | "claude-fable-5"
                 | "claude-sonnet-5"
                 | "claude-opus-5"
+                | "claude-opus-5-5"
+                | "claude-sonnet-5-5"
+                | "claude-fable-5-1"
         ),
-        ApiProvider::Xai => is_grok_tiered(&model_lower),
+        ProviderKind::Xai => is_grok_tiered(&model_lower),
         // GLM-5.3 is deliberately absent: this allowlist declares that Z.ai
         // owns a *hand-written price row* for the model, and no GLM-5.3 rate
         // has been published. An absent price is honest; an owned-but-empty
         // row is not. See `glm_5_3_has_no_hardcoded_price` below.
         // GLM-5.3-Flash *does* have a published USD list (2026-08-26).
-        ApiProvider::Zai => matches!(
+        ProviderKind::Zai => matches!(
             model_lower.as_str(),
             "glm-5.1" | "glm-5.2" | "glm-5.3-flash" | "glm-5-turbo"
         ),
         // `k3` (Kimi Code membership) is deliberately absent: it is quota
         // billed and must never inherit the direct-platform kimi-k3 rate.
-        ApiProvider::Moonshot => matches!(
+        ProviderKind::Moonshot => matches!(
             model_lower.as_str(),
             "kimi-k2.6" | "kimi-k2.7-code" | "kimi-k2.7-code-highspeed" | "kimi-k3"
         ),
-        ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => matches!(
+        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => matches!(
             model_lower.as_str(),
             "minimax-m3" | "minimax-m2.7" | "minimax-m2.7-highspeed"
         ),
-        ApiProvider::Mistral => matches!(
+        ProviderKind::Mistral => matches!(
             model_lower.as_str(),
             "mistral-medium-latest"
                 | "mistral-medium-3-5"
@@ -2466,26 +2449,30 @@ fn provider_owned_hand_pricing_at(
                 | "codestral-latest"
                 | "codestral"
         ),
-        ApiProvider::Arcee => model_lower == "trinity-large-thinking",
-        // 1.2 and its contributor tier own hand-written rows the same way 1.1
-        // does (see `pricing_for_model_at`). 1.2 is now `DEFAULT_META_MODEL`,
-        // so omitting them here left the default Meta route without a
+        ProviderKind::Arcee => model_lower == "trinity-large-thinking",
+        // Every Muse tier owns a hand-written row the same way 1.1 does (see
+        // `pricing_for_model_at`), so `DEFAULT_META_MODEL` (1.3) always has a
         // provider-owned fallback row.
-        ApiProvider::Meta => matches!(
+        ProviderKind::Meta => matches!(
             model_lower.as_str(),
-            "muse-spark-1.1" | "muse-spark-1.2" | "muse-spark-1.2-contributor"
+            "muse-spark-1.1"
+                | "muse-spark-1.2"
+                | "muse-spark-1.2-contributor"
+                | "muse-spark-1.3"
+                | "muse-spark-1.3-contributor"
+                | "muse-wonder-1.0"
         ),
         // Deployment-style ids (Fireworks account prefix, OpenCode Zen
         // gateway) have no Models.dev cost fields. When the live control
         // plane 503s, these bundled family rates keep the session priced
         // instead of `unverified_live_pricing` forever (#5241).
-        ApiProvider::Fireworks => {
+        ProviderKind::Fireworks => {
             let bare = model_lower
                 .strip_prefix("accounts/fireworks/models/")
                 .unwrap_or(model_lower.as_str());
             matches!(bare, "deepseek-v4-flash" | "deepseek-v4-pro")
         }
-        ApiProvider::OpencodeZen => {
+        ProviderKind::OpencodeZen => {
             matches!(
                 model_lower.as_str(),
                 "deepseek-v4-flash" | "deepseek-v4-pro"
@@ -2493,7 +2480,7 @@ fn provider_owned_hand_pricing_at(
         }
         _ => false,
     };
-    let lookup = if provider == ApiProvider::Fireworks {
+    let lookup = if provider == ProviderKind::Fireworks {
         model_lower
             .strip_prefix("accounts/fireworks/models/")
             .unwrap_or(model_lower.as_str())
@@ -2513,7 +2500,7 @@ fn provider_owned_hand_pricing_at(
 /// DeepSeek's $0.0028 cache-hit card — Fireworks publishes $0.028.
 fn fireworks_bundled_fallback_pricing(model_lower: &str) -> Option<ModelPricing> {
     match fireworks_deployment_id(model_lower) {
-        "deepseek-v4-flash" | "deepseek-v4-flash-0731" => {
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-0731" => {
             Some(hosted_deepseek_v4_flash_standard_pricing())
         }
         "deepseek-v4-pro" => Some(hosted_deepseek_v4_pro_standard_pricing()),
@@ -2558,7 +2545,7 @@ fn hosted_deepseek_v4_pro_standard_pricing() -> ModelPricing {
 /// cache tokens are billed at the plain input rate; that substitution happens
 /// here so cost estimation and the unpriced-class audit read the same row.
 fn effective_offering_pricing(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     offering: &codewhale_config::catalog::CatalogOffering,
     classes: &TokenUsage,
@@ -2567,7 +2554,7 @@ fn effective_offering_pricing(
     let model_lower = model.trim().to_ascii_lowercase();
     let cache_uses_input_rate = matches!(
         (provider, model_lower.as_str()),
-        (ApiProvider::Openai, "gpt-5.5-pro") | (ApiProvider::Arcee, "trinity-large-thinking")
+        (ProviderKind::Openai, "gpt-5.5-pro") | (ProviderKind::Arcee, "trinity-large-thinking")
     );
     if cache_uses_input_rate {
         if classes.cache_read > 0 && pricing.cache_read_per_million.is_none() {
@@ -2576,6 +2563,14 @@ fn effective_offering_pricing(
         if classes.cache_write > 0 && pricing.cache_write_per_million.is_none() {
             pricing.cache_write_per_million = pricing.input_per_million;
         }
+        for tier in &mut pricing.context_tiers {
+            if classes.cache_read > 0 && tier.cost.cache_read.is_none() {
+                tier.cost.cache_read = tier.cost.input;
+            }
+            if classes.cache_write > 0 && tier.cost.cache_write.is_none() {
+                tier.cost.cache_write = tier.cost.input;
+            }
+        }
     }
     Some(pricing)
 }
@@ -2583,8 +2578,9 @@ fn effective_offering_pricing(
 /// Estimate usage only from the exact provider offering. Missing prices for a
 /// used token class fail closed, except on the two documented first-party
 /// routes where cache tokens are explicitly billed at the input rate.
+#[cfg(test)]
 fn catalog_cost_estimate_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     offering: &codewhale_config::catalog::CatalogOffering,
     usage: &Usage,
@@ -2617,10 +2613,29 @@ fn catalog_cost_estimate_for_route(
 /// `reasoning_tokens` under `output_tokens_details` while `output_tokens` is
 /// the total, and Chat Completions nests it under `completion_tokens_details`
 /// while `completion_tokens` is the total. Adding it charged reasoning turns
-/// twice for the same tokens (up to 2x on reasoning-heavy turns). It stays on
-/// `Usage` as informational telemetry (`/usage`, hooks, sub-agent metadata).
+/// twice for the same tokens (up to 2x on reasoning-heavy turns). It uses
+/// its own class when a rate is published, replacing that subset of output.
 #[must_use]
 pub fn token_usage_for_pricing(usage: &Usage) -> TokenUsage {
+    let mut classes = request_token_usage_for_pricing(usage);
+    classes.request_usages = usage
+        .request_usages
+        .iter()
+        .take(1025)
+        .map(|request| {
+            let mut classes = request_token_usage_for_pricing(request);
+            if !request.request_usages.is_empty() {
+                classes
+                    .request_usages
+                    .push(request_token_usage_for_pricing(request));
+            }
+            classes
+        })
+        .collect();
+    classes
+}
+
+fn request_token_usage_for_pricing(usage: &Usage) -> TokenUsage {
     // `input_tokens` is the authoritative total. Even malformed provider
     // telemetry must never produce token classes whose sum exceeds it. The
     // audit path rejects contradictory partitions; this bounded projection
@@ -2639,12 +2654,31 @@ pub fn token_usage_for_pricing(usage: &Usage) -> TokenUsage {
     let input = non_cached_reported.saturating_add(uncategorized_input);
     // Reasoning tokens are already inside `output_tokens`; see the doc comment.
     let output = usage.output_tokens;
+    // Subset telemetry is clamped like the cache partition above: malformed
+    // provider counts that exceed their parent total must never fail the
+    // whole estimate closed or double-count.
+    let reasoning = usage
+        .reasoning_tokens
+        .map(|tokens| u64::from(tokens.min(output)));
+    let output_audio = usage.output_audio_tokens.map(|tokens| {
+        let remaining = u64::from(output).saturating_sub(reasoning.unwrap_or(0));
+        u64::from(tokens).min(remaining)
+    });
+    let input_audio = usage
+        .input_audio_tokens
+        .map(|tokens| u64::from(tokens).min(u64::from(input)));
 
     TokenUsage {
         input: u64::from(input),
         output: u64::from(output),
         cache_read: u64::from(cache_read),
         cache_write: u64::from(cache_write),
+
+        reasoning,
+        input_audio,
+        output_audio,
+
+        request_usages: Vec::new(),
     }
 }
 
@@ -2655,20 +2689,18 @@ fn usage_cache_partition_is_consistent(usage: &Usage) -> bool {
     reported <= u64::from(usage.input_tokens)
 }
 
-fn calculate_turn_cost_from_usage_with_pricing(pricing: CurrencyPricing, usage: &Usage) -> f64 {
-    let usage = token_usage_for_pricing(usage);
-    let hit_cost = (usage.cache_read as f64 / 1_000_000.0) * pricing.input_cache_hit_per_million;
-    let miss_cost = (usage.input as f64 / 1_000_000.0) * pricing.input_cache_miss_per_million;
-    // An unpublished write policy is only reachable here for usage with zero
-    // cache-write tokens; `cost_estimate_with_pricing_checked` rejects the rest
-    // before any money is computed.
-    let write_rate = pricing
-        .cache_write
-        .rate(pricing.input_cache_miss_per_million)
-        .unwrap_or(0.0);
-    let write_cost = (usage.cache_write as f64 / 1_000_000.0) * write_rate;
-    let output_cost = (usage.output as f64 / 1_000_000.0) * pricing.output_per_million;
-    hit_cost + miss_cost + write_cost + output_cost
+fn currency_offering_pricing(pricing: CurrencyPricing, currency: Currency) -> OfferingPricing {
+    OfferingPricing {
+        currency,
+        input_per_million: Some(pricing.input_cache_miss_per_million),
+        output_per_million: Some(pricing.output_per_million),
+        cache_read_per_million: Some(pricing.input_cache_hit_per_million),
+        cache_write_per_million: pricing
+            .cache_write
+            .rate(pricing.input_cache_miss_per_million),
+        provenance: PricingProvenance::ProviderDocs,
+        ..Default::default()
+    }
 }
 
 /// Estimate how much money was saved by serving `cache_hit_tokens` from the
@@ -2708,7 +2740,7 @@ pub fn calculate_cache_savings(model: &str, cache_hit_tokens: u32) -> Option<Cos
 /// quoting a rate the session is not actually billed at.
 #[must_use]
 pub(crate) fn model_rate_label(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     currency: CostCurrency,
 ) -> Option<String> {
@@ -2742,19 +2774,6 @@ pub fn format_cost_amount(cost: f64, currency: CostCurrency) -> String {
     }
 }
 
-/// Format a cost amount for detailed reports in the chosen currency.
-#[must_use]
-pub fn format_cost_amount_precise(cost: f64, currency: CostCurrency) -> String {
-    let symbol = currency.symbol();
-    if cost == 0.0 {
-        format!("{symbol}0.0000")
-    } else if cost > 0.0 && cost < 0.0001 {
-        format!("<{symbol}0.0001")
-    } else {
-        format!("{symbol}{cost:.4}")
-    }
-}
-
 /// Format a dual-currency estimate using the selected display currency.
 #[must_use]
 pub fn format_cost_estimate(estimate: CostEstimate, currency: CostCurrency) -> String {
@@ -2768,7 +2787,6 @@ mod default_coverage_tests;
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::collections::BTreeMap;
 
     #[test]
     fn malformed_catalog_row_has_an_explicit_runtime_reason() {
@@ -2780,11 +2798,12 @@ mod tests {
                 output: Some(30.0),
                 cache_read: Some(0.05),
                 cache_write: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
 
-        let audit = invalid_catalog_pricing_audit(&offering)
+        let audit = refused_catalog_pricing_audit(&offering, &Usage::default())
             .expect("malformed row must become an explicit failed-closed audit");
         assert!(!audit.is_priced());
         assert_eq!(
@@ -2828,7 +2847,7 @@ mod tests {
             CacheWritePolicy::DocumentedAsInputRate(DEEPSEEK_CACHE_WRITE_IS_FREE)
         );
         let priced = audit_turn_cost_for_provider_at(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
             &write_heavy,
             now,
@@ -2845,14 +2864,14 @@ mod tests {
         // turn is unpriced and names the class instead of borrowing the input
         // rate.
         let stepfun = pricing_for_billing_surface(
-            ApiProvider::Stepfun,
+            ProviderKind::Stepfun,
             DEFAULT_STEPFUN_MODEL,
             Some(STEPFUN_PAYG_BILLING_SURFACE),
         )
         .expect("StepFun PAYG row");
         assert_eq!(stepfun.usd.cache_write, CacheWritePolicy::Unpublished);
         let failed = audit_turn_cost_for_route_at(
-            ApiProvider::Stepfun,
+            ProviderKind::Stepfun,
             DEFAULT_STEPFUN_MODEL,
             Some(STEPFUN_PAYG_BILLING_SURFACE),
             &write_heavy,
@@ -2873,7 +2892,7 @@ mod tests {
         };
         assert!(
             audit_turn_cost_for_route_at(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 DEFAULT_STEPFUN_MODEL,
                 Some(STEPFUN_PAYG_BILLING_SURFACE),
                 &no_write,
@@ -2887,70 +2906,109 @@ mod tests {
     /// anything unrecognized must fail closed as unknown rather than defaulting
     /// into per-token dollars (#4318).
     #[test]
+    fn official_chatgpt_api_requires_the_exact_secure_base() {
+        for endpoint in ["https://api.openai.com/v1", "https://api.openai.com/v1/"] {
+            assert!(is_official_chatgpt_api(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "http://api.openai.com/v1",
+            "https://api.openai.com:444/v1",
+            "https://api.openai.com.example.net/v1",
+            "https://api.openai.com/v1/responses",
+            "https://api.openai.com/v1?route=plan",
+            "https://api.openai.com/v1#plan",
+            "https://user:secret@api.openai.com/v1",
+            "https://chatgpt.com/backend-api",
+            "",
+        ] {
+            assert!(!is_official_chatgpt_api(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn public_chatgpt_endpoint_does_not_prove_a_plan_without_grant_provenance() {
+        assert_eq!(
+            billing_surface_for_route(ProviderKind::OpenaiCodex, Some("https://api.openai.com/v1")),
+            Some(UNCLASSIFIED_BILLING_SURFACE)
+        );
+        assert_eq!(
+            billing_surface_for_route(ProviderKind::Openai, Some("https://api.openai.com/v1")),
+            Some(FIRST_PARTY_PAYG_BILLING_SURFACE)
+        );
+        assert_eq!(
+            billing_surface_for_route(
+                ProviderKind::OpenaiCodex,
+                Some("https://chatgpt.com/backend-api/codex")
+            ),
+            Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE)
+        );
+    }
+
+    #[test]
     fn endpoint_classification_covers_every_exact_billing_surface() {
         for (provider, base_url, expected_surface, expected_metering) in [
             (
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "https://api.z.ai/api/coding/paas/v4",
                 ZAI_CODING_PLAN_BILLING_SURFACE,
                 EndpointMetering::ExactSubscription,
             ),
             (
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "https://api.z.ai/api/paas/v4",
                 ZAI_PAYG_BILLING_SURFACE,
                 EndpointMetering::Money,
             ),
             (
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 MOONSHOT_KIMI_CODE_BILLING_SURFACE,
                 EndpointMetering::ExactSubscription,
             ),
             (
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "https://api.moonshot.ai/v1",
                 MOONSHOT_PAYG_BILLING_SURFACE,
                 EndpointMetering::Money,
             ),
             (
-                ApiProvider::XiaomiMimo,
+                ProviderKind::XiaomiMimo,
                 crate::config::XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL,
                 XIAOMI_PAYG_BILLING_SURFACE,
                 EndpointMetering::Money,
             ),
             (
-                ApiProvider::XiaomiMimo,
+                ProviderKind::XiaomiMimo,
                 crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL,
                 XIAOMI_TOKEN_PLAN_BILLING_SURFACE,
                 EndpointMetering::ExactSubscription,
             ),
             (
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 "https://api.stepfun.ai/step_plan/v1",
                 STEPFUN_PLAN_BILLING_SURFACE,
                 EndpointMetering::ExactSubscription,
             ),
             (
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 "https://api.stepfun.ai/v1",
                 STEPFUN_PAYG_BILLING_SURFACE,
                 EndpointMetering::Money,
             ),
             (
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "https://api.anthropic.com/v1",
                 FIRST_PARTY_PAYG_BILLING_SURFACE,
                 EndpointMetering::Money,
             ),
             (
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "https://openrouter.ai/api/v1",
                 AGGREGATOR_BILLING_SURFACE,
                 EndpointMetering::Money,
             ),
             (
-                ApiProvider::Orcarouter,
+                ProviderKind::Orcarouter,
                 "https://api.orcarouter.ai/v1",
                 AGGREGATOR_BILLING_SURFACE,
                 EndpointMetering::Money,
@@ -2968,33 +3026,33 @@ mod tests {
         // Provider-intrinsic surfaces need no URL at all.
         for (provider, expected_surface, expected_metering) in [
             (
-                ApiProvider::OpenaiCodex,
-                OAUTH_SUBSCRIPTION_BILLING_SURFACE,
-                EndpointMetering::ExactSubscription,
-            ),
-            (
-                ApiProvider::OpencodeGo,
-                OAUTH_SUBSCRIPTION_BILLING_SURFACE,
-                EndpointMetering::ExactSubscription,
-            ),
-            (
-                ApiProvider::Ollama,
-                LOCAL_BILLING_SURFACE,
-                EndpointMetering::LocalNoBill,
-            ),
-            (
-                ApiProvider::OllamaCloud,
+                ProviderKind::OpenaiCodex,
                 UNCLASSIFIED_BILLING_SURFACE,
                 EndpointMetering::Unknown,
             ),
             (
-                ApiProvider::Vllm,
+                ProviderKind::OpencodeGo,
+                OAUTH_SUBSCRIPTION_BILLING_SURFACE,
+                EndpointMetering::ExactSubscription,
+            ),
+            (
+                ProviderKind::Ollama,
+                LOCAL_BILLING_SURFACE,
+                EndpointMetering::LocalNoBill,
+            ),
+            (
+                ProviderKind::OllamaCloud,
+                UNCLASSIFIED_BILLING_SURFACE,
+                EndpointMetering::Unknown,
+            ),
+            (
+                ProviderKind::Vllm,
                 LOCAL_BILLING_SURFACE,
                 EndpointMetering::LocalNoBill,
             ),
             // A named custom endpoint's pay mode is config, not URL shape.
             (
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 UNCLASSIFIED_BILLING_SURFACE,
                 EndpointMetering::Unknown,
             ),
@@ -3043,11 +3101,11 @@ mod tests {
         };
         let now = Utc::now();
         for (provider, model) in [
-            (ApiProvider::Openai, "gpt-5.5"),
-            (ApiProvider::Anthropic, "claude-haiku-4-5"),
-            (ApiProvider::Deepseek, "deepseek-v4-flash"),
-            (ApiProvider::Openrouter, "openai/gpt-5.5"),
-            (ApiProvider::Moonshot, "kimi-k2.7-code"),
+            (ProviderKind::Openai, "gpt-5.5"),
+            (ProviderKind::Anthropic, "claude-haiku-4-5"),
+            (ProviderKind::Deepseek, "deepseek-v4-flash"),
+            (ProviderKind::Openrouter, "openai/gpt-5.5"),
+            (ProviderKind::Moonshot, "kimi-k2.7-code"),
         ] {
             let audit = audit_turn_cost_for_route_at(provider, model, None, &usage, now);
             assert_eq!(
@@ -3069,13 +3127,13 @@ mod tests {
             // normally: this is a fail-closed rule, not a refusal to price.
             // (OpenRouter is excluded here only because its aggregator surface
             // carries no bundled rate at all, which is a different gap.)
-            if provider == ApiProvider::Openrouter {
+            if provider == ProviderKind::Openrouter {
                 continue;
             }
             let classified = audit_turn_cost_for_route_at(
                 provider,
                 model,
-                billing_surface_for_route(provider, Some(provider.default_base_url())),
+                billing_surface_for_route(provider, Some(provider.provider().default_base_url())),
                 &usage,
                 now,
             );
@@ -3089,9 +3147,9 @@ mod tests {
         // "endpoint offered but unplaceable" are different findings, and
         // neither is a price.
         let unplaceable = audit_turn_cost_for_route_at(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "gpt-5.5",
-            billing_surface_for_route(ApiProvider::Openai, Some("https://proxy.example/v1")),
+            billing_surface_for_route(ProviderKind::Openai, Some("https://proxy.example/v1")),
             &usage,
             now,
         );
@@ -3109,10 +3167,10 @@ mod tests {
             ..Usage::default()
         };
         for (provider, model) in [
-            (ApiProvider::Deepseek, "deepseek-v4-flash"),
-            (ApiProvider::Openai, "gpt-5.5"),
-            (ApiProvider::Anthropic, "claude-haiku-4-5"),
-            (ApiProvider::Openrouter, "openai/gpt-5.5"),
+            (ProviderKind::Deepseek, "deepseek-v4-flash"),
+            (ProviderKind::Openai, "gpt-5.5"),
+            (ProviderKind::Anthropic, "claude-haiku-4-5"),
+            (ProviderKind::Openrouter, "openai/gpt-5.5"),
         ] {
             let surface = billing_surface_for_route(provider, Some("https://proxy.example/v1"));
             assert_eq!(surface, Some(UNCLASSIFIED_BILLING_SURFACE), "{provider:?}");
@@ -3127,24 +3185,27 @@ mod tests {
 
         assert_eq!(
             billing_surface_for_route(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL)
             ),
             Some(MOONSHOT_KIMI_CODE_BILLING_SURFACE)
         );
         for (provider, endpoint) in [
-            (ApiProvider::Minimax, "https://api.minimax.io/v1"),
+            (ProviderKind::Minimax, "https://api.minimax.io/v1"),
             (
-                ApiProvider::MinimaxAnthropic,
+                ProviderKind::MinimaxAnthropic,
                 "https://api.minimax.io/anthropic",
             ),
-            (ApiProvider::Minimax, "https://api.minimax.io/v1/token-plan"),
             (
-                ApiProvider::XiaomiMimo,
+                ProviderKind::Minimax,
+                "https://api.minimax.io/v1/token-plan",
+            ),
+            (
+                ProviderKind::XiaomiMimo,
                 "https://token-plan-proxy.example/v1",
             ),
             (
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "https://api.z.ai/api/coding/something-else",
             ),
         ] {
@@ -3167,7 +3228,7 @@ mod tests {
             ..Usage::default()
         };
         let audit = audit_turn_cost_for_route(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             "glm-5.2",
             Some(ZAI_CODING_PLAN_BILLING_SURFACE),
             &usage,
@@ -3181,7 +3242,7 @@ mod tests {
         // The same model on the per-token surface is money-metered, so it stays
         // in the coverage denominator whether or not a price is found.
         let payg = audit_turn_cost_for_route(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             "glm-5.2",
             Some(ZAI_PAYG_BILLING_SURFACE),
             &usage,
@@ -3202,7 +3263,7 @@ mod tests {
             ..Usage::default()
         };
         let unknown = audit_turn_cost_for_route(
-            ApiProvider::Anthropic,
+            ProviderKind::Anthropic,
             "claude-haiku-4-5",
             None,
             &usage,
@@ -3222,7 +3283,7 @@ mod tests {
             crate::route_billing::BillingPresentation::Subscription("plan"),
         ] {
             let audit = audit_turn_cost_for_route(
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "claude-haiku-4-5",
                 None,
                 &usage,
@@ -3246,7 +3307,7 @@ mod tests {
 
         // Anthropic publishes a cache-write rate: fully priced, provenance kept.
         let priced = audit_turn_cost_for_provider_at(
-            ApiProvider::Anthropic,
+            ProviderKind::Anthropic,
             "claude-haiku-4-5",
             &write_heavy,
             Utc::now(),
@@ -3258,7 +3319,7 @@ mod tests {
 
         // Moonshot does not: the turn fails closed and names the class.
         let missing = audit_turn_cost_for_provider_at(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-k2.7-code",
             &write_heavy,
             Utc::now(),
@@ -3277,7 +3338,7 @@ mod tests {
         };
         assert!(
             audit_turn_cost_for_provider_at(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "kimi-k2.7-code",
                 &no_write,
                 Utc::now(),
@@ -3289,17 +3350,17 @@ mod tests {
         // reasons rather than an absent price.
         assert_eq!(
             audit_turn_cost_for_provider_at(
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 "gpt-5.5",
                 &write_heavy,
                 Utc::now(),
             )
             .unpriced_reason,
-            Some(UnpricedReason::NotMoneyMetered)
+            Some(UnpricedReason::AmbiguousBillingSurface)
         );
         assert_eq!(
             audit_turn_cost_for_route_at(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 DEFAULT_STEPFUN_MODEL,
                 None,
                 &write_heavy,
@@ -3310,7 +3371,7 @@ mod tests {
         );
         assert_eq!(
             audit_turn_cost_for_provider_at(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "gpt-5.5",
                 &Usage {
                     input_tokens: OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
@@ -3336,14 +3397,14 @@ mod tests {
         };
         let now = Utc::now();
         for (provider, model) in [
-            (ApiProvider::Anthropic, "claude-haiku-4-5"),
-            (ApiProvider::Anthropic, "claude-sonnet-5"),
-            (ApiProvider::Moonshot, "kimi-k2.7-code"),
-            (ApiProvider::Openai, "gpt-5.5"),
-            (ApiProvider::OpenaiCodex, "gpt-5.5"),
-            (ApiProvider::Deepseek, "deepseek-v4-pro"),
-            (ApiProvider::Ollama, "gpt-5.5"),
-            (ApiProvider::Stepfun, DEFAULT_STEPFUN_MODEL),
+            (ProviderKind::Anthropic, "claude-haiku-4-5"),
+            (ProviderKind::Anthropic, "claude-sonnet-5"),
+            (ProviderKind::Moonshot, "kimi-k2.7-code"),
+            (ProviderKind::Openai, "gpt-5.5"),
+            (ProviderKind::OpenaiCodex, "gpt-5.5"),
+            (ProviderKind::Deepseek, "deepseek-v4-pro"),
+            (ProviderKind::Ollama, "gpt-5.5"),
+            (ProviderKind::Stepfun, DEFAULT_STEPFUN_MODEL),
         ] {
             let audit = audit_turn_cost_for_route_at(provider, model, None, &usage, now);
             let estimate =
@@ -3371,7 +3432,7 @@ mod tests {
             ("step-3.5-flash-2603", 0.02, 0.10, 0.30),
         ] {
             let price = pricing_for_billing_surface(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 model,
                 Some(STEPFUN_PAYG_BILLING_SURFACE),
             )
@@ -3381,14 +3442,14 @@ mod tests {
             assert_eq!(price.usd.output_per_million, output);
             assert!(
                 pricing_for_billing_surface(
-                    ApiProvider::Stepfun,
+                    ProviderKind::Stepfun,
                     model,
                     Some(STEPFUN_PLAN_BILLING_SURFACE)
                 )
                 .is_none()
             );
-            assert!(route_requires_billing_surface(ApiProvider::Custom, model));
-            assert!(!has_pricing_for_provider(ApiProvider::Stepfun, model));
+            assert!(route_requires_billing_surface(ProviderKind::Custom, model));
+            assert!(!has_pricing_for_provider(ProviderKind::Stepfun, model));
         }
     }
 
@@ -3401,7 +3462,7 @@ mod tests {
             "https://API.STEPFUN.AI/v1/",
         ] {
             assert_eq!(
-                billing_surface_for_route(ApiProvider::Stepfun, Some(base_url)),
+                billing_surface_for_route(ProviderKind::Stepfun, Some(base_url)),
                 Some(STEPFUN_PAYG_BILLING_SURFACE),
                 "{base_url}"
             );
@@ -3412,7 +3473,7 @@ mod tests {
             "https://api.stepfun.com/step_plan/v1",
         ] {
             assert_eq!(
-                billing_surface_for_route(ApiProvider::Stepfun, Some(base_url)),
+                billing_surface_for_route(ProviderKind::Stepfun, Some(base_url)),
                 Some(STEPFUN_PLAN_BILLING_SURFACE),
                 "{base_url}"
             );
@@ -3430,7 +3491,7 @@ mod tests {
             "https://stepfun.example/v1",
         ] {
             assert_eq!(
-                billing_surface_for_route(ApiProvider::Stepfun, Some(base_url)),
+                billing_surface_for_route(ProviderKind::Stepfun, Some(base_url)),
                 Some(UNCLASSIFIED_BILLING_SURFACE),
                 "{base_url}"
             );
@@ -3442,12 +3503,12 @@ mod tests {
         // A StepFun URL paired with the OpenRouter protocol is a foreign custom
         // endpoint, not proof of either provider's billing surface.
         assert_eq!(
-            billing_surface_for_route(ApiProvider::Openrouter, Some(DEFAULT_STEPFUN_BASE_URL)),
+            billing_surface_for_route(ProviderKind::Openrouter, Some(DEFAULT_STEPFUN_BASE_URL)),
             Some(UNCLASSIFIED_BILLING_SURFACE)
         );
         // No endpoint at all stays `None`.
         assert_eq!(
-            billing_surface_for_route(ApiProvider::Stepfun, None),
+            billing_surface_for_route(ProviderKind::Stepfun, None),
             None,
             "an absent endpoint is not a classification"
         );
@@ -3459,7 +3520,7 @@ mod tests {
             ..Default::default()
         };
         let payg = calculate_turn_cost_estimate_for_billing_surface(
-            ApiProvider::Stepfun,
+            ProviderKind::Stepfun,
             DEFAULT_STEPFUN_MODEL,
             Some(STEPFUN_PAYG_BILLING_SURFACE),
             &usage,
@@ -3472,7 +3533,7 @@ mod tests {
         // Plan and must not add either route to spend or savings totals.
         assert!(
             calculate_turn_cost_estimate_for_provider(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 DEFAULT_STEPFUN_MODEL,
                 &usage,
             )
@@ -3480,7 +3541,7 @@ mod tests {
         );
         assert!(
             calculate_turn_cost_estimate_for_provider_at(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 DEFAULT_STEPFUN_MODEL,
                 &usage,
                 Utc::now(),
@@ -3488,14 +3549,14 @@ mod tests {
             .is_none()
         );
         assert!(!has_pricing_for_provider(
-            ApiProvider::Stepfun,
+            ProviderKind::Stepfun,
             DEFAULT_STEPFUN_MODEL
         ));
 
         for surface in [None, Some(STEPFUN_PLAN_BILLING_SURFACE)] {
             assert!(
                 calculate_turn_cost_estimate_for_billing_surface(
-                    ApiProvider::Stepfun,
+                    ProviderKind::Stepfun,
                     DEFAULT_STEPFUN_MODEL,
                     surface,
                     &usage,
@@ -3505,7 +3566,7 @@ mod tests {
         }
         assert!(
             calculate_turn_cost_estimate_for_billing_surface(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 "step-unknown",
                 Some(STEPFUN_PAYG_BILLING_SURFACE),
                 &usage,
@@ -3513,9 +3574,9 @@ mod tests {
             .is_none()
         );
         for provider in [
-            ApiProvider::Openrouter,
-            ApiProvider::Ollama,
-            ApiProvider::Custom,
+            ProviderKind::Openrouter,
+            ProviderKind::Ollama,
+            ProviderKind::Custom,
         ] {
             assert!(
                 calculate_turn_cost_estimate_for_billing_surface(
@@ -3549,7 +3610,7 @@ mod tests {
         }
 
         let recorded = calculate_turn_cost_estimate_for_route_at(
-            ApiProvider::Stepfun,
+            ProviderKind::Stepfun,
             DEFAULT_STEPFUN_MODEL,
             Some(STEPFUN_PAYG_BILLING_SURFACE),
             &usage,
@@ -3586,11 +3647,11 @@ mod tests {
         assert!(pricing_for_model_at("trinity-mini", Utc::now()).is_none());
         assert!(!has_pricing_for_model("trinity-mini"));
         assert!(!has_pricing_for_provider(
-            ApiProvider::Arcee,
+            ProviderKind::Arcee,
             "trinity-mini"
         ));
         assert!(
-            calculate_turn_cost_estimate_for_provider(ApiProvider::Arcee, "trinity-mini", &usage,)
+            calculate_turn_cost_estimate_for_provider(ProviderKind::Arcee, "trinity-mini", &usage,)
                 .is_none()
         );
     }
@@ -3684,7 +3745,7 @@ mod tests {
                     ..Usage::default()
                 };
                 let estimate = calculate_turn_cost_estimate_for_provider_at(
-                    ApiProvider::Xai,
+                    ProviderKind::Xai,
                     model,
                     &usage,
                     Utc::now(),
@@ -3698,7 +3759,7 @@ mod tests {
                 );
             }
             assert!(
-                provider_owned_hand_pricing_at(ApiProvider::Openrouter, model, Utc::now())
+                provider_owned_hand_pricing_at(ProviderKind::Openrouter, model, Utc::now())
                     .is_none(),
                 "{model}: OpenRouter must not inherit xAI billing"
             );
@@ -3713,7 +3774,7 @@ mod tests {
                 ..Usage::default()
             };
             let estimate = calculate_turn_cost_estimate_for_provider_at(
-                ApiProvider::Xai,
+                ProviderKind::Xai,
                 "grok-4.6",
                 &usage,
                 Utc::now(),
@@ -3724,14 +3785,14 @@ mod tests {
         }
 
         assert!(
-            provider_owned_hand_pricing_at(ApiProvider::Openrouter, "grok-4.6", Utc::now(),)
+            provider_owned_hand_pricing_at(ProviderKind::Openrouter, "grok-4.6", Utc::now(),)
                 .is_none()
         );
     }
 
     #[test]
     fn provider_scoped_minimax_m3_keeps_usage_tiers_for_both_wire_protocols() {
-        for provider in [ApiProvider::Minimax, ApiProvider::MinimaxAnthropic] {
+        for provider in [ProviderKind::Minimax, ProviderKind::MinimaxAnthropic] {
             for (input_tokens, input_rate) in [(512_000, 0.30), (512_001, 0.60)] {
                 let usage = Usage {
                     input_tokens,
@@ -3770,7 +3831,7 @@ mod tests {
 
             assert!(
                 calculate_turn_cost_estimate_for_provider(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     model,
                     &at_boundary,
                 )
@@ -3779,7 +3840,7 @@ mod tests {
             );
             assert!(
                 calculate_turn_cost_estimate_for_provider(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     model,
                     &above_boundary,
                 )
@@ -3793,12 +3854,12 @@ mod tests {
     fn direct_openai_gpt54_family_is_guarded_even_without_a_bundled_catalog_row() {
         for model in ["gpt-5.4", "gpt-5.4-pro"] {
             assert!(!direct_openai_long_context_tier_is_unpriced(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 model,
                 OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD,
             ));
             assert!(direct_openai_long_context_tier_is_unpriced(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 model,
                 OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
             ));
@@ -3809,7 +3870,7 @@ mod tests {
             };
             assert!(
                 calculate_turn_cost_estimate_for_provider(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     model,
                     &above_boundary,
                 )
@@ -3824,10 +3885,10 @@ mod tests {
         let input_tokens = OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1;
 
         for provider in [
-            ApiProvider::Openrouter,
-            ApiProvider::OpenaiCodex,
-            ApiProvider::Ollama,
-            ApiProvider::Custom,
+            ProviderKind::Openrouter,
+            ProviderKind::OpenaiCodex,
+            ProviderKind::Ollama,
+            ProviderKind::Custom,
         ] {
             assert!(
                 !direct_openai_long_context_tier_is_unpriced(provider, "gpt-5.5", input_tokens,),
@@ -3845,7 +3906,7 @@ mod tests {
         ] {
             assert!(
                 !direct_openai_long_context_tier_is_unpriced(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     model,
                     input_tokens,
                 ),
@@ -3860,7 +3921,7 @@ mod tests {
         };
         assert!(calculate_turn_cost_estimate_from_usage("gpt-5.5", &usage).is_some());
         assert!(
-            calculate_turn_cost_estimate_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", &usage,)
+            calculate_turn_cost_estimate_for_provider(ProviderKind::OpenaiCodex, "gpt-5.5", &usage,)
                 .is_none()
         );
     }
@@ -3873,12 +3934,12 @@ mod tests {
             "gpt-5.5-2026-04-23",
         ] {
             assert!(!direct_openai_long_context_tier_is_unpriced(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 snapshot,
                 OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD,
             ));
             assert!(direct_openai_long_context_tier_is_unpriced(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 snapshot,
                 OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
             ));
@@ -3889,7 +3950,7 @@ mod tests {
             };
             assert!(
                 calculate_turn_cost_estimate_for_provider(
-                    ApiProvider::Openai,
+                    ProviderKind::Openai,
                     snapshot,
                     &above_boundary,
                 )
@@ -3917,7 +3978,7 @@ mod tests {
 
         assert!(
             calculate_turn_cost_estimate_for_provider(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "gpt-5.6-sol",
                 &at_boundary,
             )
@@ -3925,7 +3986,7 @@ mod tests {
         );
         assert!(
             calculate_turn_cost_estimate_for_provider(
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "gpt-5.6-sol",
                 &above_boundary,
             )
@@ -3940,6 +4001,57 @@ mod tests {
         assert_eq!(pricing.usd.input_cache_miss_per_million, 0.30);
         assert_eq!(pricing.usd.output_per_million, 1.20);
         assert_eq!(pricing.usd.cache_write, CacheWritePolicy::Rate(0.375));
+    }
+
+    /// The offline seed's price and the reviewed provider-owned table must
+    /// agree wherever both price a row: the route audit reads a catalog rate
+    /// before the hand table, so a disagreement silently changes the offline
+    /// estimate (#6396). A deliberate difference belongs in
+    /// `catalog_corrections.json`, which this reads through.
+    #[test]
+    fn bundled_seed_prices_agree_with_provider_owned_table() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 26, 12, 0, 0).unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let mut checked = 0;
+        let mut mismatches = Vec::new();
+        for row in codewhale_config::catalog::bundled_catalog_offerings() {
+            let Some(cost) = row.cost.as_ref() else {
+                continue;
+            };
+            let Some(provider) = ProviderKind::parse(&row.provider) else {
+                continue;
+            };
+            let Some(hand) = provider_owned_hand_pricing_at(provider, &row.wire_model_id, at)
+            else {
+                continue;
+            };
+            checked += 1;
+            let usd = &hand.usd;
+            let pairs = [
+                ("input", cost.input, usd.input_cache_miss_per_million),
+                ("output", cost.output, usd.output_per_million),
+                (
+                    "cache_read",
+                    cost.cache_read,
+                    usd.input_cache_hit_per_million,
+                ),
+            ];
+            for (field, seed, table) in pairs {
+                if let Some(seed) = seed
+                    && !close(seed, table)
+                {
+                    mismatches.push(format!(
+                        "{}/{} {field}: seed {seed} vs table {table}",
+                        row.provider, row.wire_model_id
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled row has a provider-owned table price"
+        );
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[test]
@@ -3980,7 +4092,8 @@ mod tests {
             ("gpt-5.5", 0.50, 5.00, 30.00),
             // GPT-5.5 Pro has no cached-input discount: cache-hit == input.
             ("gpt-5.5-pro", 30.00, 30.00, 180.00),
-            ("gpt-5.6-sol", 0.50, 5.00, 30.00),
+            ("gpt-5.6", 0.40, 4.00, 20.00),
+            ("gpt-5.6-sol", 0.40, 4.00, 20.00),
             ("gpt-5.6-terra", 0.20, 2.00, 12.00),
             ("gpt-5.6-luna", 0.02, 0.20, 1.20),
             ("gpt-5-codex", 0.125, 1.25, 10.00),
@@ -4109,6 +4222,7 @@ mod tests {
                 output: Some(50.0),
                 cache_read: Some(1.0),
                 cache_write: Some(12.5),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4122,7 +4236,7 @@ mod tests {
         };
 
         let estimate = catalog_cost_estimate_for_route(
-            ApiProvider::Anthropic,
+            ProviderKind::Anthropic,
             "catalog-priced-model",
             &offering,
             &usage,
@@ -4134,17 +4248,26 @@ mod tests {
 
     #[test]
     fn recorded_time_provider_cost_keeps_catalog_cache_write_tier() {
+        let request = Usage {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            prompt_cache_hit_tokens: Some(0),
+            prompt_cache_miss_tokens: Some(0),
+            prompt_cache_write_tokens: Some(100_000),
+            ..Default::default()
+        };
         let usage = Usage {
             input_tokens: 1_000_000,
             output_tokens: 0,
             prompt_cache_hit_tokens: Some(0),
             prompt_cache_miss_tokens: Some(0),
             prompt_cache_write_tokens: Some(1_000_000),
+            request_usages: vec![request; 10],
             ..Default::default()
         };
 
         let estimate = calculate_turn_cost_estimate_for_provider_at(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "qwen/qwen3.7-plus",
             &usage,
             Utc::now(),
@@ -4165,7 +4288,7 @@ mod tests {
 
         assert!(
             calculate_turn_cost_estimate_for_provider_at(
-                ApiProvider::Ollama,
+                ProviderKind::Ollama,
                 "gpt-5.5",
                 &usage,
                 Utc::now(),
@@ -4182,13 +4305,13 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            crate::provider_lake::catalog_offering_for_model(ApiProvider::Openai, "gpt-5-codex")
+            crate::provider_lake::catalog_offering_for_model(ProviderKind::Openai, "gpt-5-codex")
                 .is_none(),
             "regression fixture must exercise the hand-price fallback"
         );
 
         let estimate = calculate_turn_cost_estimate_for_provider_at(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "gpt-5-codex",
             &usage,
             Utc::now(),
@@ -4197,13 +4320,16 @@ mod tests {
 
         assert!((estimate.usd - 1.25).abs() < f64::EPSILON);
         assert_eq!(estimate.cny, 0.0);
-        assert!(has_pricing_for_provider(ApiProvider::Openai, "gpt-5-codex"));
+        assert!(has_pricing_for_provider(
+            ProviderKind::Openai,
+            "gpt-5-codex"
+        ));
     }
 
     #[test]
     fn provider_price_does_not_invent_catalog_missing_cache_write_class() {
         let offering =
-            crate::provider_lake::catalog_offering_for_model(ApiProvider::Openai, "gpt-5.5")
+            crate::provider_lake::catalog_offering_for_model(ProviderKind::Openai, "gpt-5.5")
                 .expect("bundled OpenAI route");
         let catalog_pricing =
             OfferingPricing::from_catalog_offering(&offering).expect("catalog pricing");
@@ -4217,7 +4343,7 @@ mod tests {
         };
 
         let audit =
-            audit_turn_cost_for_provider_at(ApiProvider::Openai, "gpt-5.5", &usage, Utc::now());
+            audit_turn_cost_for_provider_at(ProviderKind::Openai, "gpt-5.5", &usage, Utc::now());
 
         assert!(audit.estimate.is_none());
         assert_eq!(
@@ -4239,9 +4365,9 @@ mod tests {
         let recorded_at = Utc::now();
 
         for (provider, model) in [
-            (ApiProvider::Zai, "GLM-5.3"),
-            (ApiProvider::XiaomiMimo, "mimo-v2.5-pro"),
-            (ApiProvider::ModelstudioTokenPlan, "qwen3.8-max"),
+            (ProviderKind::Zai, "GLM-5.3"),
+            (ProviderKind::XiaomiMimo, "mimo-v2.6-pro"),
+            (ProviderKind::ModelstudioTokenPlan, "qwen3.8-max"),
         ] {
             let offering =
                 crate::provider_lake::bundled_catalog_offering_for_model(provider, model)
@@ -4283,7 +4409,7 @@ mod tests {
 
         assert!(
             calculate_turn_cost_estimate_for_provider_at(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-chat",
                 &usage,
                 before_retirement,
@@ -4292,7 +4418,7 @@ mod tests {
         );
         assert!(
             calculate_turn_cost_estimate_for_provider_at(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-reasoner",
                 &usage,
                 at_retirement,
@@ -4328,24 +4454,16 @@ mod tests {
 
     #[test]
     fn deepseek_pricing_requires_exact_ids_or_explicit_route_aliases() {
-        let _lock = codewhale_models::model_catalog::test_catalog_lock();
         let at = utc_hm(2, 0);
-        let catalog = codewhale_models::model_catalog::MergedCatalog::from_sources(
-            BTreeMap::new(),
-            None,
-            codewhale_models::model_catalog::bundled_catalog(),
-            at,
-        );
-        let _guard = codewhale_models::model_catalog::replace_active_catalog_for_test(catalog);
         let usage = Usage {
             input_tokens: 1_000,
             output_tokens: 100,
             ..Default::default()
         };
         let providers = [
-            ApiProvider::Deepseek,
-            ApiProvider::DeepseekCN,
-            ApiProvider::DeepseekAnthropic,
+            ProviderKind::Deepseek,
+            ProviderKind::Deepseek,
+            ProviderKind::DeepseekAnthropic,
         ];
 
         for model in [
@@ -4412,6 +4530,12 @@ mod tests {
                 output: 100,
                 cache_read: 250,
                 cache_write: 50,
+
+                reasoning: Some(50),
+                input_audio: None,
+                output_audio: None,
+
+                request_usages: Vec::new(),
             }
         );
 
@@ -4427,12 +4551,12 @@ mod tests {
         );
         assert_eq!(
             calculate_turn_cost_estimate_for_provider(
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "claude-haiku-4-5",
                 &usage,
             ),
             calculate_turn_cost_estimate_for_provider(
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "claude-haiku-4-5",
                 &without_reasoning,
             )
@@ -4457,7 +4581,7 @@ mod tests {
             "token projection may never exceed the provider's input total"
         );
         let audit = audit_turn_cost_for_provider_on_endpoint_at(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
             None,
             &usage,
@@ -4492,13 +4616,13 @@ mod tests {
         };
 
         assert!(calculate_turn_cost_estimate_from_usage("gpt-5.5", &usage).is_some());
-        assert!(has_pricing_for_provider(ApiProvider::Openai, "gpt-5.5"));
+        assert!(has_pricing_for_provider(ProviderKind::Openai, "gpt-5.5"));
         assert!(!has_pricing_for_provider(
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             "gpt-5.5"
         ));
         assert!(
-            calculate_turn_cost_estimate_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", &usage)
+            calculate_turn_cost_estimate_for_provider(ProviderKind::OpenaiCodex, "gpt-5.5", &usage)
                 .is_none()
         );
     }
@@ -4512,7 +4636,7 @@ mod tests {
         };
         assert!(
             calculate_turn_cost_estimate_for_billing_surface(
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "claude-sonnet-5",
                 Some(FIRST_PARTY_PAYG_BILLING_SURFACE),
                 &usage,
@@ -4521,7 +4645,7 @@ mod tests {
         );
         assert!(
             calculate_turn_cost_estimate_for_route(
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "claude-sonnet-5",
                 &usage,
                 crate::route_billing::BillingPresentation::Subscription("Claude OAuth quota"),
@@ -4547,51 +4671,29 @@ mod tests {
                 output: 100,
                 cache_read: 250,
                 cache_write: 0,
+
+                reasoning: None,
+                input_audio: None,
+                output_audio: None,
+
+                request_usages: Vec::new(),
             }
         );
     }
 
     #[test]
     fn catalog_pricing_overrides_known_row_when_present() {
-        let _lock = codewhale_models::model_catalog::test_catalog_lock();
-        let mut overrides = BTreeMap::new();
-        let models = [
+        for model in [
             "catalog-priced-model",
             "deepseek-v4.1-flash-expires-on-0910",
-        ];
-        for model in models {
-            overrides.insert(
-                model.to_string(),
-                codewhale_models::model_catalog::CatalogEntry {
-                    id: model.to_string(),
-                    context_window: None,
-                    max_output: None,
-                    supports_reasoning: None,
-                    input_usd_per_million: Some(0.25),
-                    output_usd_per_million: Some(1.25),
-                    modalities: Vec::new(),
-                    supported_parameters: Vec::new(),
-                    provider_model_id: None,
-                    provenance: codewhale_models::model_catalog::MetadataProvenance::UserOverride,
-                },
+        ] {
+            assert!(
+                pricing_for_model_at(model, Utc::now()).is_none(),
+                "private unknown rows never gain global prices"
             );
         }
-        let catalog = codewhale_models::model_catalog::MergedCatalog::from_sources(
-            overrides,
-            None,
-            codewhale_models::model_catalog::bundled_catalog(),
-            Utc::now(),
-        );
-        let _guard = codewhale_models::model_catalog::replace_active_catalog_for_test(catalog);
-
-        for model in models {
-            let pricing = pricing_for_model_at(model, Utc::now()).expect(model);
-            assert_eq!(pricing.usd.input_cache_hit_per_million, 0.25, "{model}");
-            assert_eq!(pricing.usd.input_cache_miss_per_million, 0.25, "{model}");
-            assert_eq!(pricing.usd.output_per_million, 1.25, "{model}");
-            assert!(pricing.cny.is_none(), "{model}");
-        }
-        assert!(pricing_for_model_at("deepseek-v4.1-flash", Utc::now()).is_none());
+        // Exact configured prices are tested through provider_lake + endpoint
+        // identity above; the primitive helper cannot see those scoped declarations.
     }
 
     /// Published Claude Sonnet 5 rates per 1M tokens (cache-hit, cache-miss,
@@ -4654,12 +4756,12 @@ mod tests {
         assert_eq!(pricing.usd.cache_write, CacheWritePolicy::Rate(6.25));
         assert!(pricing.cny.is_none());
         assert!(
-            provider_owned_hand_pricing_at(ApiProvider::Anthropic, "claude-opus-5", Utc::now())
+            provider_owned_hand_pricing_at(ProviderKind::Anthropic, "claude-opus-5", Utc::now())
                 .is_some(),
             "direct Anthropic owns the Opus 5 row"
         );
         assert!(
-            provider_owned_hand_pricing_at(ApiProvider::Openrouter, "claude-opus-5", Utc::now())
+            provider_owned_hand_pricing_at(ProviderKind::Openrouter, "claude-opus-5", Utc::now())
                 .is_none(),
             "an aggregator must not inherit the first-party Opus 5 row"
         );
@@ -4690,20 +4792,20 @@ mod tests {
         // https://platform.kimi.ai/docs/pricing/chat-k3 (2026-08-17):
         // cache-hit 0.30 / cache-miss 3.00 / output 15.00 per 1M.
         let now = Utc::now();
-        let pricing = provider_owned_hand_pricing_at(ApiProvider::Moonshot, "kimi-k3", now)
+        let pricing = provider_owned_hand_pricing_at(ProviderKind::Moonshot, "kimi-k3", now)
             .expect("direct Moonshot owns the kimi-k3 row");
         assert_eq!(pricing.usd.input_cache_hit_per_million, 0.30);
         assert_eq!(pricing.usd.input_cache_miss_per_million, 3.00);
         assert_eq!(pricing.usd.output_per_million, 15.00);
         assert!(
-            provider_owned_hand_pricing_at(ApiProvider::Moonshot, "k3", now).is_none(),
+            provider_owned_hand_pricing_at(ProviderKind::Moonshot, "k3", now).is_none(),
             "Kimi Code membership `k3` is quota billed"
         );
         assert!(pricing_for_model_at("k3", now).is_none());
         // Fireworks-hosted K3 keeps its own (still unpublished) rate card.
         assert!(
             provider_owned_hand_pricing_at(
-                ApiProvider::Fireworks,
+                ProviderKind::Fireworks,
                 "accounts/fireworks/models/kimi-k3",
                 now
             )
@@ -4716,7 +4818,7 @@ mod tests {
         // https://platform.kimi.ai/docs/pricing/chat-k27-code (2026-08-17).
         let now = Utc::now();
         let pricing =
-            provider_owned_hand_pricing_at(ApiProvider::Moonshot, "kimi-k2.7-code-highspeed", now)
+            provider_owned_hand_pricing_at(ProviderKind::Moonshot, "kimi-k2.7-code-highspeed", now)
                 .expect("direct Moonshot owns the K2.7 Code high-speed row");
         assert_eq!(pricing.usd.input_cache_hit_per_million, 0.38);
         assert_eq!(pricing.usd.input_cache_miss_per_million, 1.90);
@@ -4732,7 +4834,7 @@ mod tests {
     fn minimax_m2_7_highspeed_preserves_cache_read_and_write_rates() {
         // https://platform.minimax.io/docs/guides/pricing-paygo (2026-08-17):
         // $0.6 in / $2.4 out / $0.06 cache read / $0.375 cache write.
-        for provider in [ApiProvider::Minimax, ApiProvider::MinimaxAnthropic] {
+        for provider in [ProviderKind::Minimax, ProviderKind::MinimaxAnthropic] {
             let pricing =
                 provider_owned_hand_pricing_at(provider, "MiniMax-M2.7-highspeed", Utc::now())
                     .expect("direct MiniMax owns the M2.7 high-speed row");
@@ -4765,7 +4867,7 @@ mod tests {
             ("mistral-small-latest", 0.015, 0.15, 0.60),
             ("mistral-code-latest", 0.03, 0.30, 0.90),
         ] {
-            let pricing = provider_owned_hand_pricing_at(ApiProvider::Mistral, model, now)
+            let pricing = provider_owned_hand_pricing_at(ProviderKind::Mistral, model, now)
                 .unwrap_or_else(|| panic!("direct Mistral owns {model}"));
             assert_eq!(pricing.usd.input_cache_hit_per_million, hit, "{model}");
             assert_eq!(pricing.usd.input_cache_miss_per_million, miss, "{model}");
@@ -4777,7 +4879,7 @@ mod tests {
                 "{model}"
             );
             assert!(
-                provider_owned_hand_pricing_at(ApiProvider::Openrouter, model, now).is_none(),
+                provider_owned_hand_pricing_at(ProviderKind::Openrouter, model, now).is_none(),
                 "{model}: aggregators must not inherit first-party Mistral rates"
             );
         }
@@ -4985,10 +5087,10 @@ mod tests {
     fn deepseek_audit_uses_recorded_time_tier_not_now() {
         let usage = million_input_usage();
         for (provider, model) in [
-            (ApiProvider::Deepseek, "deepseek-v4-flash"),
-            (ApiProvider::Deepseek, "deepseek-v4-pro"),
-            (ApiProvider::DeepseekCN, "deepseek-v4-flash"),
-            (ApiProvider::DeepseekAnthropic, "deepseek-v4-pro"),
+            (ProviderKind::Deepseek, "deepseek-v4-flash"),
+            (ProviderKind::Deepseek, "deepseek-v4-pro"),
+            (ProviderKind::Deepseek, "deepseek-v4-flash"),
+            (ProviderKind::DeepseekAnthropic, "deepseek-v4-pro"),
         ] {
             let off_peak_usd = if model.contains("pro") { 0.66 } else { 0.22 };
             let off_peak_cny = if model.contains("pro") { 4.5 } else { 1.5 };
@@ -5026,18 +5128,18 @@ mod tests {
     fn fireworks_and_zen_flash_use_bundled_family_rates() {
         let now = Utc.with_ymd_and_hms(2026, 8, 14, 0, 0, 0).single().unwrap();
         let fireworks = provider_owned_hand_pricing_at(
-            ApiProvider::Fireworks,
+            ProviderKind::Fireworks,
             "accounts/fireworks/models/deepseek-v4-flash",
             now,
         )
         .expect("Fireworks Flash should inherit the bundled DeepSeek family row");
         let zen =
-            provider_owned_hand_pricing_at(ApiProvider::OpencodeZen, "deepseek-v4-flash", now)
+            provider_owned_hand_pricing_at(ProviderKind::OpencodeZen, "deepseek-v4-flash", now)
                 .expect("OpenCode Zen Flash should inherit the bundled DeepSeek family row");
         assert_eq!(fireworks.usd.output_per_million, zen.usd.output_per_million);
         assert!(
             provider_owned_hand_pricing_at(
-                ApiProvider::Fireworks,
+                ProviderKind::Fireworks,
                 "accounts/fireworks/models/kimi-k3",
                 now,
             )
@@ -5107,19 +5209,31 @@ mod tests {
     #[test]
     fn format_cost_amount_precise_keeps_report_precision() {
         assert_eq!(
-            format_cost_amount_precise(0.1234, CostCurrency::Usd),
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
+                0.1234,
+                codewhale_command_contract::types::CommandCurrency::Usd
+            ),
             "$0.1234"
         );
         assert_eq!(
-            format_cost_amount_precise(0.1234, CostCurrency::Cny),
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
+                0.1234,
+                codewhale_command_contract::types::CommandCurrency::Cny
+            ),
             "¥0.1234"
         );
         assert_eq!(
-            format_cost_amount_precise(0.0, CostCurrency::Usd),
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
+                0.0,
+                codewhale_command_contract::types::CommandCurrency::Usd
+            ),
             "$0.0000"
         );
         assert_eq!(
-            format_cost_amount_precise(0.00001, CostCurrency::Usd),
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
+                0.00001,
+                codewhale_command_contract::types::CommandCurrency::Usd
+            ),
             "<$0.0001"
         );
     }
@@ -5148,13 +5262,26 @@ mod tests {
         );
     }
 
-    fn official_route_audit(provider: ApiProvider, model: &str, usage: &Usage) -> TurnCostAudit {
-        audit_turn_cost_for_route_at(
+    fn official_route_audit(provider: ProviderKind, model: &str, usage: &Usage) -> TurnCostAudit {
+        let base = provider.provider().default_base_url();
+        let at = Utc::now();
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(base);
+        let quote = crate::provider_catalog_live::fresh_dispatch_pricing_quote_at(
             provider,
+            provider.as_str(),
             model,
-            billing_surface_for_route(provider, Some(provider.default_base_url())),
+            base,
+            at.timestamp() as u64,
+        );
+        audit_turn_cost_for_route_on_endpoint_for_identity_at(
+            provider,
+            Some(provider.as_str()),
+            model,
+            billing_surface_for_route(provider, Some(base)),
+            Some(&fingerprint),
+            quote.as_ref(),
             usage,
-            Utc::now(),
+            at,
         )
     }
 
@@ -5175,22 +5302,22 @@ mod tests {
         let now = Utc::now();
         let cases = [
             (
-                ApiProvider::Fireworks,
+                ProviderKind::Fireworks,
                 "accounts/fireworks/models/deepseek-v4-flash-0731",
                 0.14,
             ),
             (
-                ApiProvider::Fireworks,
+                ProviderKind::Fireworks,
                 "accounts/fireworks/models/deepseek-v4-flash",
                 0.14,
             ),
-            (ApiProvider::Fireworks, "deepseek-v4-flash", 0.14),
+            (ProviderKind::Fireworks, "deepseek-v4-flash", 0.14),
             (
-                ApiProvider::Fireworks,
+                ProviderKind::Fireworks,
                 "accounts/fireworks/models/deepseek-v4-pro",
                 1.74,
             ),
-            (ApiProvider::OpencodeZen, "deepseek-v4-flash", 0.14),
+            (ProviderKind::OpencodeZen, "deepseek-v4-flash", 0.14),
         ];
         for (provider, model, expected_usd) in cases {
             let audit = official_route_audit(provider, model, &usage);
@@ -5249,7 +5376,7 @@ mod tests {
     }
 
     #[test]
-    fn models_dev_live_cost_is_capabilities_only_and_falls_back_to_bundled_rates() {
+    fn models_dev_live_rates_price_the_published_estimate() {
         let _live = crate::provider_lake::lock_live_snapshot();
         crate::provider_lake::clear_live_snapshot();
         let now = Utc::now();
@@ -5265,6 +5392,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "models-dev-capabilities".to_string(),
@@ -5278,7 +5406,7 @@ mod tests {
 
         let usage = million_input_usage();
         let audit = official_route_audit(
-            ApiProvider::Fireworks,
+            ProviderKind::Fireworks,
             "accounts/fireworks/models/deepseek-v4-flash-0731",
             &usage,
         );
@@ -5289,12 +5417,12 @@ mod tests {
             audit.unpriced_reason,
             Some(UnpricedReason::UnverifiedLivePricing)
         );
-        assert_eq!(audit.provenance, Some(PricingProvenance::ProviderDocs));
+        assert_eq!(audit.provenance, Some(PricingProvenance::ModelsDevLive));
         assert_eq!(audit.live_pricing_defect, None);
         let estimate = audit.estimate.expect("priced");
         assert!(
-            (estimate.usd - 0.14).abs() < 1e-12,
-            "models.dev leftover cost must not be billed: {}",
+            (estimate.usd - 99.0).abs() < 1e-12,
+            "live models.dev input rate must price the estimate: {}",
             estimate.usd
         );
     }
@@ -5316,6 +5444,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "other-endpoint".to_string(),
@@ -5328,7 +5457,16 @@ mod tests {
         );
 
         let usage = million_input_usage();
-        let audit = official_route_audit(ApiProvider::OpencodeZen, "deepseek-v4-flash", &usage);
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(
+            ProviderKind::OpencodeZen.provider().default_base_url(),
+        );
+        let audit = audit_turn_cost_for_provider_on_endpoint_at(
+            ProviderKind::OpencodeZen,
+            "deepseek-v4-flash",
+            Some(&fingerprint),
+            &usage,
+            now,
+        );
         crate::provider_lake::clear_live_snapshot();
 
         assert!(audit.is_priced(), "{audit:?}");
@@ -5361,6 +5499,7 @@ mod tests {
                         output: Some(18.0),
                         cache_read: Some(1.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5373,16 +5512,10 @@ mod tests {
         );
 
         let usage = million_input_usage();
-        let audit = audit_turn_cost_for_route_on_endpoint_at(
-            ApiProvider::Fireworks,
+        let audit = official_route_audit(
+            ProviderKind::Fireworks,
             "accounts/fireworks/models/kimi-k3",
-            billing_surface_for_route(
-                ApiProvider::Fireworks,
-                Some(crate::config::DEFAULT_FIREWORKS_BASE_URL),
-            ),
-            Some(&fingerprint),
             &usage,
-            now,
         );
         crate::provider_lake::clear_live_snapshot();
 
@@ -5419,6 +5552,7 @@ mod tests {
                         output: Some(18.0),
                         cache_read: Some(1.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5430,13 +5564,9 @@ mod tests {
             crate::provider_lake::LiveSource::PerProvider,
         );
 
-        let audit = audit_turn_cost_for_route_on_endpoint_at(
-            ApiProvider::Fireworks,
+        let audit = audit_turn_cost_for_provider_on_endpoint_at(
+            ProviderKind::Fireworks,
             "accounts/fireworks/models/future-price-only",
-            billing_surface_for_route(
-                ApiProvider::Fireworks,
-                Some(crate::config::DEFAULT_FIREWORKS_BASE_URL),
-            ),
             Some(&fingerprint),
             &million_input_usage(),
             dispatched_at,
@@ -5455,11 +5585,12 @@ mod tests {
 
     /// The fixture deliberately stamps `Live` rather than the `ModelsDevLive`
     /// the refresh now emits: this pins the *second*, independent check — the
-    /// live partition the row sits in — which is what still catches a row
-    /// mislabelled by an older publisher or a stale on-disk cache. Do not
-    /// "correct" the source here; that would delete this belt's only coverage.
+    /// live partition the row sits in — which is what decides the price basis
+    /// of a row mislabelled by an older publisher or a stale on-disk cache. Do
+    /// not "correct" the source here; that would delete this belt's only
+    /// coverage.
     #[test]
-    fn models_dev_live_overlay_does_not_replace_bundled_catalog_rates() {
+    fn models_dev_partition_live_rows_price_the_live_catalog_rate() {
         let _live = crate::provider_lake::lock_live_snapshot();
         crate::provider_lake::clear_live_snapshot();
         let now = Utc::now();
@@ -5475,6 +5606,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "models-dev-capabilities".to_string(),
@@ -5493,16 +5625,16 @@ mod tests {
             output_tokens: 0,
             ..Usage::default()
         };
-        let audit = official_route_audit(ApiProvider::Openai, "gpt-5.5", &usage);
+        let audit = official_route_audit(ProviderKind::Openai, "gpt-5.5", &usage);
         crate::provider_lake::clear_live_snapshot();
 
         assert!(audit.is_priced(), "{audit:?}");
-        assert_eq!(audit.provenance, Some(PricingProvenance::ModelsDevBundled));
+        assert_eq!(audit.provenance, Some(PricingProvenance::ModelsDevLive));
         assert_eq!(audit.live_pricing_defect, None);
         let estimate = audit.estimate.expect("priced");
         assert!(
-            (estimate.usd - 0.05).abs() < 1e-12,
-            "bundled OpenAI rate must win over models.dev leftover cost: {}",
+            (estimate.usd - 0.99).abs() < 1e-12,
+            "the models.dev live rate must price the estimate: {}",
             estimate.usd
         );
     }
@@ -5520,7 +5652,7 @@ mod tests {
 
         // deepseek-v4-pro is the model owner's own hand-priced row; a
         // Concentrate request for it must not inherit that rate.
-        let audit = official_route_audit(ApiProvider::Concentrate, "deepseek-v4-pro", &usage);
+        let audit = official_route_audit(ProviderKind::Concentrate, "deepseek-v4-pro", &usage);
         assert!(!audit.is_priced(), "{audit:?}");
         assert_eq!(
             audit.unpriced_reason,
@@ -5528,7 +5660,7 @@ mod tests {
             "{audit:?}"
         );
         assert!(!has_pricing_for_provider(
-            ApiProvider::Concentrate,
+            ProviderKind::Concentrate,
             "deepseek-v4-pro"
         ));
     }
@@ -5557,6 +5689,7 @@ mod tests {
                         output: Some(1.5),
                         cache_read: None,
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5570,11 +5703,11 @@ mod tests {
 
         let usage = million_input_usage();
         let surface = billing_surface_for_route(
-            ApiProvider::Concentrate,
+            ProviderKind::Concentrate,
             Some(crate::config::DEFAULT_CONCENTRATE_BASE_URL),
         );
         let scoped = audit_turn_cost_for_route_on_endpoint_at(
-            ApiProvider::Concentrate,
+            ProviderKind::Concentrate,
             "deepseek-v4-pro",
             surface,
             Some(&fingerprint),
@@ -5582,7 +5715,7 @@ mod tests {
             now,
         );
         let unproven = audit_turn_cost_for_route_on_endpoint_at(
-            ApiProvider::Concentrate,
+            ProviderKind::Concentrate,
             "deepseek-v4-pro",
             surface,
             None,
@@ -5726,7 +5859,7 @@ mod tests {
     }
 
     fn audit_price_patch(
-        provider: ApiProvider,
+        provider: ProviderKind,
         model: &str,
         input: f64,
     ) -> codewhale_config::cloud_facts::ModelFact {
@@ -5754,9 +5887,9 @@ mod tests {
         codewhale_config::cloud_facts::overlay::clear();
         crate::provider_lake::clear_live_snapshot();
         crate::provider_catalog_live::reset_cache_for_test();
-        let provider = ApiProvider::Openai;
+        let provider = ProviderKind::Openai;
         let model = "cloud-audit-fixture";
-        let base = provider.default_base_url();
+        let base = provider.provider().default_base_url();
         let fingerprint = codewhale_config::catalog::base_url_fingerprint(base);
         let now = Utc::now();
         let at = now.timestamp() as u64;
@@ -5844,11 +5977,11 @@ mod tests {
             ..Default::default()
         };
         let routes = [
-            (ApiProvider::Deepseek, "deepseek-v4-flash"),
-            (ApiProvider::Anthropic, "claude-sonnet-5"),
-            (ApiProvider::Minimax, "MiniMax-M3"),
-            (ApiProvider::MinimaxAnthropic, "MiniMax-M3"),
-            (ApiProvider::Xai, "grok-4.6"),
+            (ProviderKind::Deepseek, "deepseek-v4-flash"),
+            (ProviderKind::Anthropic, "claude-sonnet-5"),
+            (ProviderKind::Minimax, "MiniMax-M3"),
+            (ProviderKind::MinimaxAnthropic, "MiniMax-M3"),
+            (ProviderKind::Xai, "grok-4.6"),
         ];
         let before: Vec<_> = routes
             .iter()
@@ -5865,7 +5998,7 @@ mod tests {
             at,
         );
         for ((provider, model), expected) in routes.into_iter().zip(before) {
-            let base = provider.default_base_url();
+            let base = provider.provider().default_base_url();
             let quote = crate::provider_catalog_live::fresh_dispatch_pricing_quote_at(
                 provider,
                 provider.as_str(),
@@ -5884,7 +6017,7 @@ mod tests {
             // signed price cannot itself establish the account billing mode.
             let surface = if matches!(
                 provider,
-                ApiProvider::Minimax | ApiProvider::MinimaxAnthropic
+                ProviderKind::Minimax | ProviderKind::MinimaxAnthropic
             ) {
                 let unknown = audit_turn_cost_for_route_on_endpoint_for_identity_at(
                     provider,

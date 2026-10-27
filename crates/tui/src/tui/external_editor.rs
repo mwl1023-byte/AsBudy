@@ -326,9 +326,11 @@ fn suspend_tui_child_modes<W: Write>(
 
 fn disable_mouse_capture_for_child<W: Write>(writer: &mut W) {
     // Crossterm's mouse-capture command takes a WinAPI path on Windows and
-    // does not emit bytes into PTY-style terminals such as mintty. External
-    // editors inherit the PTY state, so send the xterm reset sequences
-    // directly here.
+    // does not emit bytes into PTY-style terminals such as mintty. Release
+    // the WinAPI state before resetting the inherited PTY state so resume
+    // can re-enable capture through a real console-mode transition.
+    #[cfg(windows)]
+    let _ = execute!(writer, crossterm::event::DisableMouseCapture);
     const DISABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
     if let Err(err) = writer.write_all(DISABLE_MOUSE_CAPTURE) {
         tracing::debug!(?err, "DisableMouseCapture direct reset ignored");
@@ -338,46 +340,21 @@ fn disable_mouse_capture_for_child<W: Write>(writer: &mut W) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    /// Serialize tests that mutate process-global env vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        keys: Vec<(&'static str, Option<OsString>)>,
-    }
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            let saved: Vec<_> = keys.iter().map(|k| (*k, env::var_os(k))).collect();
-            Self { keys: saved }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.keys {
-                match v {
-                    Some(val) => unsafe { env::set_var(k, val) },
-                    None => unsafe { env::remove_var(k) },
-                }
-            }
-        }
-    }
+    use crate::test_support::{EnvVarGuard, lock_test_env};
 
     /// The file on disk is the document: a `hooks.toml` the user edits stays
     /// edited, and the outcome only reports whether the bytes moved.
     #[test]
     #[cfg(unix)]
     fn editing_a_path_in_place_reports_only_whether_the_bytes_moved() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::new(&["VISUAL", "EDITOR"]);
+        let _lock = lock_test_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.toml");
         fs::write(&path, "# seed\n").unwrap();
 
         // An editor that saves nothing.
-        unsafe { env::set_var("VISUAL", "true") };
-        unsafe { env::remove_var("EDITOR") };
+        let _visual = EnvVarGuard::set("VISUAL", "true");
+        let _editor = EnvVarGuard::remove("EDITOR");
         assert_eq!(
             run_editor_on_path(&path, None).unwrap(),
             EditorOutcome::Unchanged,
@@ -389,7 +366,9 @@ mod tests {
         fs::write(&script, "#!/bin/sh\nprintf 'x\\n' >> \"$1\"\n").unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        unsafe { env::set_var("VISUAL", script.to_str().unwrap()) };
+        // Shadow rather than reassign: both guards live, and drop order
+        // restores the original value last.
+        let _visual_script = EnvVarGuard::set("VISUAL", &script);
         match run_editor_on_path(&path, None).unwrap() {
             EditorOutcome::Edited(text) => assert!(text.contains("# seed") && text.contains('x')),
             other => panic!("expected Edited, got {other:?}"),
@@ -444,23 +423,17 @@ mod tests {
 
     #[test]
     fn resolve_editor_prefers_visual_over_editor() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::set_var("VISUAL", "vis-cmd");
-            env::set_var("EDITOR", "ed-cmd");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::set("VISUAL", "vis-cmd");
+        let _editor = EnvVarGuard::set("EDITOR", "ed-cmd");
         assert_eq!(resolve_editor(), "vis-cmd");
     }
 
     #[test]
     fn resolve_editor_falls_back_to_vi() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::remove_var("EDITOR");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::remove("EDITOR");
         assert_eq!(resolve_editor(), "vi");
     }
 
@@ -468,12 +441,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_editor_unchanged_when_editor_is_noop() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", "true");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "true");
         let out = run_editor_raw("seed text").expect("editor ok");
         assert_eq!(out, EditorOutcome::Unchanged);
     }
@@ -482,12 +452,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_editor_cancelled_on_nonzero_exit() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", "false");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "false");
         let out = run_editor_raw("seed").expect("call ok");
         assert_eq!(out, EditorOutcome::Cancelled);
     }
@@ -496,12 +463,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_editor_cancelled_when_editor_missing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", "/nonexistent/codewhale-test-editor");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "/nonexistent/codewhale-test-editor");
         let out = run_editor_raw("seed").expect("call ok");
         assert_eq!(out, EditorOutcome::Cancelled);
     }
@@ -512,8 +476,7 @@ mod tests {
     fn run_editor_returns_edited_contents() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
+        let _lock = lock_test_env();
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("ed.sh");
         fs::write(&script, "#!/bin/sh\nprintf 'edited body' > \"$1\"\n").unwrap();
@@ -521,10 +484,8 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
 
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", script.to_string_lossy().to_string());
-        }
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", &script);
         let out = run_editor_raw("seed body").expect("editor ok");
         assert_eq!(out, EditorOutcome::Edited("edited body".to_string()));
     }
@@ -537,8 +498,7 @@ mod tests {
     fn run_editor_cleans_up_temp_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
+        let _lock = lock_test_env();
         let dir = tempfile::tempdir().unwrap();
         let path_capture = dir.path().join("capture.txt");
         let script = dir.path().join("ed.sh");
@@ -554,10 +514,8 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
 
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", script.to_string_lossy().to_string());
-        }
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", &script);
         let _ = run_editor_raw("seed").expect("editor ok");
 
         let captured = fs::read_to_string(&path_capture).expect("captured path");

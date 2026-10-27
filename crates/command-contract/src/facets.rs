@@ -5,9 +5,24 @@
 //! `codewhale-tui` one command group at a time. Only after every group uses
 //! these shapes will groups move physically into a commands crate.
 
+pub use crate::config_policy::{CommandConfigStatusContext, CommandPermissionsContext};
+
 use std::path::{Path, PathBuf};
 
-use codewhale_core::request::{Message, SystemPrompt};
+mod session_structcopy;
+pub use session_structcopy::*;
+
+mod debug_operations;
+pub mod debug_receipts;
+pub use debug_operations::*;
+pub use debug_receipts::*;
+
+mod diagnostics_report;
+mod diagnostics_tools;
+pub use diagnostics_report::*;
+pub use diagnostics_tools::*;
+
+use codewhale_protocol::request::{Message, SystemPrompt};
 use serde_json::Value;
 
 use crate::types::{CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId};
@@ -57,6 +72,27 @@ pub trait CommandModePolicyContext {
     fn allow_shell(&self) -> bool;
     fn set_shell_access(&mut self, allow: bool);
     fn policy_locked(&self) -> bool;
+    /// Apply a mode selection the way `/mode` does, reporting which of the
+    /// three outcomes occurred (changed, same-but-persisted, refused).
+    fn select_mode(&mut self, mode: CommandMode) -> CommandModeSelection;
+    /// Apply the legacy YOLO alias (invisible Act + full access).
+    fn select_yolo_compat(&mut self) -> CommandModeSelection;
+    /// The receipt shown when the same mode was persisted as the default.
+    fn mode_startup_default_receipt(&self, mode: CommandMode) -> String;
+    /// The refusal text when a locked policy blocks the change.
+    fn setting_locked_mode_message(&self) -> String;
+    /// Localized display name for a mode (e.g. `Work`, `Plan`).
+    fn mode_label(&self, mode: CommandMode) -> String;
+    /// Localized label for the legacy YOLO alias (`Full Access (Work)`).
+    fn yolo_compat_label(&self) -> String;
+}
+
+/// Outcome of a `/mode` selection (mirrors the host `SettingSelection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandModeSelection {
+    Changed,
+    PersistedSame,
+    Refused,
 }
 
 /// Read access to the effective system prompt.
@@ -71,9 +107,17 @@ pub trait CommandSkillsContext {
     fn refresh_skill_cache(&mut self);
 }
 
-/// Workspace path and a bounded serialized work-state snapshot.
+/// Workspace path, bounded work-state observations and confined anchor storage.
 pub trait CommandWorkspaceContext {
     fn workspace(&self) -> PathBuf;
+    fn effective_home_dir(&self) -> Option<PathBuf>;
+    fn inspect_workspace_target(&self, candidate: &Path) -> crate::navigation::WorkspaceTarget;
+    fn read_anchor_document(&self) -> Result<Option<String>, String>;
+    fn append_anchor_bytes(
+        &mut self,
+        parts: &[&[u8]],
+    ) -> Result<PathBuf, crate::navigation::AnchorWriteError>;
+    fn replace_anchor_document(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn work_state_snapshot(&self) -> Result<Option<String>, String>;
     /// Session-aware canonical operation digest. Returns the final user-facing
     /// digest text or a safe explicit error; never a serialized snapshot.
@@ -92,6 +136,10 @@ pub trait CommandWorkspaceContext {
 pub trait CommandPresentationContext {
     /// Resolve a stable message key with its named replacements.
     fn translate(&self, key: &str, replacements: &[(&str, &str)]) -> Result<String, String>;
+
+    fn language_name(&self) -> &'static str {
+        "English"
+    }
 }
 
 /// Portable receipt for a successful atomic media attachment (FEAT-018 D4).
@@ -115,6 +163,284 @@ pub trait CommandMediaContext {
 }
 
 // ---------------------------------------------------------------------------
+// Debug diagnostics (FEAT-029 D3)
+// ---------------------------------------------------------------------------
+
+/// Only the provider identity and support decision consumed by `/balance`.
+/// The adapter derives support from the authoritative provider policy; the
+/// portable handler decides whether to emit `FetchBalance` or the original text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugBalanceProjection {
+    pub provider_display_name: String,
+    pub supports_balance_api: bool,
+}
+
+/// Source text consumed by `/system`; retain Text/Blocks/None separately
+/// so the portable handler alone owns the separators and empty-state text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugSystemPrompt {
+    None,
+    Text(String),
+    Blocks(Vec<String>),
+}
+
+/// Only the data read by the `/system` renderer, with the host's mode label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugSystemProjection {
+    pub mode_label: String,
+    pub prompt: DebugSystemPrompt,
+}
+
+/// Published usage telemetry remains optional: absence is not zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugTokenProjection {
+    pub active_context_used: usize,
+    pub context_window: u32,
+    pub last_input: Option<u32>,
+    pub last_output: Option<u32>,
+    pub cache_hit: Option<u32>,
+    pub cache_miss: Option<u32>,
+    pub total_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub api_message_count: usize,
+    pub chat_message_count: usize,
+    pub model: String,
+    pub cost: DebugCostProjection,
+}
+
+/// Already-authoritative monetary values and bounded route attribution.
+/// Calculation and price/source selection stay with the TUI host; formatting,
+/// ordering and coverage wording belong to the portable handlers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCostProjection {
+    pub currency: CommandCurrency,
+    pub total: f64,
+    pub parent_turns: f64,
+    pub subagents: f64,
+    pub display_floor: f64,
+    pub priced_turns: u32,
+    pub unpriced_turns: u32,
+    pub legacy_coverage_unknown: bool,
+    pub user_declared_estimates: bool,
+    pub itemized_turns: u32,
+    pub route_amounts: Vec<DebugRouteCost>,
+    pub turn_history_capacity: usize,
+    pub unpriced_reason_labels: Vec<String>,
+    pub unpriced_classes: Vec<String>,
+    pub pricing_provenances: Vec<String>,
+    pub live_pricing_defects: Vec<String>,
+    pub unusable_pricing_defects: Vec<String>,
+    pub route_receipts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugRouteCost {
+    pub route: String,
+    pub amount: f64,
+}
+
+/// A cache inspection's semantic layer, retaining the same public JSON
+/// field order as the baseline without borrowing the client request type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugPromptLayer {
+    pub name: String,
+    pub stability: DebugPromptLayerStability,
+    pub char_len: usize,
+    pub byte_len: usize,
+    pub token_estimate: usize,
+    pub sha256: String,
+    pub tool_result: Option<DebugToolResultInspection>,
+    pub turn_meta: Option<DebugTurnMetaInspection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum DebugPromptLayerStability {
+    Static,
+    History,
+    Dynamic,
+}
+
+impl DebugPromptLayerStability {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::History => "history",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugToolResultInspection {
+    pub original_chars: usize,
+    pub sent_chars: usize,
+    pub truncated: bool,
+    pub deduplicated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugTurnMetaInspection {
+    pub original_chars: usize,
+    pub sent_chars: usize,
+    pub deduplicated: bool,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugPromptInspection {
+    pub base_static_prefix_hash: String,
+    pub full_request_prefix_hash: String,
+    pub tool_catalog_hash: String,
+    pub layers: Vec<DebugPromptLayer>,
+}
+
+/// Full key fields are needed for the existing comparison and JSON report;
+/// the short hash is computed by the authoritative host hashing function.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugWarmupKey {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub static_prefix_hash: String,
+    pub tool_catalog_hash: String,
+    pub project_pack_hash: String,
+    pub skills_hash: String,
+}
+
+/// One coherent observation, including previous inspection before any write.
+/// Inspect errors occur before this value exists and never update session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugCacheInspectionObservation {
+    pub current: DebugPromptInspection,
+    pub previous: Option<DebugPromptInspection>,
+    pub current_warmup_key: DebugWarmupKey,
+    pub last_warmup_key: Option<DebugWarmupKey>,
+    pub current_warmup_hash_short: String,
+    pub last_warmup_hash_short: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugCacheInspectionUnavailable {
+    NoConcreteRoute,
+    MissingCapturedEndpoint,
+}
+
+/// A bounded turn row. Pricing class partition and amount come from the
+/// authoritative host, not a second implementation of provider billing.
+/// Missing telemetry, missing audit and a measured zero remain distinct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCacheTurn {
+    pub provider: Option<String>,
+    pub provider_identity: Option<String>,
+    pub model: Option<String>,
+    pub auto_model: bool,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_hit_tokens: Option<u32>,
+    pub cache_miss_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
+    pub reasoning_replay_tokens: Option<u32>,
+    pub priced_amount: Option<f64>,
+    pub unpriced_reason_key: Option<String>,
+    /// Original host enum order for deduplicated /cache note ordering.
+    pub unpriced_reason_sort_rank: Option<u8>,
+    pub unpriced_classes: Vec<String>,
+    pub priced_cache_read: u64,
+    pub priced_cache_miss: u64,
+    pub priced_cache_write: u64,
+    /// Coherent age at observation time; portable display rounds seconds.
+    pub age_seconds: u64,
+}
+
+/// Prompt-cache hit rates, each labelled by whose requests it covers (#6565).
+///
+/// `parent` is this conversation's own requests: the footer `cache N%` and it
+/// never change meaning. `agents` covers sub-agent and other background
+/// requests. `combined` weights both by their tokens. Each is `None` when its
+/// requests reported no cache telemetry; no report is never 0%.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DebugCacheRates {
+    pub parent: Option<u8>,
+    pub agents: Option<u8>,
+    pub combined: Option<u8>,
+}
+
+impl DebugCacheRates {
+    /// `parent 82% · agents 64% · combined 75%` with the given words, or just
+    /// `82%` when only the parent reported. `None` when nothing did.
+    #[must_use]
+    pub fn labelled(&self, parent: &str, agents: &str, combined: &str) -> Option<String> {
+        match (self.parent, self.agents) {
+            (Some(pct), None) => Some(format!("{pct}%")),
+            (None, None) => None,
+            _ => Some(
+                [
+                    (parent, self.parent),
+                    (agents, self.agents),
+                    (combined, self.combined),
+                ]
+                .into_iter()
+                .filter_map(|(word, pct)| pct.map(|pct| format!("{word} {pct}%")))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            ),
+        }
+    }
+}
+
+/// Shared source for `/cache [count|stats|zones]` branches. One host read
+/// preserves ring order, optional telemetry and prefix stability evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCacheTelemetry {
+    pub model: String,
+    /// Parent/agent/combined percentages computed once by the host.
+    pub session_cache_rates: DebugCacheRates,
+    pub history: Vec<DebugCacheTurn>,
+    pub history_capacity: usize,
+    pub prefix_stability_pct: Option<u32>,
+    pub prefix_checks_total: u64,
+    pub prefix_change_count: u64,
+    pub prefix_drift_count: u64,
+    pub prefix_context_updates: u64,
+    pub prefix_pin_reason: Option<String>,
+    pub prefix_last_miss_reason: Option<String>,
+    pub last_prefix_change_desc: Option<String>,
+    pub last_pinned_prefix_hash: Option<String>,
+    pub api_message_count: usize,
+    pub non_system_message_count: usize,
+}
+
+/// Narrow, synchronous data boundary for the debug diagnostics slice.
+///
+/// No concrete provider, App, completed message, or network operation crosses
+/// this interface. Add operations only when their live branches require them.
+/// Portable handlers consume these facts without concrete host access.
+pub trait CommandDebugDiagnosticsContext {
+    fn balance_projection(&self) -> DebugBalanceProjection;
+    fn system_projection(&self) -> DebugSystemProjection;
+    fn token_projection(&self) -> DebugTokenProjection;
+    fn cost_projection(&self) -> DebugCostProjection;
+    fn cache_telemetry(&self) -> DebugCacheTelemetry;
+    /// The report builder stays host-owned; format and JSON serialization
+    /// consume only this data-only source map.
+    fn context_source_map(&self) -> DebugPromptSourceMap;
+    fn prompt_context(&self) -> DebugPromptContext;
+    /// None means no prepared snapshot exists; argument validation occurs
+    /// only after this check in the portable `/tools` handler.
+    fn tool_snapshot(&self) -> Option<DebugToolSnapshot>;
+    /// Route resolution and request inspection remain host-owned. This call
+    /// must not update the remembered inspection on failure or success.
+    fn inspect_cache(
+        &self,
+    ) -> Result<DebugCacheInspectionObservation, DebugCacheInspectionUnavailable>;
+    /// Store the already-observed inspection after portable rendering, without
+    /// rebuilding or re-inspecting the request. The baseline also commits on
+    /// JSON serialization fallback.
+    fn remember_cache_inspection(&mut self, inspection: DebugPromptInspection);
+}
+
+// ---------------------------------------------------------------------------
 // Project (FEAT-021 D1/D2/D3/D4)
 // ---------------------------------------------------------------------------
 
@@ -130,23 +456,6 @@ pub enum ProjectGoalStatus {
     Paused,
     Complete,
     Blocked,
-}
-
-/// Portable session-share projection (FEAT-021 D1).
-///
-/// Carries only the emptiness/length and the model/mode labels the live
-/// `/share` handler consumes. The session history itself, exporter I/O, and
-/// all `App` state stay host-side.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectShareProjection {
-    /// Whether the session history is empty (drives the empty-share error).
-    pub history_is_empty: bool,
-    /// Session history length used in the export message and action.
-    pub history_len: usize,
-    /// Current model label.
-    pub model: String,
-    /// Current operating-mode label.
-    pub mode_label: String,
 }
 
 /// Portable goal projection (FEAT-021 D1).
@@ -203,8 +512,6 @@ pub trait CommandProjectContext {
     fn lsp_enabled(&self) -> bool;
     /// `/lsp` set: enable or disable LSP diagnostics.
     fn lsp_set(&mut self, enabled: bool) -> Result<(), String>;
-    /// `/share` projection: session emptiness, length, model, and mode label.
-    fn share_projection(&self) -> ProjectShareProjection;
     /// `/goal` projection: visible and effective goal state.
     fn goal_state(&self) -> ProjectGoalState;
 }
@@ -476,11 +783,13 @@ pub struct PluginLegacyTool {
     pub path: PathBuf,
 }
 
-/// Portable legacy-tool scan result: directory and discovered tools.
+/// Portable legacy-tool scan result: directory, discovered tools, and load
+/// diagnostics for scripts that asked for something the loader ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginLegacyScan {
     pub dir: PathBuf,
     pub tools: Vec<PluginLegacyTool>,
+    pub diagnostics: Vec<PluginDiagnostic>,
 }
 
 /// Portable Kimi managed-plugin candidate (FEAT-020 D2).
@@ -502,6 +811,28 @@ pub struct PluginManagedScan {
     pub root: PathBuf,
     pub candidates: Vec<PluginManagedCandidate>,
     pub rejected: Vec<String>,
+}
+
+/// Portable review of a DeepSeek Harness bundle package before import: what
+/// converts, what is skipped, the authority it will request, and the content
+/// hash an exact install of the same package stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDshPreview {
+    pub package_path: PathBuf,
+    pub plugin_name: String,
+    pub source_package: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: String,
+    pub skills: Vec<String>,
+    pub remote_servers: Vec<String>,
+    pub local_servers: Vec<String>,
+    pub network_hosts: Vec<String>,
+    /// Rows that become Native host code (JavaScript run by the extension host).
+    pub native_rows: Vec<String>,
+    pub requires_node: bool,
+    /// One line per skipped row or patch operation (a manual port).
+    pub manual_ports: Vec<String>,
+    pub diagnostics: Vec<String>,
 }
 
 /// Portable marketplace candidate install plan (FEAT-020 D2).
@@ -581,6 +912,16 @@ pub struct PluginSuggestion {
     pub next_step: String,
 }
 
+/// Plugins hidden from proactive suggestions (plugin policy rule 9). Names
+/// are lowercase; each list is sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginSuggestionDismissals {
+    /// "Don't suggest again": kept across sessions until reset.
+    pub persisted: Vec<String>,
+    /// Hidden for this session only (Esc, or a review the user already opened).
+    pub session: Vec<String>,
+}
+
 /// Host plugin data for the plugin command group (FEAT-020 D1).
 ///
 /// One object-safe, synchronous facet exposing the exact-minimum typed
@@ -655,6 +996,12 @@ pub trait CommandPluginContext {
         canonical_path: &Path,
         expected_content_hash: &str,
     ) -> Result<PluginMutationReceipt, String>;
+    /// Read-only: convert a DeepSeek Harness bundle package into scratch and
+    /// review it without installing anything.
+    fn dsh_preview(&self, package: &Path) -> Result<PluginDshPreview, String> {
+        let _ = package;
+        Err("DeepSeek Harness import is not available in this host.".to_string())
+    }
     /// Read-only: marketplace state (optional host catalog + stored catalogs).
     fn marketplace_state(&self) -> Result<PluginMarketplaceState, String>;
     /// Mutation: add a local catalog document to the marketplace store.
@@ -671,6 +1018,12 @@ pub trait CommandPluginContext {
         catalog: &str,
         candidate: &str,
     ) -> Result<PluginMutationReceipt, String>;
+    /// Read-only: which plugins proactive suggestions currently skip.
+    fn suggestion_dismissals(&self) -> Result<PluginSuggestionDismissals, String>;
+    /// Mutation: let suggestions offer `name` again (every dismissed plugin
+    /// when `None`), in this session and future ones. Returns the names
+    /// cleared, sorted.
+    fn reset_suggestion_dismissals(&mut self, name: Option<&str>) -> Result<Vec<String>, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +1193,10 @@ pub enum SkillActivationError {
         available: Vec<String>,
         warnings: Vec<String>,
     },
+    InvocationRejected {
+        name: String,
+        reason: String,
+    },
     PluginRejected {
         name: String,
         reason: String,
@@ -957,11 +1314,9 @@ pub trait CommandSkillGroupContext {
 // the handlers retain exact message composition (D2/D5).
 // ---------------------------------------------------------------------------
 
-/// Portable synchronization fields a lifecycle handler maps into the
-/// temporary `SyncSession` action payload. The conversation and prompt types
-/// are `codewhale-core` request types shared by the contract and the TUI
-/// (FEAT-037 will move shared outcome ownership; FEAT-023 keeps the bounded
-/// reference only for `/fork` and `/new` transitions, D6).
+/// Portable synchronization fields carried by shared session and debug actions.
+/// Conversation and prompt types are protocol-owned shapes; concrete runtime
+/// state and host action conversion remain outside the command contract.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSyncPayload {
     pub session_id: Option<String>,
@@ -1059,6 +1414,17 @@ pub trait CommandSessionLifecycleContext {
     /// never consult it in the baseline, so their paths must not either.
     fn transition_blocked(&self) -> bool;
 
+    /// Why the transition gate is closed, in operator terms; empty means the
+    /// transition is allowed. Consulted only after [`Self::transition_blocked`]
+    /// reports a block, so the refusal can name the work that holds the
+    /// session instead of restating that it is held.
+    ///
+    /// Display projection, not a data source: the strings are pre-rendered
+    /// for a refusal message and carry no stable shape. A caller that needs
+    /// ids, durations, or owners should add a structured method instead of
+    /// parsing these back out.
+    fn transition_blockers(&self) -> Vec<String>;
+
     /// `/branch` with no argument: the current leaf when an active journaled
     /// session resolves, otherwise `None` (the baseline silently falls back
     /// to the usage message on this path).
@@ -1117,8 +1483,8 @@ pub trait CommandSessionLifecycleContext {
 // FEAT-024: session control slice (D2-D7).
 //
 // One independently optional session-control authority covering exactly the
-// host work the six control commands (`/relay`, `/rename`, `/resume`, `/rc`,
-// `/remote-env`, `/title`) consume. `CommandSessionContext` and
+// host work the seven control commands (`/relay`, `/rename`, `/resume`, `/rc`,
+// `/remote-env`, `/title`, `/color`) consume. `CommandSessionContext` and
 // `CommandSessionLifecycleContext` are deliberately not widened: control
 // authority exists only on this facet, and every delegate is an atomic host
 // operation or a semantic projection so handlers keep byte-identical
@@ -1135,6 +1501,10 @@ pub struct RelayProjection {
     /// Authoritative compact-template text (`COMPACT_TEMPLATE`), echoed with
     /// a trailing trim by the handler exactly as today.
     pub compact_template: String,
+    /// Workspace-relative path the relay is written to. The host supplies
+    /// the same path its startup loader reads first, so the writer and the
+    /// loader cannot drift.
+    pub handoff_path: String,
     pub workspace: String,
     pub mode: String,
     pub model: String,
@@ -1303,7 +1673,7 @@ pub struct HostedWorkTarget {
 /// Control authority for the session command slice (FEAT-024 D2/D5).
 ///
 /// Operation-granular synchronous delegates over the exact minimum host work
-/// the six control commands consume. Delegates reproduce the baseline
+/// the seven control commands consume. Delegates reproduce the baseline
 /// check/mutation order (transition gate before resume I/O, save before
 /// publication, single-attempt browser launch) and return portable receipts/
 /// projections or the exact host-error text the baseline surfaces. No
@@ -1313,6 +1683,16 @@ pub struct HostedWorkTarget {
 pub trait CommandSessionControlContext {
     /// Live transition gate consulted by `/resume` before any picker or I/O.
     fn transition_blocked(&self) -> bool;
+
+    /// Why the transition gate is closed, in operator terms; empty means the
+    /// transition is allowed. Consulted only after [`Self::transition_blocked`]
+    /// reports a block.
+    ///
+    /// Display projection, not a data source: the strings are pre-rendered
+    /// for a refusal message and carry no stable shape. A caller that needs
+    /// ids, durations, or owners should add a structured method instead of
+    /// parsing these back out.
+    fn transition_blockers(&self) -> Vec<String>;
 
     /// `/relay`: authoritative semantic snapshot (workspace/mode/model/goal/
     /// to-do/plan/compact-template). Unavailable sources are represented as
@@ -1351,6 +1731,10 @@ pub trait CommandSessionControlContext {
     /// `/title off|clear|none`: clear the session window title with the same
     /// baseline persistence/redraw semantics.
     fn clear_window_title(&mut self) -> Result<(), String>;
+
+    fn composer_color(&self) -> Option<String>;
+
+    fn set_composer_color(&mut self, color: Option<String>) -> Result<(), String>;
 
     /// `/rc status`: current remote-control status line.
     fn remote_status(&self) -> String;

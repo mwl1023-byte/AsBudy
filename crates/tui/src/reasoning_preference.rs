@@ -4,21 +4,20 @@
 //! tools can resolve and normalize reasoning effort without depending on
 //! presentation types.
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::work_graph::ReasoningEffortTier;
 
 /// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
 ///
 /// The config file accepts every supported string value for forward-compat with
-/// providers that expose the full spectrum; DeepSeek currently collapses
-/// `Low`/`Medium` → `high`. OpenAI Codex normalizes inherited DeepSeek-only
+/// providers that expose the full spectrum; first-party DeepSeek routes send
+/// `low`/`high`/`max`, so `Minimal` → `low`, `Medium`/`XHigh` → `high`, and
+/// `Ultra` → `max`. OpenAI Codex normalizes inherited DeepSeek-only
 /// `Off` to `Low` and keeps `XHigh`, `Max`, and `Ultra` distinct at the
 /// provider boundary. The default keyboard cycler walks the three DeepSeek-distinct
 /// tiers: `Off` → `High` → `Max` → `Off`; provider-aware callers should use
-/// [`ReasoningEffort::cycle_next_in`] with the route's effort list. Auto
-/// routing has no concrete provider yet, so
-/// [`ReasoningEffort::cycle_next_for_auto_model`] retains the full
-/// provider-neutral preference vocabulary until dispatch.
+/// [`ReasoningEffort::cycle_next_in`] with the route's picker ladder
+/// (`picker_efforts_for_route`), which also covers Auto routing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Off,
@@ -147,7 +146,7 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn from_setting_for_provider(value: &str, provider: ApiProvider) -> Self {
+    pub fn from_setting_for_provider(value: &str, provider: ProviderKind) -> Self {
         Self::from_setting(value).normalize_for_provider(provider)
     }
 
@@ -185,20 +184,20 @@ impl ReasoningEffort {
 
     /// Provider-facing label for user-visible surfaces.
     #[must_use]
-    pub fn display_label_for_provider(self, provider: ApiProvider) -> &'static str {
+    pub fn display_label_for_provider(self, provider: ProviderKind) -> &'static str {
         match (provider, self.normalize_for_provider(provider)) {
-            (ApiProvider::OpenaiCodex, Self::Minimal) => "low",
-            (ApiProvider::OpenaiCodex, Self::Low) => "low",
-            (ApiProvider::OpenaiCodex, Self::Medium) => "medium",
-            (ApiProvider::OpenaiCodex, Self::High) => "high",
+            (ProviderKind::OpenaiCodex, Self::Minimal) => "low",
+            (ProviderKind::OpenaiCodex, Self::Low) => "low",
+            (ProviderKind::OpenaiCodex, Self::Medium) => "medium",
+            (ProviderKind::OpenaiCodex, Self::High) => "high",
             // `xhigh`, `max` and `ultra` are three distinct rungs the Codex
             // roster publishes per model; collapsing them onto "xhigh" dates
             // from when xhigh was the ceiling and made the top tiers
             // unreachable and indistinguishable.
-            (ApiProvider::OpenaiCodex, Self::XHigh) => "xhigh",
-            (ApiProvider::OpenaiCodex, Self::Ultra) => "ultra",
-            (ApiProvider::OpenaiCodex, Self::Max) => "max",
-            (ApiProvider::Xai, Self::XHigh) => "xhigh",
+            (ProviderKind::OpenaiCodex, Self::XHigh) => "xhigh",
+            (ProviderKind::OpenaiCodex, Self::Ultra) => "ultra",
+            (ProviderKind::OpenaiCodex, Self::Max) => "max",
+            (ProviderKind::Xai, Self::XHigh) => "xhigh",
             (_, effort) => effort.short_label(),
         }
     }
@@ -212,8 +211,8 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn normalize_for_provider(self, provider: ApiProvider) -> Self {
-        if provider != ApiProvider::OpenaiCodex {
+    pub fn normalize_for_provider(self, provider: ProviderKind) -> Self {
+        if provider != ProviderKind::OpenaiCodex {
             return self;
         }
         match self {
@@ -238,7 +237,18 @@ impl ReasoningEffort {
     #[must_use]
     pub fn normalize_for_route(
         self,
-        provider: ApiProvider,
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Self {
+        self.normalize_for_route_identity(provider, provider.as_str(), base_url, wire_model)
+    }
+
+    #[must_use]
+    pub fn normalize_for_route_identity(
+        self,
+        provider: ProviderKind,
+        identity: &str,
         base_url: &str,
         wire_model: &str,
     ) -> Self {
@@ -256,17 +266,20 @@ impl ReasoningEffort {
                 other => other,
             };
         }
-        if provider == ApiProvider::OpenaiCodex {
+        if provider == ProviderKind::OpenaiCodex {
             return normalized;
         }
         // First-party DeepSeek routes document `reasoning_effort` low/high/max
         // on the wire (no medium), so `low` is a real, cheaper tier there and
         // must reach the wire as low; `medium` rounds up to high because the
-        // dialect has no such value (#52).
-        if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        // dialect has no such value (#52). `minimal`, `xhigh`, and `ultra`
+        // collapse exactly as `client::deepseek_effort` sends them, so the
+        // effective tier names what the wire receives (#6650).
+        if matches!(provider, ProviderKind::Deepseek) {
             return match normalized {
-                Self::Low => Self::Low,
-                Self::Medium => Self::High,
+                Self::Minimal => Self::Low,
+                Self::Medium | Self::XHigh => Self::High,
+                Self::Ultra => Self::Max,
                 other => other,
             };
         }
@@ -274,15 +287,36 @@ impl ReasoningEffort {
         // documents the complete none/low/medium/high/max ladder. Keep every
         // real tier distinct for normal turns; only Codewhale-only synonyms
         // are folded onto the nearest documented spelling.
-        if provider == ApiProvider::OllamaCloud {
+        if provider == ProviderKind::OllamaCloud {
             return match normalized {
                 Self::Minimal => Self::Low,
                 Self::XHigh | Self::Ultra => Self::Max,
                 other => other,
             };
         }
-        if let Some(values) = Self::catalog_effort_values(provider, wire_model) {
-            return Self::clamp_to_catalog_efforts(normalized, provider, wire_model, &values);
+        let catalog_identity = if provider == ProviderKind::Custom {
+            identity
+        } else {
+            provider.as_str()
+        };
+        if let Some(offering) = crate::provider_lake::catalog_offering_for_route(
+            provider,
+            catalog_identity,
+            base_url,
+            wire_model,
+        ) && let Some(values) = Self::catalog_effort_values_for_offering(&offering)
+        {
+            if normalized == Self::Off
+                && provider != ProviderKind::Custom
+                && !codewhale_config::provider_base_url_is_official(provider, base_url)
+            {
+                return Self::Off;
+            }
+            return Self::clamp_to_catalog_efforts(
+                normalized,
+                Self::catalog_default_for_offering(&offering),
+                &values,
+            );
         }
         match normalized {
             Self::Low | Self::Medium => Self::High,
@@ -290,8 +324,31 @@ impl ReasoningEffort {
         }
     }
 
-    pub fn catalog_default(provider: ApiProvider, wire_model: &str) -> Option<Self> {
-        let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
+    pub(crate) fn offering_for_reasoning(
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<codewhale_config::catalog::CatalogOffering> {
+        crate::provider_lake::catalog_offering_for_route(
+            provider,
+            provider.as_str(),
+            base_url,
+            wire_model,
+        )
+    }
+
+    pub fn catalog_default(
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<Self> {
+        let offering = Self::offering_for_reasoning(provider, base_url, wire_model)?;
+        Self::catalog_default_for_offering(&offering)
+    }
+
+    fn catalog_default_for_offering(
+        offering: &codewhale_config::catalog::CatalogOffering,
+    ) -> Option<Self> {
         offering.reasoning_options.iter().find_map(|option| {
             option
                 .get("type")
@@ -304,15 +361,27 @@ impl ReasoningEffort {
         })
     }
 
-    pub fn catalog_effort_values(provider: ApiProvider, wire_model: &str) -> Option<Vec<Self>> {
-        let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
+    pub fn catalog_effort_values(
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<Vec<Self>> {
+        let offering = Self::offering_for_reasoning(provider, base_url, wire_model)?;
+        Self::catalog_effort_values_for_offering(&offering)
+    }
+
+    pub(crate) fn catalog_effort_values_for_offering(
+        offering: &codewhale_config::catalog::CatalogOffering,
+    ) -> Option<Vec<Self>> {
         let mut efforts = Vec::new();
+        let mut has_toggle = false;
         for option in &offering.reasoning_options {
-            if !option
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("effort"))
-            {
+            let kind = option.get("type").and_then(|value| value.as_str());
+            if kind.is_some_and(|kind| kind.eq_ignore_ascii_case("toggle")) {
+                has_toggle = true;
+                continue;
+            }
+            if !kind.is_some_and(|kind| kind.eq_ignore_ascii_case("effort")) {
                 continue;
             }
             let Some(values) = option.get("values").and_then(|value| value.as_array()) else {
@@ -325,6 +394,11 @@ impl ReasoningEffort {
                     efforts.push(effort);
                 }
             }
+        }
+        // A Models.dev `toggle` beside an effort ladder means reasoning can also
+        // be switched off (#6396); an explicit off must not round up.
+        if has_toggle && !efforts.is_empty() && !efforts.contains(&Self::Off) {
+            efforts.insert(0, Self::Off);
         }
         (!efforts.is_empty()).then_some(efforts)
     }
@@ -339,36 +413,36 @@ impl ReasoningEffort {
             "xhigh" => Some(Self::XHigh),
             "ultra" | "ultracode" => Some(Self::Ultra),
             "max" | "maximum" => Some(Self::Max),
-            "auto" | "automatic" | "adaptive" => Some(Self::Auto),
+            "auto" | "automatic" | "adaptive" | "default" => Some(Self::Auto),
             _ => None,
         }
     }
 
-    fn clamp_to_catalog_efforts(
-        normalized: Self,
-        provider: ApiProvider,
-        wire_model: &str,
-        values: &[Self],
-    ) -> Self {
+    fn clamp_to_catalog_efforts(normalized: Self, default: Option<Self>, values: &[Self]) -> Self {
         if matches!(normalized, Self::Auto) || values.contains(&normalized) {
             return normalized;
         }
         let aliased = match normalized {
             Self::Minimal if values.contains(&Self::Low) => Self::Low,
             Self::Max | Self::Ultra if values.contains(&Self::XHigh) => Self::XHigh,
-            Self::Off => Self::catalog_default(provider, wire_model).unwrap_or(Self::High),
+            Self::Off => default.unwrap_or(Self::High),
             other => other,
         };
         if values.contains(&aliased) {
-            aliased
-        } else {
-            Self::catalog_default(provider, wire_model).unwrap_or(Self::High)
+            return aliased;
         }
+        if let Some(default) = default {
+            return default;
+        }
+        if values.contains(&Self::High) {
+            return Self::High;
+        }
+        normalized.nearest_in(values).unwrap_or(Self::High)
     }
 
     #[must_use]
-    pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
-        if provider != ApiProvider::OpenaiCodex {
+    pub fn api_value_for_provider(self, provider: ProviderKind) -> Option<&'static str> {
+        if provider != ProviderKind::OpenaiCodex {
             return self.api_value();
         }
         Some(match self.normalize_for_provider(provider) {
@@ -388,7 +462,7 @@ impl ReasoningEffort {
     #[must_use]
     pub fn api_value_for_route(
         self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         wire_model: &str,
     ) -> Option<&'static str> {
@@ -397,7 +471,7 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
+    pub fn as_setting_for_provider(self, provider: ProviderKind) -> &'static str {
         self.api_value_for_provider(provider)
             .unwrap_or_else(|| self.as_setting())
     }
@@ -406,7 +480,7 @@ impl ReasoningEffort {
     #[must_use]
     pub fn as_setting_for_route(
         self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         wire_model: &str,
     ) -> &'static str {
@@ -498,23 +572,6 @@ impl ReasoningEffort {
     /// listed are handled by [`Self::nearest_in`], never by an alias table.
     fn index_in(self, efforts: &[Self]) -> Option<usize> {
         efforts.iter().position(|&effort| effort == self)
-    }
-
-    /// Cycle the unresolved auto-model preference without applying any
-    /// provider's normalization rules prematurely.
-    #[must_use]
-    pub fn cycle_next_for_auto_model(self) -> Self {
-        match self {
-            Self::Auto => Self::Off,
-            Self::Off => Self::Minimal,
-            Self::Minimal => Self::Low,
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-            Self::High => Self::XHigh,
-            Self::XHigh => Self::Ultra,
-            Self::Ultra => Self::Max,
-            Self::Max => Self::Auto,
-        }
     }
 }
 
@@ -621,21 +678,5 @@ mod tests {
         assert_eq!(XHigh.cycle_next_in(&capped), Off);
         // An empty ladder falls back to the provider-neutral cycle.
         assert_eq!(Off.cycle_next_in(&[]), Off.cycle_next());
-    }
-
-    #[test]
-    fn reasoning_effort_cycle_for_auto_model_walks_the_full_vocabulary() {
-        use ReasoningEffort::*;
-        let mut effort = Auto;
-        let mut seen = vec![effort];
-        for _ in 0..8 {
-            effort = effort.cycle_next_for_auto_model();
-            seen.push(effort);
-        }
-        assert_eq!(
-            seen,
-            vec![Auto, Off, Minimal, Low, Medium, High, XHigh, Ultra, Max]
-        );
-        assert_eq!(Max.cycle_next_for_auto_model(), Auto);
     }
 }

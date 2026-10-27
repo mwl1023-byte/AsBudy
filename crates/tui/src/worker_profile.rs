@@ -14,8 +14,6 @@
 //! contract. Runtime enforcement of every declared field remains incremental
 //! follow-up work (#3217).
 
-#![allow(dead_code)] // foundation: consumers are wired in a follow-up (#3217).
-
 use crate::fleet::role::FleetRole;
 use serde::{Deserialize, Serialize};
 
@@ -517,10 +515,7 @@ impl WorkerRuntimeProfile {
         };
         // Depth stays absolute; only the current position increments. Every
         // authority projection compares the position against this same ceiling.
-        let max_spawn_depth = requested
-            .max_spawn_depth
-            .min(self.max_spawn_depth)
-            .min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
+        let max_spawn_depth = requested.max_spawn_depth.min(self.max_spawn_depth);
         WorkerRuntimeProfile {
             role: requested.role.clone(),
             permissions,

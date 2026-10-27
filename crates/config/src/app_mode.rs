@@ -12,7 +12,7 @@ pub enum AppMode {
 }
 
 impl AppMode {
-    /// Productive keyboard cycle: Plan -> Act -> Operate -> Plan.
+    /// Productive keyboard cycle: Plan -> Work -> Operate -> Plan.
     ///
     /// Operate joins the visible cycle as the always-on fleet operation:
     /// a lead plans slices, then workers execute against an optional burn rate.
@@ -25,14 +25,25 @@ impl AppMode {
             "plan" | "2" => Some(Self::Plan),
             "operate" | "operation" | "ops" | "3" => Some(Self::Operate),
             // Invisible one-way permission shorthand only — never a visible
-            // mode. These spellings resolve to Act; the bypass posture they
+            // mode. These spellings resolve to Work; the bypass posture they
             // imply is carried by the permission surface (settings load,
             // CLI/runtime wire), not by a mode.
-            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
-                Some(Self::Agent)
-            }
+            other if Self::is_legacy_bypass_alias(other) => Some(Self::Agent),
             _ => None,
         }
+    }
+
+    /// Legacy mode spellings (`yolo`, `4`, `bypass`, `bypass-permissions`,
+    /// `bypasspermissions`) that carried the Full Access posture. [`Self::parse`]
+    /// folds them to Work; callers that must preserve the permission meaning
+    /// (the `/mode` command, the runtime policy wire, persisted thread records)
+    /// ask this one predicate instead of keeping their own copy of the list.
+    #[must_use]
+    pub fn is_legacy_bypass_alias(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
+        )
     }
 
     #[must_use]
@@ -56,6 +67,15 @@ impl AppMode {
     /// Short label used in the UI footer.
     pub fn label(self) -> &'static str {
         match self {
+            AppMode::Agent => "WORK",
+            AppMode::Plan => "PLAN",
+            AppMode::Operate => "OPERATE",
+        }
+    }
+
+    #[must_use]
+    pub fn hook_label(self) -> &'static str {
+        match self {
             AppMode::Agent => "ACT",
             AppMode::Plan => "PLAN",
             AppMode::Operate => "OPERATE",
@@ -65,7 +85,7 @@ impl AppMode {
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
-            AppMode::Agent => "Act",
+            AppMode::Agent => "Work",
             AppMode::Plan => "Plan",
             AppMode::Operate => "Operate",
         }
@@ -98,7 +118,7 @@ impl AppMode {
     /// Description shown in help or onboarding text.
     pub fn description(self) -> &'static str {
         match self {
-            AppMode::Agent => "Act mode - direct work in the current session with tools",
+            AppMode::Agent => "Work mode - direct work in the current session with tools",
             AppMode::Plan => "Plan mode - research and design before implementing",
             AppMode::Operate => {
                 "Operate mode - always-on fleet operation: lead plans, optional $/time burn rate, workers follow the plan"
@@ -136,12 +156,25 @@ mod tests {
         assert_eq!(AppMode::parse("auto"), Some(AppMode::Agent));
         assert_eq!(AppMode::parse("3"), Some(AppMode::Operate));
         assert_eq!(AppMode::parse("operate"), Some(AppMode::Operate));
-        // Legacy YOLO spellings resolve to Act; the bypass posture they imply
+        // Legacy YOLO spellings resolve to Work; the bypass posture they imply
         // travels on the permission surface, not on a mode.
         assert_eq!(AppMode::parse("YOLO"), Some(AppMode::Agent));
         assert_eq!(AppMode::parse("4"), Some(AppMode::Agent));
         assert_eq!(AppMode::parse("bypass"), Some(AppMode::Agent));
         assert_eq!(AppMode::parse("bypass-permissions"), Some(AppMode::Agent));
+        for alias in [
+            "yolo",
+            " YOLO ",
+            "4",
+            "bypass",
+            "bypass-permissions",
+            "BypassPermissions",
+        ] {
+            assert!(AppMode::is_legacy_bypass_alias(alias), "{alias}");
+        }
+        for mode in ["agent", "act", "plan", "operate", "1", "full-access", ""] {
+            assert!(!AppMode::is_legacy_bypass_alias(mode), "{mode}");
+        }
         assert_eq!(AppMode::parse("multitask"), None);
         assert_eq!(AppMode::parse("5"), None);
         assert_eq!(AppMode::parse("fast"), None);
@@ -186,7 +219,7 @@ mod tests {
     }
 
     /// `from_setting` is the de-facto default: an absent, empty, or unreadable
-    /// stored value must land on Act rather than panicking or picking Operate.
+    /// stored value must land on Work rather than panicking or picking Operate.
     #[test]
     fn from_setting_falls_back_to_act_for_unknown_values() {
         assert_eq!(AppMode::from_setting(""), AppMode::Agent);
@@ -197,11 +230,11 @@ mod tests {
 
     #[test]
     fn labels_and_descriptions_cover_every_mode() {
-        assert_eq!(AppMode::Agent.label(), "ACT");
+        assert_eq!(AppMode::Agent.label(), "WORK");
         assert_eq!(AppMode::Plan.label(), "PLAN");
         assert_eq!(AppMode::Operate.label(), "OPERATE");
 
-        assert_eq!(AppMode::Agent.display_name(), "Act");
+        assert_eq!(AppMode::Agent.display_name(), "Work");
         assert_eq!(AppMode::Plan.display_name(), "Plan");
         assert_eq!(AppMode::Operate.display_name(), "Operate");
 

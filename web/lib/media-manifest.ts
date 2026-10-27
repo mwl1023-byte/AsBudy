@@ -28,14 +28,24 @@
 
 import type { LocalizedText } from "./content/vocabulary";
 
-/** Captured build identity is independent of the current source/release. */
+/**
+ * The homepage terminal. The site renders it as live text from the PTY cell
+ * capture (`capture`, via scripts/render-terminal-capture.mjs and
+ * components/terminal-capture.tsx); `src` is the same frame rasterized by
+ * that script for the README, which cannot run the site's renderer. Captured
+ * build identity is independent of the current source/release. This local
+ * website-demo session exercises real Engine tools; it does not qualify an
+ * inference provider. sourceCommit is the candidate's base; exact binary and
+ * dirty-source hashes are recorded in terminal-captures/manifest.json.
+ */
 export const TERMINAL_SCREENSHOT = {
-  src: "/codewhale-tui-d7a9a1c.png",
-  width: 1132,
-  height: 632,
-  version: "0.10.0",
-  sourceCommit: "d7a9a1c8c15635a84099d5fc2ee965146cf197c7",
-  sha256: "73e56158d6ec6c04933ce787c23c07322ce4d509b54050b54b12d181b09314b8",
+  capture: "web/lib/terminal-captures/website-home-100x24.json",
+  src: "/codewhale-tui-0102-demo.png",
+  width: 1000,
+  height: 480,
+  version: "0.10.2",
+  sourceCommit: "bd0c32567024d5bc3efac7d13331c68711de031e",
+  sha256: "43ebde941cedb690612945b712e9565e92a441045c78646bf8841f3ad43ac369",
 } as const;
 
 /** Published-asset budgets; see the module contract for what tests inspect. */

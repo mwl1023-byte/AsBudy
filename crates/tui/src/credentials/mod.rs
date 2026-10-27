@@ -15,7 +15,7 @@
 //!
 //! This is a **design port into idiomatic Rust, not a line-for-line copy**.
 //! pi's module is async TypeScript over a `Provider` record with a single
-//! `auth.json`; CodeWhale's is synchronous Rust over `ApiProvider` and the
+//! `auth.json`; CodeWhale's is synchronous Rust over `ProviderKind` and the
 //! several pre-existing on-disk stores (secret store, config file, ambient
 //! environment, externally consented CLI credential files). The four ideas
 //! taken verbatim in spirit are: one type-tagged credential per provider,
@@ -74,7 +74,7 @@ pub(crate) use store::{CredentialInfo, CredentialStore};
 /// adopting this type never moves a token between stores.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Credential {
-    /// A bearer API key held in CodeWhale's own durable store.
+    /// A bearer API key held in Codewhale's durable store or process memory.
     ApiKey { key: String },
     /// An OAuth access token plus its expiry, if the flow reported one.
     ///

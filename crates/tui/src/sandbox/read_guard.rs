@@ -13,6 +13,15 @@
 //! harness process and are never wrapped by `sandbox-exec` or `bwrap` at all,
 //! so the OS-level rules alone left the largest hole wide open.
 //!
+//! # Two scopes
+//!
+//! Every rule denies the model's own file tools. Only `DenyScope::Process`
+//! rules are also handed to the OS wrappers, so a subprocess cannot read them.
+//! A tool's own auth config (`~/.config/gh/hosts.yml`, `~/.npmrc`) is
+//! `DenyScope::ModelContext`: refusing that file to the process does not hide
+//! the token, because the tool prints it on request; it only stops the tool
+//! from starting at all.
+//!
 //! # What this is NOT
 //!
 //! **This is defense-in-depth, not a security boundary.** It raises the cost of
@@ -120,6 +129,18 @@ impl ReadDenial {
     }
 }
 
+/// Which reads a rule applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyScope {
+    /// Every read the sandbox controls: the model's file tools and any
+    /// subprocess. For key material, system policy, and stores that belong to
+    /// a different principal.
+    Process,
+    /// Only the reads the model performs through its own file tools. For a
+    /// tool's own auth config, which the tool must open to work at all.
+    ModelContext,
+}
+
 /// A single deny rule. Kept as an enum rather than a bare path so the refusal
 /// message can name the rule ("SSH keys") instead of echoing a secret path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +156,8 @@ pub enum DenyRule {
         resolved: Option<PathBuf>,
         /// Human label, e.g. "SSH keys (~/.ssh)".
         label: &'static str,
+        /// Whether this rule also denies subprocess reads.
+        scope: DenyScope,
     },
     /// Any file whose *name* matches, anywhere on disk. Used for `.env`, which
     /// has no fixed location.
@@ -146,12 +169,13 @@ pub enum DenyRule {
 
 impl DenyRule {
     /// A subtree rule that also remembers where its path really leads.
-    fn subtree(path: PathBuf, label: &'static str) -> Self {
+    fn subtree(path: PathBuf, label: &'static str, scope: DenyScope) -> Self {
         let resolved = canonicalize_best_effort(&path);
         DenyRule::Subtree {
             resolved: (resolved != path).then_some(resolved),
             path,
             label,
+            scope,
         }
     }
 
@@ -230,8 +254,8 @@ impl ReadDenylist {
                 p.file_name()
                     .is_some_and(|name| name == std::ffi::OsStr::new(".env"))
             });
-            for (raw, label) in default_denied_subtrees() {
-                let rule = DenyRule::subtree(normalize_lexically(&raw), label);
+            for (raw, label, scope) in default_denied_subtrees() {
+                let rule = DenyRule::subtree(normalize_lexically(&raw), label, scope);
                 if rule.is_within_any(&exempt_normalized) {
                     continue;
                 }
@@ -249,6 +273,7 @@ impl ReadDenylist {
             subtrees.push(DenyRule::subtree(
                 path,
                 "a path in `sandbox_denied_read_paths`",
+                DenyScope::Process,
             ));
         }
 
@@ -265,18 +290,25 @@ impl ReadDenylist {
         self.subtrees.is_empty() && !self.deny_env_files
     }
 
-    /// Every literal subtree path, for handing to the OS wrappers
-    /// (`SandboxManager::set_denied_read_subpaths`). The filename rule (`.env`)
-    /// has no fixed path and therefore cannot be expressed to Seatbelt or
-    /// bubblewrap as a subpath — it is enforced in-process only, which is a
-    /// real gap for shell commands and is documented as such.
+    /// Every literal subtree path that must also be denied to subprocesses,
+    /// for handing to the OS wrappers (`SandboxManager::set_denied_read_subpaths`).
+    /// Rules scoped to [`DenyScope::ModelContext`] are omitted: refusing a
+    /// program the config it needs to start disables the program without
+    /// keeping its bytes out of the model. The filename rule (`.env`) has no
+    /// fixed path and therefore cannot be expressed to Seatbelt or bubblewrap
+    /// as a subpath — it is enforced in-process only, which is a real gap for
+    /// shell commands and is documented as such.
     #[must_use]
     pub fn subtree_paths(&self) -> Vec<PathBuf> {
         self.subtrees
             .iter()
             .filter_map(|rule| match rule {
-                DenyRule::Subtree { path, .. } => Some(path.clone()),
-                DenyRule::FileName { .. } => None,
+                DenyRule::Subtree {
+                    path,
+                    scope: DenyScope::Process,
+                    ..
+                } => Some(path.clone()),
+                DenyRule::Subtree { .. } | DenyRule::FileName { .. } => None,
             })
             .collect()
     }
@@ -392,10 +424,15 @@ fn is_env_file(path: &Path) -> bool {
 
 /// The built-in default deny set.
 ///
-/// Chosen against one test: **would denying this break ordinary development?**
-/// Everything here is a credential store that build tools, language servers,
-/// test runners, and source reading never need. Deliberately excluded, despite
-/// containing or neighbouring secrets:
+/// Every rule here denies a read to the model's own file tools. A rule also
+/// denies subprocess reads (DenyScope::Process) only when the item is key
+/// material, system policy, or another principal's store: something no
+/// ordinary program opens in order to work. A tool's own auth config is
+/// scoped to the model instead (DenyScope::ModelContext), because `gh`
+/// cannot start without `~/.config/gh/hosts.yml`, so denying that file to the
+/// process disables the CLI without putting its token any further out of
+/// reach, since the CLI will still print it on request. Deliberately
+/// excluded, despite containing or neighbouring secrets:
 ///
 /// - `~/.gitconfig` — read constantly by tooling; holds config, not secrets.
 ///   (`~/.git-credentials`, which holds the secrets, IS denied.)
@@ -408,74 +445,124 @@ fn is_env_file(path: &Path) -> bool {
 ///   it are listed instead.
 /// - The user's source tree, `~/Documents`, `~/Downloads` — a coding agent must
 ///   still be able to read the user's code, which is the entire point.
-fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
+fn default_denied_subtrees() -> Vec<(PathBuf, &'static str, DenyScope)> {
+    use DenyScope::{ModelContext, Process};
+    let mut out = machine_wide_denied_subtrees();
+    if let Ok(Some(active)) = codewhale_paths::codewhale_home() {
+        out.push((
+            active.join("secrets"),
+            "Codewhale secret store (active home)",
+            Process,
+        ));
+        out.push((
+            active.join("credentials"),
+            "Codewhale OAuth credentials (active home)",
+            Process,
+        ));
+    }
+    if let Some(legacy) = codewhale_paths::legacy_deepseek_home() {
+        out.push((
+            legacy.join("secrets"),
+            "Codewhale secret store (legacy home)",
+            Process,
+        ));
+        out.push((
+            legacy.join("credentials"),
+            "Codewhale OAuth credentials (legacy home)",
+            Process,
+        ));
+    }
+    out.push((
+        crate::oauth::auth_file_path(),
+        "Codex CLI login (resolved auth file)",
+        Process,
+    ));
+    out.extend(runtime_daemon_socket_dirs());
     let Some(home) = dirs::home_dir() else {
-        // No home directory: only the machine-wide entries are meaningful.
-        return machine_wide_denied_subtrees();
+        return out;
     };
     let h = |rel: &str| home.join(rel);
 
-    let mut out = vec![
+    let mut ambient: Vec<(PathBuf, &'static str, DenyScope)> = vec![
         // --- SSH / GPG ---
-        (h(".ssh"), "SSH keys and known-hosts (~/.ssh)"),
-        (h(".gnupg"), "GnuPG keyring (~/.gnupg)"),
+        (h(".ssh"), "SSH keys and known-hosts (~/.ssh)", Process),
+        (h(".gnupg"), "GnuPG keyring (~/.gnupg)", Process),
         // --- Cloud provider credentials ---
-        (h(".aws"), "AWS credentials (~/.aws)"),
+        (h(".aws"), "AWS credentials (~/.aws)", ModelContext),
         (
             h(".config/gcloud"),
             "Google Cloud credentials (~/.config/gcloud)",
+            ModelContext,
         ),
-        (h(".azure"), "Azure credentials (~/.azure)"),
-        (h(".kube"), "Kubernetes credentials (~/.kube)"),
-        (h(".oci"), "Oracle Cloud credentials (~/.oci)"),
+        (h(".azure"), "Azure credentials (~/.azure)", ModelContext),
+        (h(".kube"), "Kubernetes credentials (~/.kube)", ModelContext),
+        (h(".oci"), "Oracle Cloud credentials (~/.oci)", ModelContext),
         (
             h(".config/doctl"),
             "DigitalOcean credentials (~/.config/doctl)",
+            ModelContext,
         ),
-        (h(".config/fly"), "Fly.io credentials (~/.config/fly)"),
-        (h(".vercel"), "Vercel credentials (~/.vercel)"),
+        (
+            h(".config/fly"),
+            "Fly.io credentials (~/.config/fly)",
+            ModelContext,
+        ),
+        (h(".vercel"), "Vercel credentials (~/.vercel)", ModelContext),
         (
             h(".wrangler/config"),
             "Cloudflare credentials (~/.wrangler/config)",
+            ModelContext,
         ),
         (
             h(".config/gh/hosts.yml"),
             "GitHub CLI tokens (~/.config/gh/hosts.yml)",
+            ModelContext,
         ),
         (
             h(".config/glab-cli"),
             "GitLab CLI tokens (~/.config/glab-cli)",
+            ModelContext,
         ),
         // --- Package-registry and network credential files ---
-        (h(".netrc"), "netrc credentials (~/.netrc)"),
-        (h("_netrc"), "netrc credentials (~/_netrc)"),
-        (h(".pgpass"), "PostgreSQL password file (~/.pgpass)"),
-        (h(".my.cnf"), "MySQL credentials (~/.my.cnf)"),
-        (h(".npmrc"), "npm auth tokens (~/.npmrc)"),
-        (h(".pypirc"), "PyPI auth tokens (~/.pypirc)"),
+        (h(".netrc"), "netrc credentials (~/.netrc)", ModelContext),
+        (h("_netrc"), "netrc credentials (~/_netrc)", ModelContext),
+        (
+            h(".pgpass"),
+            "PostgreSQL password file (~/.pgpass)",
+            ModelContext,
+        ),
+        (h(".my.cnf"), "MySQL credentials (~/.my.cnf)", ModelContext),
+        (h(".npmrc"), "npm auth tokens (~/.npmrc)", ModelContext),
+        (h(".pypirc"), "PyPI auth tokens (~/.pypirc)", ModelContext),
         (
             h(".git-credentials"),
             "stored git credentials (~/.git-credentials)",
+            ModelContext,
         ),
         (
             h(".cargo/credentials"),
             "crates.io token (~/.cargo/credentials)",
+            ModelContext,
         ),
         (
             h(".cargo/credentials.toml"),
             "crates.io token (~/.cargo/credentials.toml)",
+            ModelContext,
         ),
         (
             h(".docker/config.json"),
             "Docker registry auth (~/.docker/config.json)",
+            ModelContext,
         ),
         (
             h(".m2/settings-security.xml"),
             "Maven master password (~/.m2)",
+            ModelContext,
         ),
         (
             h(".gradle/gradle.properties"),
             "Gradle credentials (~/.gradle/gradle.properties)",
+            ModelContext,
         ),
         // --- Codewhale's own credential stores ---
         // Duplicated with `tools::file::is_codewhale_credential_path` on
@@ -484,73 +571,164 @@ fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
         (
             h(".codewhale/secrets"),
             "Codewhale secret store (~/.codewhale/secrets)",
+            Process,
         ),
         (
             h(".deepseek/secrets"),
             "Codewhale secret store (~/.deepseek/secrets)",
+            Process,
+        ),
+        (
+            h(".codewhale/credentials"),
+            "Codewhale OAuth credentials (ambient home)",
+            Process,
+        ),
+        (
+            h(".deepseek/credentials"),
+            "Codewhale OAuth credentials (ambient legacy home)",
+            Process,
+        ),
+        (h(".kimi/credentials"), "Kimi CLI credentials", Process),
+        (
+            h(".claude/.credentials.json"),
+            "Claude Code credentials",
+            Process,
+        ),
+        (
+            h(".codewhale-cu/recordings"),
+            "Computer Use recordings and trajectories",
+            Process,
         ),
         // --- Browser profiles (cookies, saved passwords, session tokens) ---
-        (h(".mozilla"), "Firefox profile (~/.mozilla)"),
+        (h(".mozilla"), "Firefox profile (~/.mozilla)", Process),
         (
             h(".config/google-chrome"),
             "Chrome profile (~/.config/google-chrome)",
+            Process,
         ),
         (
             h(".config/chromium"),
             "Chromium profile (~/.config/chromium)",
+            Process,
         ),
         (
             h(".config/BraveSoftware"),
             "Brave profile (~/.config/BraveSoftware)",
+            Process,
         ),
     ];
 
     if cfg!(target_os = "macos") {
-        out.extend([
+        ambient.extend([
             (
                 h("Library/Keychains"),
                 "macOS keychain (~/Library/Keychains)",
+                Process,
             ),
             (
                 h("Library/Application Support/Google/Chrome"),
                 "Chrome profile (~/Library/Application Support/Google/Chrome)",
+                Process,
             ),
             (
                 h("Library/Application Support/Firefox"),
                 "Firefox profile (~/Library/Application Support/Firefox)",
+                Process,
             ),
             (
                 h("Library/Application Support/BraveSoftware"),
                 "Brave profile (~/Library/Application Support/BraveSoftware)",
+                Process,
             ),
-            (h("Library/Safari"), "Safari profile (~/Library/Safari)"),
+            (
+                h("Library/Safari"),
+                "Safari profile (~/Library/Safari)",
+                Process,
+            ),
             (
                 h("Library/Cookies"),
                 "macOS cookie store (~/Library/Cookies)",
+                Process,
             ),
         ]);
     }
 
-    out.extend(machine_wide_denied_subtrees());
+    out.extend(ambient);
     out
 }
 
-fn machine_wide_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
-    let mut out: Vec<(PathBuf, &'static str)> = vec![
+fn runtime_daemon_socket_dirs() -> Vec<(PathBuf, &'static str, DenyScope)> {
+    use codewhale_app_server::daemon_socket::{SocketPathInputs, resolve_socket_path};
+    let live = SocketPathInputs::from_environment(None).unwrap_or_else(|_| SocketPathInputs {
+        xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        user_home: codewhale_paths::user_home(),
+        macos: cfg!(target_os = "macos"),
+        ..SocketPathInputs::default()
+    });
+    let layouts = [
+        live.clone(),
+        SocketPathInputs {
+            codewhale_home_override: None,
+            ..live.clone()
+        },
+        SocketPathInputs {
+            codewhale_home_override: None,
+            xdg_runtime_dir: None,
+            ..live.clone()
+        },
+        SocketPathInputs {
+            codewhale_home_override: None,
+            xdg_runtime_dir: None,
+            macos: false,
+            ..live
+        },
+    ];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for layout in &layouts {
+        if let Ok(socket) = resolve_socket_path(layout)
+            && let Some(dir) = socket.parent()
+            && !dirs.iter().any(|seen| seen == dir)
+        {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| {
+            (
+                dir,
+                "Codewhale runtime daemon socket and owner receipt",
+                DenyScope::Process,
+            )
+        })
+        .collect()
+}
+
+fn machine_wide_denied_subtrees() -> Vec<(PathBuf, &'static str, DenyScope)> {
+    use DenyScope::Process;
+    let mut out: Vec<(PathBuf, &'static str, DenyScope)> = vec![
         (
             PathBuf::from("/etc/shadow"),
             "system password hashes (/etc/shadow)",
+            Process,
         ),
         (
             PathBuf::from("/etc/sudoers"),
             "sudoers policy (/etc/sudoers)",
+            Process,
         ),
-        (PathBuf::from("/etc/ssh"), "system SSH host keys (/etc/ssh)"),
+        (
+            PathBuf::from("/etc/ssh"),
+            "system SSH host keys (/etc/ssh)",
+            Process,
+        ),
     ];
     if cfg!(target_os = "macos") {
         out.push((
             PathBuf::from("/Library/Keychains"),
             "system keychain (/Library/Keychains)",
+            Process,
         ));
     }
     out
@@ -731,6 +909,66 @@ mod tests {
         CWD_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Unix only: the fixture redirects the home directory through `HOME`,
+    // and Windows resolves the profile through the known-folder API instead.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_read_guard_denies_active_and_known_agent_credentials_in_real_file_tool() {
+        use crate::tools::spec::{ToolContext, ToolSpec};
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("private fixture");
+        let home = temp.path().join("home");
+        let active_home = temp.path().join("active");
+        let codex = temp.path().join("codex");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", home.to_str().unwrap());
+        let _active =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", active_home.to_str().unwrap());
+        let _codex = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex.to_str().unwrap());
+        let _auth = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_AUTH_FILE");
+        assert_eq!(dirs::home_dir().as_deref(), Some(home.as_path()));
+        let denied = [
+            active_home.join("credentials/fixture.json"),
+            codex.join("auth.json"),
+            home.join(".kimi/credentials/fixture.json"),
+            home.join(".claude/.credentials.json"),
+            home.join(".codewhale-cu/recordings/trajectories/fixture.jsonl"),
+        ];
+        for path in &denied {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "read-s10-synthetic-value").unwrap();
+        }
+        struct RestoreActive(Option<Arc<ReadDenylist>>);
+        impl Drop for RestoreActive {
+            fn drop(&mut self) {
+                *ACTIVE.write().unwrap() = self.0.take();
+            }
+        }
+        let previous = ACTIVE.write().unwrap().take();
+        let _restore = RestoreActive(previous);
+        set_active(ReadDenylist::build(true, &[], &[]));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let context = ToolContext::new(temp.path());
+        for path in denied {
+            let result = runtime.block_on(
+                crate::tools::file::ReadFileTool
+                    .execute(serde_json::json!({"path": path}), &context),
+            );
+            assert!(result.is_err(), "file tool read a credential source");
+        }
+        let safe = home.join(".claude/settings.json");
+        std::fs::write(&safe, "ordinary-readable-setting").unwrap();
+        let allowed = runtime
+            .block_on(
+                crate::tools::file::ReadFileTool
+                    .execute(serde_json::json!({"path": safe}), &context),
+            )
+            .expect("ordinary settings remain readable");
+        assert!(allowed.content.contains("ordinary-readable-setting"));
     }
 
     #[test]

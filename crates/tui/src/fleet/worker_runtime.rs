@@ -29,8 +29,8 @@ use super::profile::{
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
 };
 use super::role::runtime_role_for_member;
-use crate::config::{ApiProvider, Config};
-use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
+use crate::config::{Config, ProviderKind};
+use crate::route_runtime::resolve_route_candidate;
 use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, FleetRole};
 use crate::worker_profile::{ChildLaunchManifest, ModelRoute, ToolScope, WorkerRuntimeProfile};
 
@@ -58,6 +58,8 @@ struct FrozenFleetMember {
     reasoning_effort: Option<String>,
     max_spawn_depth: Option<u32>,
     origin: ProfileOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_preset: Option<crate::extension_host::composition_scope::NativePresetRef>,
 }
 
 impl FrozenFleetMember {
@@ -78,6 +80,7 @@ impl FrozenFleetMember {
             reasoning_effort: profile.profile.reasoning_effort.clone(),
             max_spawn_depth: profile.profile.delegation.max_spawn_depth,
             origin: profile.origin,
+            native_preset: profile.native_preset.clone(),
         }
     }
 
@@ -87,6 +90,7 @@ impl FrozenFleetMember {
         }
         Ok(AgentProfile {
             id: self.id,
+            native_preset: self.native_preset,
             display_name: self.display_name,
             description: self.description,
             requires: self.requires,
@@ -287,8 +291,8 @@ pub fn validate_fleet_task_routes(
         }
         if config.is_none()
             && let Some(provider_id) = explicit_provider.as_deref()
-            && ApiProvider::parse(provider_id)
-                .is_none_or(|provider| provider == ApiProvider::Custom)
+            && ProviderKind::parse(provider_id)
+                .is_none_or(|provider| provider == ProviderKind::Custom)
         {
             bail!(
                 "Fleet task `{}` names custom provider=`{provider_id}`, but a provider name alone does not prove its endpoint or model; attach the live route config before creating the run",
@@ -297,7 +301,10 @@ pub fn validate_fleet_task_routes(
         }
         if pinned_model && explicit_provider.is_none() {
             let config = config.expect("provider authority checked above");
-            let (provider, base_url) = (config.api_provider(), config.active_route_base_url());
+            let identity = config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?;
+            let (provider, base_url) = (identity.provider, config.base_url_for_route(&identity));
             if let Err(reason) =
                 crate::route_runtime::validate_unpinned_model_provider(provider, &model, &base_url)
             {
@@ -363,7 +370,7 @@ fn validate_fleet_reasoning_effort(
         // the more useful provider/model diagnosis.
         return Ok(());
     };
-    let provider = ApiProvider::parse(&route.provider_kind).unwrap_or(ApiProvider::Custom);
+    let provider = ProviderKind::parse(&route.provider_kind).unwrap_or(ProviderKind::Custom);
     let capability = crate::config::provider_capability(provider, &route.wire_model_id);
     if capability.thinking_supported {
         return Ok(());
@@ -405,7 +412,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     worker_id: &str,
     run_id: &str,
     task_spec: &FleetTaskSpec,
-    _worker_spec: &FleetWorkerSpec,
+    worker_spec: &FleetWorkerSpec,
     model: &str,
     workspace: &std::path::Path,
     coordination_workspace: &std::path::Path,
@@ -418,7 +425,23 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let role = effective_fleet_role(worker_profile, agent_profile);
     let agent_type = runtime_role_for_member(role.as_deref().unwrap_or_default());
     let tool_profile = fleet_tool_profile(worker_profile);
-    let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
+    super::placement::require_match(task_spec, worker_spec)?;
+    let mut objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
+    if worker_spec.environment.is_some()
+        || task_spec
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.placement.is_some())
+        || matches!(
+            worker_spec.host,
+            codewhale_protocol::fleet::FleetHostSpec::Tailscale { .. }
+        )
+    {
+        objective.push_str("\n\nExecution environment (operator-declared context; runtime permissions still apply):\n");
+        objective.push_str(&serde_json::to_string(&super::placement::environment(
+            worker_spec,
+        ))?);
+    }
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
     let loadout = effective_fleet_loadout(worker_profile, agent_profile);
     let (effective_model, model_source) =
@@ -483,6 +506,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         worker_id: worker_id.to_string(),
         run_id: run_id.to_string(),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(session_name),
         objective,
         role,
@@ -685,33 +709,39 @@ pub(crate) fn resolve_fleet_route_with_config(
     let (candidate, provider_id, provider_exact_id, route_source) = if let Some(config) = config {
         let identity = match explicit_provider_id.as_deref() {
             Some(provider_id) => config.resolve_provider_identity(provider_id).ok()?,
-            None => config
-                .resolve_provider_identity(&config.provider_identity_for(config.api_provider()))
-                .ok()?,
+            None => config.active_provider_identity().ok()?,
         };
-        let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
-        let route = resolve_runtime_route(&scoped, identity.provider, model_selector)
-            .ok()?
-            .validate()
-            .ok()?;
-        let provider_exact_id = (route.identity.provider == ApiProvider::Custom)
-            .then_some(route.identity.exact_id)
-            .flatten();
+        let route = crate::route_runtime::resolve_runtime_route_for_identity(
+            config,
+            &identity,
+            model_selector,
+        )
+        .ok()?
+        .validate()
+        .ok()?;
+        let provider_exact_id = route.identity.persisted_id().map(str::to_string);
         (
             route.candidate,
-            route.identity.key,
+            route.identity.key.to_string(),
             provider_exact_id,
             "runtime_route",
         )
     } else {
         let provider_id = explicit_provider_id.as_deref()?;
-        let provider = ApiProvider::parse(provider_id)?;
-        if provider == ApiProvider::Custom {
+        let metadata = codewhale_config::descriptors::compatibility_for_selector(provider_id)?;
+        let provider = metadata.kind;
+        if provider == ProviderKind::Custom {
             return None;
         }
-        let candidate =
-            resolve_route_candidate(provider, model_selector, None, None, None, None).ok()?;
+        let candidate = resolve_route_candidate(
+            provider,
+            model_selector,
+            Some(metadata.default_model),
+            Some(metadata.base_url.to_owned()),
+            None,
+            None,
+        )
+        .ok()?;
         let provider_id = candidate.provider_id().as_str().to_string();
         (candidate, provider_id, None, "resolver")
     };
@@ -766,8 +796,8 @@ pub(crate) fn resolve_fleet_route_from_worker_report(
         Some(provider_exact_id) => Some(non_empty_trimmed(provider_exact_id)?),
         None => None,
     };
-    let provider_kind = ApiProvider::parse(provider)?;
-    if provider_exact_id.is_some() && provider_kind != ApiProvider::Custom {
+    let provider_kind = ProviderKind::parse(provider)?;
+    if provider_exact_id.is_some() && provider_kind != ProviderKind::Custom {
         return None;
     }
     let provider_id = provider_exact_id.unwrap_or(provider);
@@ -1189,7 +1219,7 @@ fn effective_fleet_model_with_source(
 /// The provider id a resolved agent profile EXPLICITLY pins, if any (#4093).
 ///
 /// This preserves user-named OpenAI-compatible custom providers such as
-/// `lm-studio` instead of collapsing them through [`ApiProvider`]. Runtime
+/// `lm-studio` instead of collapsing them through [`ProviderKind`]. Runtime
 /// launch paths can set `Config.provider` to this exact id so the normal config
 /// resolver finds `[providers.<id>]` (#3965).
 ///
@@ -1219,10 +1249,12 @@ pub(crate) fn explicit_fleet_provider_id(agent_profile: Option<&AgentProfile>) -
 /// instead of re-deriving it and risking a second, divergent policy. User-named
 /// custom providers intentionally return `None` here; launch paths that can
 /// carry strings should use [`explicit_fleet_provider_id`].
-pub(crate) fn explicit_fleet_provider(agent_profile: Option<&AgentProfile>) -> Option<ApiProvider> {
+pub(crate) fn explicit_fleet_provider(
+    agent_profile: Option<&AgentProfile>,
+) -> Option<ProviderKind> {
     explicit_fleet_provider_id(agent_profile)
         .as_deref()
-        .and_then(ApiProvider::parse)
+        .and_then(ProviderKind::parse)
 }
 
 pub(crate) fn effective_fleet_reasoning_effort(
@@ -1426,9 +1458,11 @@ pub(crate) fn fleet_model_route_for_loadout(
 
 /// Apply exec hardening to a worker spec from fleet config (#3027).
 ///
-/// Filters tools against allowed/disallowed lists, caps max_steps to
-/// config's max_turns, and returns the objective with system prompt
-/// appended when configured.
+/// Filters tools against allowed/disallowed lists and caps max_steps to
+/// config's max_turns. `append_system_prompt` is deliberately not folded into
+/// the objective: the worker command delivers it once, as system prompt text,
+/// via `--append-system-prompt`, and the objective must stay identical to the
+/// persisted launch manifest prompt.
 pub fn apply_exec_hardening(
     mut spec: AgentWorkerSpec,
     exec: &codewhale_config::FleetExecConfig,
@@ -1444,8 +1478,7 @@ pub fn apply_exec_hardening(
     spec.max_spawn_depth = spec
         .max_spawn_depth
         .min(spec.runtime_profile.max_spawn_depth)
-        .min(exec.max_spawn_depth)
-        .min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
+        .min(exec.max_spawn_depth);
     spec.runtime_profile.max_spawn_depth = spec.max_spawn_depth;
     spec.runtime_profile.spawn_depth = spec.spawn_depth;
 
@@ -1466,14 +1499,6 @@ pub fn apply_exec_hardening(
         if !spec.runtime_profile.denied_tools.contains(rule) {
             spec.runtime_profile.denied_tools.push(rule.clone());
         }
-    }
-
-    // Append system prompt
-    if !exec.append_system_prompt.is_empty() {
-        spec.objective = format!(
-            "{}\n\n[Policy]\n{}",
-            spec.objective, exec.append_system_prompt
-        );
     }
 
     spec
@@ -1573,6 +1598,7 @@ fn profile_origin_label(origin: crate::fleet::roster::ProfileOrigin) -> &'static
         crate::fleet::roster::ProfileOrigin::Config => "config",
         crate::fleet::roster::ProfileOrigin::Personal => "personal",
         crate::fleet::roster::ProfileOrigin::Workspace => "workspace",
+        crate::fleet::roster::ProfileOrigin::ClaudeCode => "claude",
     }
 }
 
@@ -1622,9 +1648,9 @@ mod tests {
     fn explicit_deepseek_config() -> Config {
         Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("test-key".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(Some("test-key".to_string()), None)
     }
 
     #[test]
@@ -1690,6 +1716,7 @@ mod tests {
             instructions: format!("do {id}"),
             worker,
             workspace: Some(FleetWorkspaceRequirements {
+                placement: None,
                 root: Some(PathBuf::from(".")),
                 required_files: Vec::new(),
                 writable_paths: vec![PathBuf::from(".")],
@@ -1711,6 +1738,7 @@ mod tests {
     #[test]
     fn write_capable_fleet_worker_requires_and_persists_a_bounded_claim() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -1756,6 +1784,7 @@ mod tests {
     #[test]
     fn fleet_claim_roots_share_one_manager_workspace_namespace() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -1766,12 +1795,14 @@ mod tests {
         };
         let mut nested = fleet_task("nested", None);
         nested.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from("pkg-a")),
             writable_paths: vec![PathBuf::from("src")],
             ..FleetWorkspaceRequirements::default()
         });
         let mut root = fleet_task("root", None);
         root.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from(".")),
             writable_paths: vec![PathBuf::from("pkg-a/src")],
             ..FleetWorkspaceRequirements::default()
@@ -1815,6 +1846,7 @@ mod tests {
     #[test]
     fn fleet_manifest_rejects_control_characters_before_lease() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -1892,6 +1924,7 @@ mod tests {
         loadout: codewhale_config::FleetLoadout,
     ) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: Some(format!("{role} profile")),
             description: Some(format!("{role} description")),
@@ -1984,6 +2017,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -2580,6 +2614,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -2626,6 +2661,7 @@ mod tests {
     #[test]
     fn role_only_consultant_aliases_keep_high_reasoning_and_locked_posture() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -2703,6 +2739,7 @@ mod tests {
         // worker spec, so the model picked in /model is the model that runs.
         let task = fleet_task("build", None);
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -3162,7 +3199,7 @@ mod tests {
         // provider actually drove resolution, whatever wire id/aggregator
         // mapping the resolver's catalog assigns.
         let openrouter_candidate = resolve_route_candidate(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("deepseek-v4-flash"),
             None,
             None,
@@ -3237,7 +3274,7 @@ mod tests {
             .expect("saved cross-provider profile route should resolve");
 
         let openrouter_candidate = resolve_route_candidate(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("deepseek-v4-flash"),
             None,
             None,
@@ -3619,6 +3656,7 @@ mod tests {
         profile.profile.provider = Some("deepseek".to_string());
         profile.profile.model = Some("deepseek-v4-flash".to_string());
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4102,6 +4140,7 @@ mod tests {
     #[test]
     fn fleet_task_max_steps_zero_or_omitted_is_unbounded_and_positive_is_enforced() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4144,6 +4183,7 @@ mod tests {
         );
         profile.profile.model = Some("glm-5.2".to_string());
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4261,6 +4301,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4304,6 +4345,7 @@ mod tests {
     #[test]
     fn fleet_worker_spec_model_route_precedence_is_profile_unpinned_task_then_session() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4431,6 +4473,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4524,6 +4567,7 @@ mod tests {
             metadata: Default::default(),
         };
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4546,17 +4590,10 @@ mod tests {
         )
         .expect("worker spec with empty profiles");
 
-        // Root fleet worker runs at depth 0; its budget equals the shared
-        // sub-agent default (3) so fleet and sub-agents are one substrate and
-        // at least 3 nested delegation levels are afforded.
         assert_eq!(spec.spawn_depth, 0);
         assert_eq!(spec.max_spawn_depth, codewhale_config::DEFAULT_SPAWN_DEPTH);
-        assert_eq!(spec.max_spawn_depth, 3);
+        assert_eq!(spec.max_spawn_depth, u32::MAX);
 
-        // End-to-end reachability: walk the SAME gate the SubAgentRuntime
-        // enforces (`would_exceed_depth` = `spawn_depth + 1 > max_spawn_depth`).
-        // A depth-0 root must reach 3 nested levels, then stop. This fails if
-        // anyone lowers the shared default below 3 (Hunter: afford >= 3).
         let hardened = apply_exec_hardening(spec, &codewhale_config::FleetExecConfig::default());
         let would_exceed = |spawn_depth: u32| spawn_depth + 1 > hardened.max_spawn_depth;
         assert!(
@@ -4566,14 +4603,15 @@ mod tests {
         assert!(!would_exceed(1), "depth-1 child must spawn to depth 2");
         assert!(!would_exceed(2), "depth-2 child must spawn to depth 3");
         assert!(
-            would_exceed(3),
-            "depth 3 is the afforded ceiling; depth 4 is blocked"
+            !would_exceed(8),
+            "default delegation continues beyond eight levels"
         );
     }
 
     #[test]
     fn fleet_fanout_role_loadouts_keep_distinct_child_models() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "local-worker".to_string(),
             name: "Local worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4637,6 +4675,7 @@ mod tests {
                 }),
                 workspace: matches!(&expected_type, FleetRole::Builder).then(|| {
                     FleetWorkspaceRequirements {
+                        placement: None,
                         root: Some(PathBuf::from(".")),
                         required_files: Vec::new(),
                         writable_paths: vec![PathBuf::from(".")],
@@ -4697,7 +4736,7 @@ mod tests {
 
     #[test]
     fn fleet_route_parity_uses_shared_router_candidates() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use crate::model_routing::{RouterCandidates, provider_router_candidates};
 
         // Fleet emits the SAME `ModelRoute` seam the sub-agent assignment path
@@ -4748,7 +4787,7 @@ mod tests {
             ModelRoute::Inherit => parent.to_string(),
         };
 
-        let deepseek = provider_router_candidates(ApiProvider::Deepseek, parent);
+        let deepseek = provider_router_candidates(ProviderKind::Deepseek, parent);
         assert_eq!(
             resolve(
                 &fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Fast),
@@ -4760,7 +4799,7 @@ mod tests {
 
         // A provider with no known fast sibling must keep children on the parent
         // model rather than fabricating a cloud id (#3166 route assertion).
-        let no_sibling = provider_router_candidates(ApiProvider::Anthropic, parent);
+        let no_sibling = provider_router_candidates(ProviderKind::Anthropic, parent);
         assert_eq!(no_sibling.cheap, None);
         assert_eq!(
             resolve(
@@ -4778,6 +4817,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4804,11 +4844,12 @@ mod tests {
     }
 
     #[test]
-    fn exec_hardening_applies_and_clamps_spawn_depth() {
+    fn exec_hardening_applies_explicit_spawn_depth_without_a_product_cap() {
         let spec = AgentWorkerSpec {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4842,10 +4883,7 @@ mod tests {
             ..Default::default()
         };
         let hardened = apply_exec_hardening(spec.clone(), &exec);
-        assert_eq!(
-            hardened.max_spawn_depth,
-            codewhale_config::MAX_SPAWN_DEPTH_CEILING
-        );
+        assert_eq!(hardened.max_spawn_depth, 99);
 
         let exec = codewhale_config::FleetExecConfig {
             max_spawn_depth: 0,
@@ -4914,11 +4952,12 @@ mod tests {
     }
 
     #[test]
-    fn exec_hardening_appends_system_prompt() {
+    fn exec_hardening_leaves_policy_prompt_out_of_the_objective() {
         let spec = AgentWorkerSpec {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "do the thing".to_string(),
             role: None,
@@ -4941,8 +4980,8 @@ mod tests {
             ..Default::default()
         };
         let hardened = apply_exec_hardening(spec, &exec);
-        assert!(hardened.objective.contains("do the thing"));
-        assert!(hardened.objective.contains("[Policy]"));
-        assert!(hardened.objective.contains("never push to main"));
+        // The policy travels as system prompt text on the worker command
+        // (`--append-system-prompt`), never duplicated into the task prompt.
+        assert_eq!(hardened.objective, "do the thing");
     }
 }

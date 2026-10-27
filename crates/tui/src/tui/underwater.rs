@@ -154,7 +154,11 @@ fn launch_recent_entries(app: &App) -> (Vec<LaunchRecentEntry>, bool) {
             LaunchRecentEntry {
                 id: session.id.clone(),
                 title,
-                detail: age,
+                detail: if session.interrupted {
+                    format!("interrupted · {age}")
+                } else {
+                    age
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -637,7 +641,11 @@ impl ShellPhase {
         {
             return Self::Failed;
         }
+        // A child agent's unanswered approval or question is the person's
+        // move, even while other agents keep working: the footer says
+        // "waiting on you", not "agents underway" (#6565).
         if app.pending_user_input_prompt.is_some()
+            || !app.pending_child_requests.is_empty()
             || app
                 .task_panel
                 .iter()
@@ -679,7 +687,7 @@ impl ShellPhase {
 
 /// Exhaustive on purpose: a new [`AppMode`] must be handed a Policy ink
 /// deliberately rather than inheriting act's by falling through a wildcard.
-fn header_mode_ink(mode: AppMode) -> ChromeInk {
+pub(crate) fn header_mode_ink(mode: AppMode) -> ChromeInk {
     match mode {
         AppMode::Plan => ChromeInk::PolicyPlan,
         AppMode::Operate => ChromeInk::PolicyOperate,
@@ -687,7 +695,7 @@ fn header_mode_ink(mode: AppMode) -> ChromeInk {
     }
 }
 
-fn header_permission_ink(mode: ApprovalMode) -> ChromeInk {
+pub(crate) fn header_permission_ink(mode: ApprovalMode) -> ChromeInk {
     match mode {
         ApprovalMode::Suggest | ApprovalMode::Never => ChromeInk::PermissionAsk,
         ApprovalMode::Auto => ChromeInk::PermissionAutoReview,
@@ -892,7 +900,7 @@ pub(crate) fn phase_marker_with_activity(
     }
 }
 
-fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
+pub(crate) fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
     match mode {
         AppMode::Agent => tr(locale, MessageId::ChipModeAct),
         AppMode::Plan => tr(locale, MessageId::ChipModePlan),
@@ -907,22 +915,8 @@ fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
 /// Tool-approval posture only. Filesystem scope is a separate fact and only
 /// earns header columns when it is worth reading — see
 /// [`filesystem_scope_notice`].
-fn permission_label(app: &App) -> Cow<'static, str> {
-    let locale = app.ui_locale;
-    if app.mode == AppMode::Plan {
-        return tr(locale, MessageId::ChipPermissionReadOnly);
-    }
-    match app.approval_mode {
-        ApprovalMode::Suggest => tr(locale, MessageId::ChipPermissionAsk),
-        ApprovalMode::Auto => tr(locale, MessageId::ChipPermissionAuto),
-        // Keep the effective permission explicit. `bypass` is an
-        // implementation detail and, more importantly, can imply that
-        // repository law no longer applies. Full Access never bypasses
-        // constitution rules. This is **tool-approval posture**, not
-        // filesystem scope — see filesystem_scope_notice.
-        ApprovalMode::Bypass => tr(locale, MessageId::ChipPermissionFullAccess),
-        ApprovalMode::Never => tr(locale, MessageId::ChipPermissionNever),
-    }
+pub(crate) fn permission_label(app: &App) -> Cow<'static, str> {
+    crate::core::authority::permission_label_for(app.ui_locale, app.mode, app.approval_mode)
 }
 
 /// The effective filesystem scope — but only when it says something the
@@ -965,10 +959,10 @@ fn filesystem_scope_notice(app: &App) -> Option<Cow<'static, str>> {
                 | crate::sandbox::SandboxPolicy::ExternalSandbox { .. }
         );
     match policy {
-        crate::sandbox::SandboxPolicy::ReadOnly if unenforced => {
+        crate::sandbox::SandboxPolicy::ReadOnly { .. } if unenforced => {
             Some(Cow::Borrowed("files: read-only (unenforced)"))
         }
-        crate::sandbox::SandboxPolicy::ReadOnly => {
+        crate::sandbox::SandboxPolicy::ReadOnly { .. } => {
             (app.mode != AppMode::Plan).then_some(Cow::Borrowed("files: read-only"))
         }
         // `DangerFullAccess` only ever arises from the Bypass posture
@@ -1251,7 +1245,7 @@ pub(crate) fn mcp_remedy_command(app: &App) -> Option<String> {
     use crate::tui::session_boot::{McpServerBootState, PluginBootSummary, SessionBootSurface};
     let boot = SessionBootSurface::from_parts(
         app.mcp_snapshot.as_ref(),
-        app.mcp_initializing,
+        app.mcp_boot_initializing(),
         &app.mcp_connecting,
         app.mcp_configured_count,
         PluginBootSummary::default(),
@@ -1304,7 +1298,7 @@ fn mcp_launch_lines(app: &App, text_width: usize) -> McpLaunchBlock {
     // discard it would be waste.
     let boot = SessionBootSurface::from_parts(
         app.mcp_snapshot.as_ref(),
-        app.mcp_initializing,
+        app.mcp_boot_initializing(),
         &app.mcp_connecting,
         app.mcp_configured_count,
         PluginBootSummary::default(),
@@ -1498,6 +1492,9 @@ struct LaunchFit {
     context: bool,
     help: bool,
     notice: bool,
+    whats_new: usize,
+    /// The "no model connected · run /provider" line (UX-3).
+    setup: bool,
     heading: bool,
     blanks: usize,
     shown: usize,
@@ -1520,6 +1517,8 @@ impl LaunchFit {
             + (self.context as usize)
             + (self.help as usize)
             + (self.notice as usize)
+            + self.whats_new
+            + (self.setup as usize)
             + self.blanks * self.gap
             + 1
             + (self.heading as usize)
@@ -1533,17 +1532,29 @@ impl LaunchFit {
 /// Shed the card down to `height`, in a fixed order: rhythm, the migration
 /// notice, the MCP block's detail, identity/help chrome, then the tail of
 /// the recent list. The overflow row keeps any hidden sessions reachable.
+/// The "no model connected" line goes last of all: on a keyless first run
+/// it is the only thing on the card that explains why nothing will answer.
 ///
 /// The MCP block gives up its rows before the recent list does (recent work
 /// is what the screen is *for*) but keeps its summary line until almost
 /// everything else has gone, because "2 failed" in one row still tells the
 /// truth that the footer chip could not.
-fn launch_fit(height: usize, recent: usize, has_more: bool, notice: bool, mcp: usize) -> LaunchFit {
+fn launch_fit(
+    height: usize,
+    recent: usize,
+    has_more: bool,
+    notice: bool,
+    whats_new: usize,
+    mcp: usize,
+    setup: bool,
+) -> LaunchFit {
     let mut fit = LaunchFit {
         brand: true,
         context: true,
         help: true,
         notice,
+        whats_new,
+        setup,
         heading: recent > 0 || has_more,
         blanks: LAUNCH_SEPARATORS,
         shown: recent,
@@ -1560,27 +1571,58 @@ fn launch_fit(height: usize, recent: usize, has_more: bool, notice: bool, mcp: u
             2 => fit.blanks = 0,
             3 => fit.notice = false,
             4 => {
+                while fit.whats_new > 0 && fit.rows() > height {
+                    fit.whats_new -= 1;
+                }
+            }
+            5 => {
                 while fit.mcp > 1 && fit.rows() > height {
                     fit.mcp -= 1;
                 }
             }
-            5 => fit.help = false,
-            6 => fit.context = false,
-            7 => fit.heading = false,
-            8 => fit.brand = false,
-            9 => {
+            6 => fit.help = false,
+            7 => fit.context = false,
+            8 => fit.heading = false,
+            9 => fit.brand = false,
+            10 => {
                 while fit.shown > 0 && fit.rows() > height {
                     fit.shown -= 1;
                     fit.see_all = true;
                 }
             }
-            10 => fit.mcp = 0,
-            11 => fit.see_all = false,
+            11 => fit.mcp = 0,
+            12 => fit.see_all = false,
+            13 => fit.setup = false,
             _ => break,
         }
         step += 1;
     }
     fit
+}
+
+fn whats_new_launch_lines(app: &App, text_width: usize) -> Vec<(String, bool)> {
+    let Some(notice) = app.launch.whats_new.as_ref() else {
+        return Vec::new();
+    };
+    if app.launch.return_to_session {
+        return Vec::new();
+    }
+    let headline = notice.headline();
+    let mut lines: Vec<(String, bool)> = if text_display_width(&headline) <= text_width {
+        vec![(headline, false)]
+    } else {
+        let mut rows = crate::tui::onboarding::wrap_words(&notice.updated, text_width);
+        if let Some(counts) = &notice.counts {
+            rows.extend(crate::tui::onboarding::wrap_words(counts, text_width));
+        }
+        rows.into_iter().map(|row| (row, false)).collect()
+    };
+    let notes = [notice.notes_with_command(), notice.notes.clone()]
+        .into_iter()
+        .find(|line| text_display_width(line) <= text_width)
+        .unwrap_or_else(|| notice.url.clone());
+    lines.push((notes, true));
+    lines
 }
 
 pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
@@ -1623,9 +1665,13 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     }
 
     let (entries, has_more) = launch_recent_entries(app);
+    // Nothing will answer a message until a model is connected; the card
+    // says so instead of letting the first Enter fail silently (UX-3).
+    let no_model_connected = app.onboarding_needs_api_key;
     // Built before the fit ladder runs: how many rows the block wants is a
     // fact about this workspace's servers, not about the pane.
     let mcp_block = mcp_launch_lines(app, text_width);
+    let whats_new_lines = whats_new_launch_lines(app, text_width);
     // Brand occupies the header only; recent titles retain the whole reading lane.
     // Scale the canonical raster derivative before sacrificing any controls.
     use crate::tui::mark::MarkSize;
@@ -1646,7 +1692,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         entries.len(),
         has_more,
         app.launch.claude_code_detected,
+        whats_new_lines.len(),
         mcp_block.lines.len(),
+        no_model_connected,
     );
     if mark.is_some() && !(fit.brand && fit.context) {
         // At the absolute height floor the wordmark yields to the actions too.
@@ -1656,7 +1704,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             entries.len(),
             has_more,
             app.launch.claude_code_detected,
+            whats_new_lines.len(),
             mcp_block.lines.len(),
+            no_model_connected,
         );
     }
     let header_width =
@@ -1728,6 +1778,29 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             }
             text[row] = Some(Line::from(spans));
         }
+    }
+    if fit.setup {
+        let line = format!(
+            "{}{}{}",
+            tr(locale, MessageId::LaunchNoModelConnected),
+            crate::tui::session_boot::ITEM_SEPARATOR,
+            tr(locale, MessageId::LaunchRunCommand).replace("{command}", "/provider"),
+        );
+        text.push(Some(Line::from(Span::styled(
+            semantic_truncate(&line, text_width),
+            Style::default().fg(theme.warning),
+        ))));
+    }
+    for (line, muted) in whats_new_lines.iter().take(fit.whats_new) {
+        let ink = if *muted {
+            theme.text_muted
+        } else {
+            theme.text_body
+        };
+        text.push(Some(Line::from(Span::styled(
+            semantic_truncate(line, text_width),
+            Style::default().fg(ink),
+        ))));
     }
     // The migration notice, while there is still a question to answer. It
     // retires for good once `/import-claude` has been run.
@@ -1960,8 +2033,8 @@ mod launch_card_tests {
     use unicode_segmentation::UnicodeSegmentation;
 
     fn app_with_recent(titles: &[&str], total: usize) -> App {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::env::temp_dir()),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::env::temp_dir()),
         );
         app.launch.visible = true;
         app.launch.claude_code_detected = false;
@@ -1974,6 +2047,7 @@ mod launch_card_tests {
                 updated_at: chrono::Utc::now()
                     - chrono::Duration::hours(i64::try_from(index).unwrap_or(0) + 1),
                 message_count: 40 + index,
+                interrupted: false,
             })
             .collect();
         app.launch.total_workspace_sessions = total;
@@ -2088,7 +2162,7 @@ mod launch_card_tests {
             reload_required: false,
             servers,
         });
-        app.mcp_initializing = false;
+        app.set_mcp_boot_initializing(false);
         app.mcp_connecting = Vec::new();
         app
     }
@@ -2307,7 +2381,7 @@ mod launch_card_tests {
     #[test]
     fn a_boot_in_flight_says_connecting_rather_than_connected() {
         let mut app = app_with_recent(&["one"], 1);
-        app.mcp_initializing = true;
+        app.set_mcp_boot_initializing(true);
         app.mcp_configured_count = 23;
         app.mcp_connecting = Vec::new();
         let lines = painted(&app, 120, 30);
@@ -2327,17 +2401,28 @@ mod launch_card_tests {
         for height in 1usize..=16 {
             for recent in 0usize..=5 {
                 for has_more in [false, true] {
-                    for notice in [false, true] {
+                    for (notice, whats_new) in [(false, 0), (true, 0), (false, 3), (true, 2)] {
                         for mcp in 0usize..=4 {
-                            let fit = launch_fit(height, recent, has_more, notice, mcp);
-                            assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
-                            assert!(fit.shown <= recent);
-                            assert!(fit.mcp <= mcp);
-                            if fit.shown < recent {
-                                assert!(
-                                    fit.see_all || fit.rows() >= height,
-                                    "shed rows became unreachable: {fit:?}",
+                            for setup in [false, true] {
+                                let fit = launch_fit(
+                                    height, recent, has_more, notice, whats_new, mcp, setup,
                                 );
+                                assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
+                                assert!(fit.shown <= recent);
+                                assert!(fit.mcp <= mcp);
+                                if fit.shown < recent {
+                                    assert!(
+                                        fit.see_all || fit.rows() >= height,
+                                        "shed rows became unreachable: {fit:?}",
+                                    );
+                                }
+                                if setup && !fit.setup {
+                                    assert_eq!(
+                                        (fit.shown, fit.mcp, fit.see_all),
+                                        (0, 0, false),
+                                        "the no-model line outlived other rows: {fit:?}",
+                                    );
+                                }
                             }
                         }
                     }
@@ -2347,15 +2432,31 @@ mod launch_card_tests {
     }
 
     #[test]
+    fn a_keyless_launch_says_no_model_is_connected_and_how_to_fix_it() {
+        let mut app = app_with_recent(&["Fix the parser"], 1);
+        app.onboarding_needs_api_key = true;
+        let lines = painted(&app, 100, 30).join("\n");
+        assert!(lines.contains("no model connected"), "{lines}");
+        assert!(lines.contains("/provider"), "{lines}");
+        // Even a pane too short for the recent list keeps the recovery line.
+        let short = painted(&app, 100, 3).join("\n");
+        assert!(short.contains("no model connected"), "{short}");
+
+        app.onboarding_needs_api_key = false;
+        let lines = painted(&app, 100, 30).join("\n");
+        assert!(!lines.contains("no model connected"), "{lines}");
+    }
+
+    #[test]
     fn empty_workspace_omits_recent_section_but_hidden_history_stays_reachable() {
         let app = app_with_recent(&[], 0);
         let text = painted(&app, 100, 24).join("\n");
         assert!(text.contains("New session"));
         assert!(!text.contains("Recent"));
         assert!(!text.contains("No recent sessions"));
-        assert!(!launch_fit(24, 0, false, false, 0).heading);
-        assert!(launch_fit(24, 0, true, false, 0).heading);
-        assert!(launch_fit(24, 0, true, false, 0).see_all);
+        assert!(!launch_fit(24, 0, false, false, 0, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, 0, false).see_all);
     }
 
     // --- the row reads as one object -----------------------------------
@@ -2641,6 +2742,32 @@ mod launch_card_tests {
         let mut app = app_with_recent(&["one"], 9);
         crate::tui::ui::type_launch_mcp_remedy(&mut app);
         assert!(app.input.is_empty());
+    }
+
+    /// The migration notice ends with the reassurance that nothing applies
+    /// unapproved; a truncated notice drops exactly that half. The English
+    /// line must fit the card measure whole at a wide terminal.
+    #[test]
+    fn claude_notice_is_never_truncated_on_a_wide_terminal() {
+        let notice = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::LaunchNoticeClaude,
+        );
+        assert!(
+            text_display_width(&notice) <= LAUNCH_CARD_MEASURE,
+            "notice is {} cells; the card lane is {LAUNCH_CARD_MEASURE}: {notice:?}",
+            text_display_width(&notice),
+        );
+        let mut app = app_with_recent(&["one"], 1);
+        app.launch.claude_code_detected = true;
+        let state = launch_empty_state(&app, Rect::new(0, 0, 160, 40));
+        assert!(
+            state
+                .lines
+                .iter()
+                .any(|line| flatten(line).contains(notice.as_ref())),
+            "the full notice must paint at 160 columns",
+        );
     }
 
     #[test]

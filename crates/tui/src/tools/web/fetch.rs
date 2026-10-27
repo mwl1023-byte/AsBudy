@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use serde::Serialize;
 
+use super::adapter::AdapterResult;
 use super::cache::{self, CachedFetch};
 use super::extract::is_js_shell_error;
 use super::guard::{
@@ -26,7 +27,7 @@ const MAX_REDIRECTS: usize = 5;
 const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (compatible; codewhale/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/Hmbown/CodeWhale)"
+    "; +https://github.com/codewhale-hq/CodeWhale)"
 );
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,9 @@ pub(crate) struct FetchOptions {
     pub(crate) timeout: Duration,
     pub(crate) max_bytes: usize,
     pub(crate) accept: &'static str,
+    pub(crate) user_agent: &'static str,
+    method: reqwest::Method,
+    range: Option<&'static str>,
 }
 
 impl FetchOptions {
@@ -42,7 +46,23 @@ impl FetchOptions {
             timeout: timeout.min(HARD_MAX_TIMEOUT),
             max_bytes: max_bytes.clamp(1, HARD_MAX_BYTES),
             accept,
+            user_agent: USER_AGENT,
+            method: reqwest::Method::GET,
+            range: None,
         }
+    }
+
+    /// Request with the shared browser user-agent instead of the Codewhale
+    /// one. [`fetch_readable`] uses this only as the one-shot fallback after
+    /// a site refused the default agent with 401/403.
+    #[must_use]
+    pub(crate) fn with_browser_user_agent(mut self) -> Self {
+        self.user_agent = super::scrape::BROWSER_USER_AGENT;
+        self
+    }
+
+    fn uses_browser_user_agent(&self) -> bool {
+        self.user_agent == super::scrape::BROWSER_USER_AGENT
     }
 }
 
@@ -102,6 +122,10 @@ pub(crate) struct FetchAttempt {
     pub(crate) cache_busted: bool,
     /// Whether this attempt is the one that yielded a readable document.
     pub(crate) produced_content: bool,
+    /// Whether this attempt used the browser user-agent after the default
+    /// agent was refused with 401/403.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) browser_user_agent: bool,
     /// `age`, `cf-cache-status`, `x-nextjs-prerender`, `x-vercel-cache` — only
     /// those the response actually carried.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -109,13 +133,19 @@ pub(crate) struct FetchAttempt {
 }
 
 impl FetchAttempt {
-    fn record(payload: &FetchedPayload, attempt: usize, mode: CacheMode) -> Self {
+    fn record(
+        payload: &FetchedPayload,
+        attempt: usize,
+        mode: CacheMode,
+        browser_user_agent: bool,
+    ) -> Self {
         Self {
             attempt,
             status: payload.status,
             cache_hit: payload.cache_hit,
             cache_busted: mode.is_revalidate(),
             produced_content: false,
+            browser_user_agent,
             cache_headers: cache_state_headers(&payload.headers),
         }
     }
@@ -124,6 +154,9 @@ impl FetchAttempt {
         let mut facts = vec![format!("HTTP {}", self.status)];
         if self.cache_hit {
             facts.push("session cache hit".to_string());
+        }
+        if self.browser_user_agent {
+            facts.push("browser user-agent".to_string());
         }
         for (name, value) in &self.cache_headers {
             facts.push(format!("{name}={value}"));
@@ -156,23 +189,38 @@ fn cache_state_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, S
 /// and a higher-ranked borrow of the payload would force the returned future
 /// to outlive the tool context it reads.
 pub(crate) type ExtractFuture<'a, T> =
-    std::pin::Pin<Box<dyn Future<Output = Result<T, ToolError>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn Future<Output = AdapterResult<T>> + Send + 'a>>;
 
-/// A fetch that produced a readable document, plus the attempts it took.
+/// A fetch that produced a readable document or a partial page, plus the
+/// attempts it took.
 #[derive(Debug)]
 pub(crate) struct ReadableFetch<T> {
     pub(crate) payload: FetchedPayload,
-    pub(crate) document: T,
+    pub(crate) document: Readable<T>,
     pub(crate) attempts: Vec<FetchAttempt>,
 }
 
+#[derive(Debug)]
+pub(crate) enum Readable<T> {
+    Document(T),
+    Partial(PartialPage),
+}
+
+#[derive(Debug)]
+pub(crate) struct PartialPage {
+    pub(crate) document: super::extract::ExtractedDocument,
+    pub(crate) note: String,
+}
+
 /// Fetch `url` and extract it, re-fetching once past every cache when a 2xx
-/// response yields no readable content.
+/// response that was not cut off at `max_bytes` yields no readable content.
 ///
-/// This is the single place that turns the JS-shell case into either a second
-/// chance or an error the model can act on. `extract` runs against the fetched
-/// payload; only [`is_js_shell_error`] failures earn the second request, so
-/// transport failures keep the existing single-retry behavior of one request.
+/// This is the single place that turns the JS-shell case into a second chance,
+/// then into a partial page built from the response's title and description,
+/// or an error the model can act on when the head carries neither. `extract`
+/// runs against the fetched payload; only [`is_js_shell_error`] failures earn
+/// the second request, so transport failures keep the existing single-retry
+/// behavior of one request.
 pub(crate) async fn fetch_readable<'e, T, F>(
     url: &str,
     options: &FetchOptions,
@@ -220,34 +268,69 @@ async fn fetch_readable_inner<'e, T, F>(
 where
     F: Fn(FetchedPayload) -> ExtractFuture<'e, T>,
 {
-    let mut attempts: Vec<FetchAttempt> = Vec::with_capacity(2);
+    let mut attempts: Vec<FetchAttempt> = Vec::with_capacity(3);
+    let mut options = options.clone();
     for mode in [CacheMode::Default, CacheMode::Revalidate] {
-        let payload = fetch_inner(
+        let mut payload = fetch_inner(
             url,
-            options,
+            &options,
             context,
             tool_label,
             test_initial_pin.clone(),
             mode,
         )
         .await?;
-        let mut record = FetchAttempt::record(&payload, attempts.len() + 1, mode);
-        let final_url = payload.url.clone();
+        // Many sites refuse non-browser agents outright. One retry as a
+        // browser is the fallback; a second refusal is final.
+        if matches!(payload.status, 401 | 403) && !options.uses_browser_user_agent() {
+            attempts.push(FetchAttempt::record(
+                &payload,
+                attempts.len() + 1,
+                mode,
+                false,
+            ));
+            options = options.with_browser_user_agent();
+            payload = fetch_inner(
+                url,
+                &options,
+                context,
+                tool_label,
+                test_initial_pin.clone(),
+                mode,
+            )
+            .await?;
+        }
+        let mut record = FetchAttempt::record(
+            &payload,
+            attempts.len() + 1,
+            mode,
+            options.uses_browser_user_agent(),
+        );
         match extract(payload.clone()).await {
             Ok(document) => {
                 record.produced_content = true;
                 attempts.push(record);
                 return Ok(ReadableFetch {
                     payload,
-                    document,
+                    document: Readable::Document(document),
                     attempts,
                 });
+            }
+            Err(error)
+                if error.content()
+                    && is_js_shell_error(&error.error)
+                    && payload.truncated
+                    && (200..300).contains(&payload.status) =>
+            {
+                attempts.push(record);
+                return shell_outcome(payload, attempts, context, Some(options.max_bytes));
             }
             // A 2xx whose body held no readable content is the one failure a
             // second request can fix: the first response may have been a
             // cached client-side shell.
             Err(error)
-                if is_js_shell_error(&error)
+                if error.content()
+                    && is_js_shell_error(&error.error)
                     && (200..300).contains(&payload.status)
                     && mode == CacheMode::Default =>
             {
@@ -255,78 +338,165 @@ where
             }
             Err(error) => {
                 attempts.push(record);
-                return Err(if is_js_shell_error(&error) {
-                    js_shell_failure(&final_url, &attempts, context, tool_label)
-                } else {
-                    error
-                });
+                if error.content() && is_js_shell_error(&error.error) {
+                    return shell_outcome(payload, attempts, context, None);
+                }
+                return Err(error.error);
             }
         }
     }
     unreachable!("the revalidate pass either returns a document or an error");
 }
 
-/// The terminal JS-shell error, carrying the failure receipt and the recovery
-/// the *calling role* actually owns.
-fn js_shell_failure(
+fn shell_outcome<T>(
+    payload: FetchedPayload,
+    attempts: Vec<FetchAttempt>,
+    context: &ToolContext,
+    truncated_at: Option<usize>,
+) -> Result<ReadableFetch<T>, ToolError> {
+    let note = js_shell_message(&payload.url, &attempts, context, truncated_at);
+    let summary = (200..300)
+        .contains(&payload.status)
+        .then(|| {
+            super::extract::head_summary(&payload.url, Some(&payload.content_type), &payload.bytes)
+        })
+        .flatten();
+    match summary {
+        Some(document) => Ok(ReadableFetch {
+            payload,
+            document: Readable::Partial(PartialPage { document, note }),
+            attempts,
+        }),
+        None => Err(ToolError::execution_failed(note)),
+    }
+}
+
+/// The terminal JS-shell message — the error, or the note on a partial page —
+/// carrying the failure receipt and the recovery the *calling role* actually
+/// owns.
+fn js_shell_message(
     url: &str,
     attempts: &[FetchAttempt],
     context: &ToolContext,
-    tool_label: &str,
-) -> ToolError {
+    truncated_at: Option<usize>,
+) -> String {
     let receipt = attempts
         .iter()
         .map(FetchAttempt::summarize)
         .collect::<Vec<_>>()
         .join("; ");
-    ToolError::execution_failed(format!(
-        "{marker} {url} after {count} attempts, the second past every cache ({receipt}). The response parsed but held no readable body, which usually means the page renders its content with JavaScript. Recovery: {recovery}",
-        marker = super::extract::JS_SHELL_MARKER,
-        count = attempts.len(),
-        recovery = js_shell_recovery(context, tool_label),
-    ))
+    let marker = super::extract::JS_SHELL_MARKER;
+    let recovery = js_shell_recovery(url, context);
+    match truncated_at {
+        None => format!(
+            "{marker} {url} after {count} attempts, the second past every cache ({receipt}). The response parsed but held no readable body, which usually means the page renders its content with JavaScript. Recovery: {recovery}",
+            count = attempts.len(),
+        ),
+        Some(limit) if limit < HARD_MAX_BYTES => format!(
+            "{marker} {url} in the first {limit} bytes, where the response was cut off ({receipt}). Either the readable content starts past that cap or the page renders it with JavaScript. Recovery: retry with a larger `max_bytes` (up to {HARD_MAX_BYTES}). If the whole page still has no readable body, {recovery}"
+        ),
+        Some(limit) => format!(
+            "{marker} {url} in the first {limit} bytes, the fetch limit, where the response was cut off ({receipt}). Either the readable content starts past that limit or the page renders it with JavaScript. Recovery: {recovery}"
+        ),
+    }
 }
 
-/// Whether the `web.run` browse surface is reachable from this context.
+/// Whether the model-facing `Web` tool is reachable from this context.
 ///
 /// Both facts already exist: the web family is feature-gated, and a
 /// network-denied Fleet worker carries `network_access: Some(false)` on the
-/// authority envelope that also removes `web.run` from its registry
+/// authority envelope that also removes the web tools from its registry
 /// (`fleet::role::NETWORK_TOOL_DENYLIST`). Nothing new is registered here.
-fn browser_surface_available(context: &ToolContext) -> bool {
+fn web_tool_available(context: &ToolContext) -> bool {
     context.features.enabled(Feature::WebSearch) && network_authorized(context)
 }
 
-/// Whether this role could shell out to `curl` as a last resort. Read-only and
-/// shell-less roles cannot: the read-only grammar rejects a network fetch.
+/// Whether this role could shell out to `curl` as a last resort: a full shell
+/// directly, a read-only shell only through a networked `read_only: true` run.
 fn shell_fallback_available(context: &ToolContext) -> bool {
-    context.shell_policy == ShellPolicy::Full && network_authorized(context)
+    match context.shell_policy {
+        ShellPolicy::Full => network_authorized(context),
+        ShellPolicy::ReadOnly => {
+            crate::tools::shell::readonly_enforced_lane_available(context)
+                && crate::tools::shell::readonly_lane_network_access(context)
+        }
+        ShellPolicy::None => false,
+    }
 }
 
-fn network_authorized(context: &ToolContext) -> bool {
+pub(crate) fn network_authorized(context: &ToolContext) -> bool {
     context
         .tool_authority
         .as_deref()
         .is_none_or(|authority| authority.network_access != Some(false))
+        && context
+            .child_host
+            .as_deref()
+            .is_none_or(|child| !child.network_is_denied())
 }
 
-fn js_shell_recovery(context: &ToolContext, tool_label: &str) -> String {
-    // `web.run` is itself the escalation, so it never names itself.
-    if tool_label != "web_run" && browser_surface_available(context) {
-        return "open this URL with the `web.run` browse surface (`web.run {\"open\": {\"url\": ...}}`), which requests it with a browser user-agent and a ten-megabyte budget and usually receives the prerendered variant.".to_string();
+/// The raw-HTML fetch a JS-shell recovery suggests, as a `Web` tool input.
+fn raw_fetch_call(url: &str) -> serde_json::Value {
+    serde_json::json!({"action": "fetch", "url": url, "format": "raw"})
+}
+
+/// The HTTP extractor cannot execute JavaScript. Recovery names any browser
+/// the session is authorized to use.
+fn js_shell_recovery(url: &str, context: &ToolContext) -> String {
+    let same_result =
+        "This HTTP fetch/extraction path does not execute JavaScript (`web.run` shares it).";
+    let browser = context
+        .browser_tool
+        .as_deref()
+        .filter(|_| network_authorized(context))
+        .map(|tool| {
+            format!(
+                " This session has a browser tool that runs JavaScript: to read the rendered page, open {url} with `{tool}`."
+            )
+        })
+        .unwrap_or_default();
+    if web_tool_available(context) {
+        return format!(
+            "{same_result}{browser} Many JavaScript pages embed their content as JSON in a script tag; to look for it, fetch the raw HTML with `Web {call}`. Otherwise search for another source of the same content.",
+            call = raw_fetch_call(url),
+        );
     }
-    let unavailable = if tool_label == "web_run" {
-        "this is already the `web.run` browse surface, so there is no further web escalation."
-    } else {
-        "the `web.run` browse surface is not available to this role."
-    };
     if shell_fallback_available(context) {
-        format!("{unavailable} Fall back to a shell fetch (`curl -sSL`) or a rendering tool.")
+        let lane = if context.shell_policy == ShellPolicy::ReadOnly {
+            " run with `read_only: true`"
+        } else {
+            ""
+        };
+        format!(
+            "{same_result}{browser} Inspect the raw HTML with a shell fetch (`curl -sSL`){lane} for embedded data, or use a rendering tool."
+        )
+    } else if browser.is_empty() {
+        format!(
+            "{same_result} This role cannot fall back to a shell fetch, so report this URL as unreadable rather than substituting another source."
+        )
     } else {
         format!(
-            "{unavailable} This role is read-only and cannot fall back to a shell fetch, so report this URL as unreadable rather than substituting another source."
+            "{same_result}{browser} This role cannot fall back to a shell fetch, so if the browser cannot render it either, report this URL as unreadable rather than substituting another source."
         )
     }
+}
+
+pub(crate) fn rendering_browser_tool<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let names = names
+        .into_iter()
+        .filter(|name| name.starts_with("mcp_"))
+        .collect::<Vec<_>>();
+    let computer_use_browser = names.iter().copied().find(|name| {
+        name.strip_suffix("_browser")
+            .is_some_and(|server| names.contains(&format!("{server}_computer").as_str()))
+    });
+    ["_browser_navigate", "_puppeteer_navigate", "_navigate_page"]
+        .into_iter()
+        .find_map(|suffix| names.iter().copied().find(|name| name.ends_with(suffix)))
+        .or(computer_use_browser)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -454,6 +624,64 @@ async fn fetch_inner(
     )))
 }
 
+pub(crate) async fn reachable_status(
+    url: &str,
+    timeout: Duration,
+    context: &ToolContext,
+    tool_label: &str,
+) -> Result<u16, ToolError> {
+    let target = reqwest::Url::parse(url)
+        .map_err(|err| ToolError::invalid_input(format!("invalid URL: {err}")))?;
+    let timeout = timeout.min(HARD_MAX_TIMEOUT);
+    let deadline = Instant::now() + timeout;
+    let head = FetchOptions {
+        method: reqwest::Method::HEAD,
+        ..FetchOptions::new(timeout, 1, "*/*")
+    };
+    let ranged = FetchOptions {
+        range: Some("bytes=0-0"),
+        ..FetchOptions::new(timeout, 1, "*/*").with_browser_user_agent()
+    };
+    let probe = async {
+        let mut outcome = Err(ToolError::execution_failed("link check did not run"));
+        for (attempt, options) in [head, ranged].iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let budget = if attempt == 0 {
+                remaining / 2
+            } else {
+                remaining
+            };
+            if budget.is_zero() {
+                break;
+            }
+            outcome = match fetch_attempt(
+                target.clone(),
+                options,
+                context,
+                tool_label,
+                budget,
+                None,
+                CacheMode::Default,
+            )
+            .await
+            {
+                Ok(payload) if (200..300).contains(&payload.status) => return Ok(payload.status),
+                Ok(payload) => Ok(payload.status),
+                Err(AttemptError::Fatal(error)) => return Err(error),
+                Err(AttemptError::Transient(message)) => Err(ToolError::execution_failed(message)),
+            };
+        }
+        outcome
+    };
+    tokio::time::timeout(timeout, probe)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ToolError::Timeout {
+                seconds: timeout.as_secs().max(1),
+            })
+        })
+}
+
 #[derive(Debug)]
 enum AttemptError {
     Fatal(ToolError),
@@ -496,7 +724,7 @@ async fn fetch_attempt(
         }
         let mut builder = guarded_reqwest_client_builder()
             .timeout(remaining)
-            .user_agent(USER_AGENT)
+            .user_agent(options.user_agent)
             .redirect(reqwest::redirect::Policy::none());
         if let Some((hostname, validated_ip)) = dns_pin {
             builder = builder.resolve(&hostname, std::net::SocketAddr::new(validated_ip, 0));
@@ -507,9 +735,12 @@ async fn fetch_attempt(
             )))
         })?;
         let mut request = client
-            .get(current_url.clone())
+            .request(options.method.clone(), current_url.clone())
             .header("Accept", options.accept)
             .header("Accept-Language", "en-US,en;q=0.5");
+        if let Some(range) = options.range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
         if cache_mode.is_revalidate() {
             // `no-cache` (revalidate), not `no-store`: the shared caches still
             // get to serve a validated copy, which is what recovers a page
@@ -815,6 +1046,7 @@ mod tests {
                 &payload.url,
                 Some(&payload.content_type),
                 &payload.bytes,
+                payload.truncated,
                 None,
             )
             .await
@@ -838,10 +1070,13 @@ mod tests {
         .await
         .expect("the revalidated response carries the prerendered page");
 
+        let Readable::Document(document) = &readable.document else {
+            panic!("the revalidated response carries the prerendered page");
+        };
         assert!(
-            readable.document.markdown.contains("full pricing table"),
+            document.markdown.contains("full pricing table"),
             "the second attempt's content must be what the caller receives: {}",
-            readable.document.markdown
+            document.markdown
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one extra request");
         assert_eq!(readable.attempts.len(), 2);
@@ -869,26 +1104,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_shells_fail_with_the_escalation_the_calling_role_owns() {
+    async fn two_shells_degrade_with_the_escalation_the_calling_role_owns() {
         let (server, calls) = js_shell_server(true).await;
         let url = format!("http://public.example:{}/pricing", server.address().port());
         let options = FetchOptions::new(Duration::from_secs(5), 65_536, "text/html");
 
-        let error = fetch_readable_with_initial_pin(
+        let mut browser = context("js-shell-browser-role");
+        browser.execution.browser_tool = Some("mcp_playwright_browser_navigate".to_string());
+        let readable = fetch_readable_with_initial_pin(
             &url,
             &options,
-            &context("js-shell-browser-role"),
+            &browser,
             "fetch_url",
             pin(),
             extract_html_document,
         )
         .await
-        .expect_err("two shells must fail");
-        let message = error.to_string();
+        .expect("a titled shell degrades to its head");
+        let Readable::Partial(partial) = readable.document else {
+            panic!("two shells must not yield a readable document");
+        };
+        assert_eq!(partial.document.title.as_deref(), Some("Pricing"));
+        let message = partial.note;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "no third request");
         assert!(
-            message.contains("web.run"),
-            "a role that has the browse surface must be told to use it: {message}"
+            message.contains("This HTTP fetch/extraction path does not execute JavaScript")
+                && message.contains("`mcp_playwright_browser_navigate`")
+                && !message.contains("no Codewhale web tool runs JavaScript"),
+            "the recovery must distinguish the HTTP extractor from the available browser: {message}"
+        );
+        // The suggested call must be one the `Web` tool schema accepts.
+        let call = message
+            .split_once("`Web ")
+            .and_then(|(_, tail)| tail.split_once('`'))
+            .map(|(call, _)| call)
+            .expect("the recovery names a Web call");
+        let call: serde_json::Value = serde_json::from_str(call).expect("suggested call is JSON");
+        assert_eq!(call, raw_fetch_call(&url));
+        let schema = crate::tools::spec::ToolSpec::input_schema(
+            &crate::tools::web_tool::WebTool::new("Web"),
+        );
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&schema)
+            .expect("Web schema compiles");
+        assert!(
+            validator.is_valid(&call),
+            "suggested call must satisfy the Web schema: {call}"
         );
         assert!(
             message.contains("attempt 1")
@@ -901,7 +1163,7 @@ mod tests {
         );
 
         // A read-only worker whose envelope denies network keeps `Web{fetch}`
-        // but loses `web.run` and any shell fallback, so the error must say so
+        // but loses `web.run` and any shell fallback, so the note must say so
         // instead of naming a surface the role cannot call.
         let mut denied = context("js-shell-read-only-role");
         denied.shell_policy = ShellPolicy::ReadOnly;
@@ -917,7 +1179,7 @@ mod tests {
                 writable_files: Vec::new(),
                 coordination_contracts: Vec::new(),
             }));
-        let error = fetch_readable_with_initial_pin(
+        let readable = fetch_readable_with_initial_pin(
             &url,
             &options,
             &denied,
@@ -926,16 +1188,110 @@ mod tests {
             extract_html_document,
         )
         .await
-        .expect_err("two shells must fail");
-        let message = error.to_string();
+        .expect("a titled shell degrades to its head");
+        let Readable::Partial(partial) = readable.document else {
+            panic!("two shells must not yield a readable document");
+        };
+        let message = partial.note;
         assert!(
-            message.contains("not available to this role"),
-            "a role without the browse surface must be told plainly: {message}"
+            !message.contains("`Web "),
+            "a role without the web tools must not be sent to one: {message}"
         );
         assert!(
             message.contains("cannot fall back to a shell fetch"),
             "read-only roles must not be sent to curl: {message}"
         );
+    }
+
+    #[derive(Clone)]
+    struct RefuseBots {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for RefuseBots {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let agent = request
+                .headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if agent.contains("codewhale") {
+                ResponseTemplate::new(403).set_body_string("bots not welcome")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string("browser body")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_default_agent_retries_once_as_a_browser() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/guarded"))
+            .respond_with(RefuseBots {
+                calls: Arc::clone(&calls),
+            })
+            .mount(&server)
+            .await;
+        let url = format!("http://public.example:{}/guarded", server.address().port());
+
+        let readable = fetch_readable_with_initial_pin(
+            &url,
+            &FetchOptions::new(Duration::from_secs(5), 1_024, "text/plain"),
+            &context("fetch-403-browser-retry"),
+            "fetch_url",
+            pin(),
+            |payload: FetchedPayload| {
+                Box::pin(async move { Ok(String::from_utf8_lossy(&payload.bytes).into_owned()) })
+            },
+        )
+        .await
+        .expect("the browser-agent retry reads the page");
+
+        assert!(matches!(&readable.document, Readable::Document(body) if body == "browser body"));
+        assert_eq!(readable.payload.status, 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one browser retry");
+        assert_eq!(readable.attempts.len(), 2);
+        assert_eq!(readable.attempts[0].status, 403);
+        assert!(!readable.attempts[0].browser_user_agent);
+        assert!(readable.attempts[1].browser_user_agent);
+        assert!(readable.attempts[1].produced_content);
+    }
+
+    #[tokio::test]
+    async fn a_browser_refusal_is_final() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/closed"))
+            .respond_with({
+                let calls = Arc::clone(&calls);
+                move |_: &Request| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(403)
+                }
+            })
+            .mount(&server)
+            .await;
+        let url = format!("http://public.example:{}/closed", server.address().port());
+
+        let readable = fetch_readable_with_initial_pin(
+            &url,
+            &FetchOptions::new(Duration::from_secs(5), 1_024, "text/plain"),
+            &context("fetch-403-final"),
+            "fetch_url",
+            pin(),
+            |payload: FetchedPayload| Box::pin(async move { Ok(payload.status) }),
+        )
+        .await
+        .expect("the 403 is handed to the caller, which owns non-2xx rendering");
+
+        assert!(matches!(readable.document, Readable::Document(403)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no third request");
     }
 
     #[tokio::test]
@@ -965,7 +1321,9 @@ mod tests {
         .await
         .expect("the existing transport retry still recovers");
 
-        assert_eq!(readable.document, "recovered response");
+        assert!(
+            matches!(&readable.document, Readable::Document(body) if body == "recovered response")
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,

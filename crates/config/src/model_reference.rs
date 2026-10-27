@@ -100,6 +100,16 @@ pub struct ModelReferenceCard {
     /// Model family / series, when stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fact_sources: std::collections::BTreeMap<String, CatalogSource>,
     /// Context-window tokens, when stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -125,6 +135,11 @@ impl ModelReferenceCard {
             model_id: offering.wire_model_id.clone(),
             canonical_model: offering.canonical_model.clone(),
             family: offering.family.clone(),
+            display_name: offering.name.clone(),
+            description: offering.description.clone(),
+            max_input: offering.limit.as_ref().and_then(|limit| limit.input),
+            last_updated: offering.last_updated.clone(),
+            fact_sources: offering.fact_sources.clone(),
             context_window: offering.limit.as_ref().and_then(|limit| limit.context),
             max_output: offering.limit.as_ref().and_then(|limit| limit.output),
             modality: Modality::from_modalities(offering.modalities.as_ref()),
@@ -163,12 +178,23 @@ impl ModelReferenceCard {
         let Some(pricing) = self.pricing.as_ref() else {
             return "unknown".to_string();
         };
-        if pricing.input_per_million.is_none() && pricing.output_per_million.is_none() {
+        if matches!(
+            pricing.status_label_at(crate::catalog::now_unix()),
+            "stale" | "unverified" | "unavailable"
+        ) || (pricing.input_per_million.is_none() && pricing.output_per_million.is_none())
+        {
             return "unknown".to_string();
         }
         let symbol = currency_symbol(&pricing.currency);
         let render = |value: Option<f64>| match value {
-            Some(rate) => format!("{symbol}{rate:.2}"),
+            Some(rate) => {
+                let rounded = format!("{rate:.2}");
+                if rounded.parse::<f64>().ok() == Some(rate) {
+                    format!("{symbol}{rounded}")
+                } else {
+                    format!("{symbol}{rate}")
+                }
+            }
             None => "?".to_string(),
         };
         let suffix = currency_suffix(&pricing.currency);
@@ -364,6 +390,7 @@ mod tests {
                 output: Some(1.2),
                 cache_read: Some(0.06),
                 cache_write: None,
+                ..Default::default()
             }),
             modalities: Some(ModelsDevModalities {
                 input: vec!["text".to_string()],
@@ -422,6 +449,7 @@ mod tests {
                 output: None,
                 cache_read: Some(0.05),
                 cache_write: None,
+                ..Default::default()
             }),
             ..offering("acme", "house-model")
         };
@@ -439,6 +467,7 @@ mod tests {
                 output: None,
                 cache_read: None,
                 cache_write: None,
+                ..Default::default()
             }),
             ..offering("openai", "gpt-5.5")
         };
@@ -513,7 +542,7 @@ mod tests {
         let deepseek = db
             .find("deepseek", "deepseek-v4-pro")
             .expect("bundled deepseek row");
-        assert_eq!(deepseek.context_window, Some(1_000_000));
+        assert_eq!(deepseek.context_window, Some(1_048_576));
         assert_eq!(deepseek.modality, Modality::Text);
         assert_eq!(deepseek.price_label(), "unknown");
 
@@ -523,12 +552,12 @@ mod tests {
             .expect("bundled minimax row");
         assert_eq!(minimax.price_label(), "$0.30 / $1.20 per Mtok");
 
-        // MiniMax-M3 ships without verified per-token pricing, so its price
-        // stays honestly unknown rather than inheriting a sibling's rate.
+        // MiniMax-M3 carries its own base rate and a context tier.
         let minimax_m3 = db
             .find("minimax", "MiniMax-M3")
             .expect("bundled minimax m3 row");
-        assert_eq!(minimax_m3.price_label(), "unknown");
+        assert_eq!(minimax_m3.price_label(), "$0.30 / $1.20 per Mtok");
+        assert_eq!(minimax_m3.pricing.as_ref().unwrap().context_tiers.len(), 1);
     }
 
     #[test]

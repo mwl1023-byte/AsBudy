@@ -5,14 +5,14 @@
 # real HTTP requests.
 #
 # Usage:  ./scripts/mobile-smoke.sh
-# Requires: curl, a built binary at target/release/codewhale-tui
+# Requires: curl, a built binary at target/release/codewhale
 #           (the script will build it if cargo is available).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="${BINARY:-${REPO_ROOT}/target/release/codewhale-tui}"
+BINARY="${BINARY:-${REPO_ROOT}/target/release/codewhale}"
 PASS=0
 FAIL=0
 SERVER_PID=""
@@ -103,7 +103,7 @@ assert_body_contains() {
     local body
     body=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
 
-    if echo "$body" | grep -q "$substring"; then
+    if grep -q -- "$substring" <<< "$body"; then
         pass "$method $path body contains '$substring'"
     else
         fail "$method $path body missing '$substring'"
@@ -121,7 +121,7 @@ assert_body_not_contains() {
     local body
     body=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
 
-    if echo "$body" | grep -q "$substring"; then
+    if grep -q -- "$substring" <<< "$body"; then
         fail "$method $path body unexpectedly contains '$substring'"
     else
         pass "$method $path body does not contain '$substring'"
@@ -132,7 +132,7 @@ assert_body_not_contains() {
 
 if [[ ! -x "$BINARY" ]]; then
     log "Binary not found; building codewhale-tui in release mode..."
-    cargo build -p codewhale-tui --release --locked
+    cargo build -p codewhale-cli --bin codewhale --release --locked
 fi
 
 log "Using binary: $BINARY"
@@ -209,7 +209,7 @@ else
     fail "mobile unexpectedly accepted a 0.0.0.0 binding"
 fi
 
-if echo "$BIND_OUTPUT" | grep -qi "loopback-only"; then
+if grep -qi -- "loopback-only" <<< "$BIND_OUTPUT"; then
     pass "rejection explains the loopback-only boundary"
 else
     fail "rejection missing loopback-only guidance"

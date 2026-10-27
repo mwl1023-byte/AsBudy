@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::agent_roster::{AgentRosterRow, RosterState};
 use crate::compaction::CompactionConfig;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::core::engine::preview::PreviewUnresolved;
 use crate::core::events::{
     Event, RouteBillingEnvelope, ToolGate, ToolGateVerdict, TurnOutcomeStatus, TurnRoute,
@@ -135,7 +135,7 @@ fn capability_metadata_str(metadata: McpServerCapabilityMetadata) -> &'static st
     }
 }
 
-fn provider_str(provider: ApiProvider) -> String {
+fn provider_str(provider: ProviderKind) -> String {
     provider.as_str().to_string()
 }
 
@@ -218,7 +218,7 @@ fn tool_error_to_wire(error: &ToolError) -> wire::ToolCallError {
             field: field.clone(),
         },
         ToolError::PathEscape { path } => wire::ToolCallError::PathEscape { path: path.clone() },
-        ToolError::ExecutionFailed { message } => wire::ToolCallError::ExecutionFailed {
+        ToolError::ExecutionFailed { message, .. } => wire::ToolCallError::ExecutionFailed {
             message: message.clone(),
         },
         ToolError::Timeout { seconds } => wire::ToolCallError::Timeout { seconds: *seconds },
@@ -385,13 +385,21 @@ fn compaction_to_wire(config: &CompactionConfig) -> wire_op::CompactionPolicy {
 /// fields (`initial_routed_usage`, `hook_executor`) and resolved routes are
 /// stripped; only their non-secret receipts cross.
 fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
+    // `spec.submission_id` is deliberately not projected: the token is
+    // host-process-local by design and the wire op has no correlation twin,
+    // so wire submitters observe `TurnStarted.submission_id` always absent
+    // and cannot correlate submissions on that channel.
     wire_op::TurnSpec {
+        profile_constitution: spec
+            .profile_constitution
+            .as_ref()
+            .map(|snapshot| serde_json::json!(snapshot)),
         max_output_tokens: spec.max_output_tokens,
         content: spec.content.clone(),
         images: spec.images.clone(),
         mode: app_mode_str(spec.mode).to_string(),
         model: Some(spec.route.model.clone()),
-        model_provider: Some(spec.route.identity.key.clone()),
+        model_provider: Some(spec.route.identity.key.to_string()),
         allowed_tools: spec.allowed_tools.clone(),
         dynamic_tools: spec.dynamic_tools.clone(),
         provenance: spec.provenance.as_str().to_string(),
@@ -446,6 +454,25 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             omitted_tool_names: omitted_tool_names.clone(),
             omitted_tool_count: count(*omitted_tool_count),
         },
+        Event::RequestImageWindow {
+            provider,
+            model,
+            total,
+            elided,
+            cap,
+            cap_source,
+            message,
+        } => wire::EventMsg::RequestImageWindow {
+            thread_id,
+            session_id,
+            provider: provider.clone(),
+            model: model.clone(),
+            total: count(*total),
+            elided: count(*elided),
+            cap: count(*cap),
+            cap_source: cap_source.clone(),
+            message: message.clone(),
+        },
         Event::SnapshotsDisabled { workspace, reason } => wire::EventMsg::SnapshotsDisabled {
             thread_id,
             session_id,
@@ -486,7 +513,20 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             session_id,
             index: count(*index),
         },
-        Event::ToolCallStarted { id, name, input } => wire::EventMsg::ToolCallStarted {
+        Event::ToolExecutionStarted { id } => wire::EventMsg::ToolExecutionStarted {
+            thread_id,
+            session_id,
+            tool_call_id: id.clone(),
+        },
+        Event::ToolResultContent { id, blocks } => wire::EventMsg::ToolResultContent {
+            thread_id,
+            session_id,
+            tool_call_id: id.clone(),
+            blocks: to_value(blocks),
+        },
+        Event::ToolCallStarted {
+            id, name, input, ..
+        } => wire::EventMsg::ToolCallStarted {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -497,7 +537,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             thread_id,
             session_id,
         },
-        Event::ToolCallComplete { id, name, result } => wire::EventMsg::ToolCallComplete {
+        Event::ToolCallComplete {
+            id, name, result, ..
+        } => wire::EventMsg::ToolCallComplete {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -513,18 +555,49 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
                 },
             },
         },
+        Event::OperationActivityStarted {
+            span_id,
+            activity_kind,
+            action_id,
+        } => wire::EventMsg::OperationActivityStarted {
+            thread_id,
+            session_id,
+            span_id: span_id.clone(),
+            activity_kind: *activity_kind,
+            action_id: action_id.clone(),
+        },
+        Event::OperationActivityCompleted {
+            span_id,
+            activity_kind,
+            action_id,
+            outcome,
+        } => wire::EventMsg::OperationActivityCompleted {
+            thread_id,
+            session_id,
+            span_id: span_id.clone(),
+            activity_kind: *activity_kind,
+            action_id: action_id.clone(),
+            outcome: *outcome,
+        },
         Event::TurnStarted {
             turn_id,
             created_at,
             route,
+            submission_id,
         } => wire::EventMsg::TurnStarted {
             thread_id,
             session_id,
             turn_id: turn_id.clone(),
             created_at: *created_at,
             route: route.as_ref().map(route_to_wire),
+            submission_id: submission_id.clone(),
         },
         Event::ToolRequestSnapshot { snapshot } => wire::EventMsg::ToolRequestSnapshot {
+            thread_id,
+            session_id,
+            snapshot: to_value(snapshot),
+        },
+        Event::WorkspaceSnapshotTaken { snapshot } => wire::EventMsg::WorkspaceSnapshotTaken {
             thread_id,
             session_id,
             snapshot: to_value(snapshot),
@@ -536,6 +609,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             route: route_to_wire(route),
         },
         Event::TurnComplete {
+            turn_id,
+            submission_id,
+            compaction_id,
             usage,
             parent_route_usage,
             routed_usage_dropped_records,
@@ -546,7 +622,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
         } => wire::EventMsg::TurnComplete {
             thread_id,
             session_id,
-            turn_id: None,
+            turn_id: turn_id.clone(),
+            submission_id: submission_id.clone(),
+            compaction_id: compaction_id.clone(),
             status: outcome_status_to_wire(*status),
             error: error.clone(),
             usage: usage_to_wire(usage),
@@ -557,12 +635,18 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
                 .map(|tools| tools.iter().map(to_value).collect()),
             base_url: base_url.clone(),
         },
+        Event::ProviderRequestReceipt { receipt } => wire::EventMsg::ProviderRequestReceipt {
+            thread_id,
+            session_id,
+            receipt: receipt.clone(),
+        },
         Event::TurnUsage {
             max_output_tokens,
             usage,
             duration_ms,
             first_token_ms,
             request_ms,
+            finish_reason: _,
         } => wire::EventMsg::TurnUsage {
             max_output_tokens: *max_output_tokens,
             thread_id,
@@ -678,6 +762,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             spawn_depth,
             model,
             route_source,
+            display_name,
         } => wire::EventMsg::AgentSpawned {
             thread_id,
             session_id,
@@ -689,6 +774,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             spawn_depth: *spawn_depth,
             model: model.clone(),
             route_source: route_source.clone(),
+            display_name: display_name.clone(),
         },
         Event::AgentProgress {
             owner_session_id,
@@ -722,6 +808,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             // Child usage stays off the wire: no protocol client consumes
             // it, and metrics reads the persisted runtime payload (#6315).
             usage: _,
+            display_name,
         } => wire::EventMsg::AgentComplete {
             thread_id,
             session_id,
@@ -734,6 +821,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             parent_run_id: parent_run_id.clone(),
             spawn_depth: *spawn_depth,
             continuable: *continuable,
+            display_name: display_name.clone(),
         },
         Event::SubAgentFollowUp {
             owner_session_id,
@@ -863,6 +951,11 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             approval_grouping_key: approval_grouping_key.clone(),
             intent_summary: intent_summary.clone(),
             approval_force_prompt: *approval_force_prompt,
+        },
+        Event::ApprovalWithdrawn { id } => wire::EventMsg::ApprovalWithdrawn {
+            thread_id,
+            session_id,
+            id: id.clone(),
         },
         Event::UserInputRequired { id, request } => wire::EventMsg::UserInputRequired {
             thread_id,
@@ -1132,6 +1225,14 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             workspace: workspace.clone(),
             mode: app_mode_str(*mode).to_string(),
         },
+        Op::RewindConversation {
+            expected,
+            messages,
+            tx: _,
+        } => wire_op::Op::RewindConversation {
+            expected: to_value(expected),
+            messages: messages.iter().map(to_value).collect(),
+        },
         Op::CompactContext {
             id,
             route,
@@ -1139,7 +1240,7 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
         } => wire_op::Op::CompactContext {
             id: id.clone(),
             model: route.model.clone(),
-            model_provider: route.identity.key.clone(),
+            model_provider: route.identity.key.to_string(),
             compaction: compaction_to_wire(compaction),
         },
         Op::CancelCompaction { id } => wire_op::Op::CancelCompaction { id: id.clone() },
@@ -1153,7 +1254,10 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             config_path: config_path.clone(),
         },
         Op::PurgeContext => wire_op::Op::PurgeContext,
-        Op::EditLastTurn { new_message } => wire_op::Op::EditLastTurn {
+        Op::EditLastTurn {
+            new_message,
+            submission_id: _,
+        } => wire_op::Op::EditLastTurn {
             new_message: new_message.clone(),
         },
         Op::SetAdvisorEnabled { enabled } => wire_op::Op::SetAdvisorEnabled { enabled: *enabled },
@@ -1247,6 +1351,7 @@ mod tests {
             (None, None),
         ] {
             let event = Event::AgentComplete {
+                display_name: None,
                 owner_session_id: "owner".into(),
                 id: "worker".into(),
                 result: "Completed successfully".into(),
@@ -1299,6 +1404,9 @@ mod tests {
         };
         let complete = event_to_protocol(
             &Event::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: total.clone(),
                 parent_route_usage: parent.clone(),
                 routed_usage_dropped_records: 3,
@@ -1345,6 +1453,7 @@ mod tests {
                     duration_ms: 12,
                     first_token_ms: Some(2),
                     request_ms: Some(10),
+                    finish_reason: None,
                 },
                 "turn_usage",
             ),
@@ -1366,6 +1475,26 @@ mod tests {
                 projected
             );
         }
+    }
+
+    #[test]
+    fn manual_compaction_terminal_keeps_its_operation_id_in_projection() {
+        let event = Event::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: Some("compact-1".into()),
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Failed,
+            error: Some("route rejected".into()),
+            tool_catalog: None,
+            base_url: None,
+        };
+        let value = serde_json::to_value(event.to_protocol(&ids())).unwrap();
+        assert_eq!(value["compaction_id"], "compact-1");
+        assert!(value.get("turn_id").is_none());
+        assert!(value.get("submission_id").is_none());
     }
 
     /// The guard is the exhaustive `match` in `event_to_protocol`: this test
@@ -1390,17 +1519,20 @@ mod tests {
                 content: "hmm".into(),
             },
             Event::ToolCallStarted {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 input: json!({"path": "x"}),
             },
             Event::ToolCallHeartbeat,
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 result: Ok(ToolResult::success("ok")),
             },
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c2".into(),
                 name: "bash".into(),
                 result: Err(ToolError::Timeout { seconds: 9 }),
@@ -1409,8 +1541,14 @@ mod tests {
                 turn_id: "turn-1".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                // A host-stamped token, not `None`: the projection must carry
+                // it verbatim or the assertion on `events[7]` below fails.
+                submission_id: Some("sub-host-1".into()),
             },
             Event::TurnComplete {
+                turn_id: Some("turn-1".into()),
+                submission_id: Some("sub-host-1".into()),
+                compaction_id: None,
                 usage: usage.clone(),
                 parent_route_usage: usage.clone(),
                 routed_usage_dropped_records: 0,
@@ -1418,6 +1556,17 @@ mod tests {
                 error: Some("stopped".into()),
                 tool_catalog: None,
                 base_url: Some("https://example.invalid".into()),
+            },
+            Event::WorkspaceSnapshotTaken {
+                snapshot: crate::snapshot::WorkspaceSnapshotRef {
+                    kind: crate::snapshot::WorkspaceSnapshotKind::Tool,
+                    snapshot_id: "a".repeat(40),
+                    tree_id: "b".repeat(40),
+                    session_id: "thr_1".into(),
+                    tool_call_id: Some("c1".into()),
+                    write_paths: Some(vec!["src/lib.rs".into()]),
+                    changed_paths: Some(Vec::new()),
+                },
             },
             Event::RoutedTurnUsage {
                 usage: usage.clone(),
@@ -1431,6 +1580,7 @@ mod tests {
                 duration_ms: 12,
                 first_token_ms: Some(3),
                 request_ms: None,
+                finish_reason: None,
             },
             Event::Error {
                 envelope: ErrorEnvelope {
@@ -1496,10 +1646,21 @@ mod tests {
             serde_json::to_value(events[6].to_protocol(&ids)).unwrap()["result"],
             json!({"outcome": "err", "error": {"kind": "timeout", "seconds": 9}})
         );
+        // The host correlation token must cross the projection verbatim: the
+        // app forwarder binds its submit-window actions to this echo, so a
+        // silently dropped mapping would defeat the contract.
+        assert_eq!(
+            serde_json::to_value(events[7].to_protocol(&ids)).unwrap()["submission_id"],
+            json!("sub-host-1")
+        );
         assert_eq!(
             serde_json::to_value(events[8].to_protocol(&ids)).unwrap()["status"],
             "interrupted"
         );
+        let terminal = serde_json::to_value(events[8].to_protocol(&ids)).unwrap();
+        assert_eq!(terminal["turn_id"], "turn-1");
+        assert_eq!(terminal["submission_id"], "sub-host-1");
+        assert!(terminal.get("compaction_id").is_none());
         let error = events
             .iter()
             .find(|event| matches!(event, Event::Error { .. }))
@@ -1507,6 +1668,35 @@ mod tests {
         let error = serde_json::to_value(error.to_protocol(&ids)).unwrap();
         assert_eq!(error["category"], "rate_limit");
         assert_eq!(error["severity"], "warning");
+    }
+
+    #[test]
+    fn conditional_rewind_projection_preserves_expected_state_and_reply_owner() {
+        let expected = crate::core::ops::SessionSnapshot {
+            session_id: "observed-conversation".into(),
+            messages: vec![],
+            total_tokens: 9,
+            model: "observed-model".into(),
+            model_provider: "deepseek".into(),
+            model_provider_id: Some("configured-provider".into()),
+            workspace: std::path::PathBuf::from("/observed/workspace"),
+            system_prompt: None,
+            mode: "agent".into(),
+        };
+        let (tx, mut receive) = tokio::sync::oneshot::channel();
+        let op = Op::RewindConversation {
+            expected: Box::new(expected.clone()),
+            messages: vec![],
+            tx,
+        };
+        let value = serde_json::to_value(op.to_protocol()).unwrap();
+        assert_eq!(value["kind"], "rewind_conversation");
+        assert!(value["expected"] == to_value(&expected));
+        assert!(value.get("tx").is_none());
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -1565,6 +1755,7 @@ mod tests {
             Op::PurgeContext,
             Op::EditLastTurn {
                 new_message: "again".into(),
+                submission_id: None,
             },
             Op::SetAdvisorEnabled { enabled: true },
             Op::GetSubAgentSettlement {
@@ -1647,5 +1838,30 @@ mod tests {
             wildcard_arms.is_empty(),
             "protocol_parity.rs must match engine variants exhaustively; found {wildcard_arms:?}"
         );
+    }
+    #[test]
+    fn acp_optional_tool_facts_round_trip_with_core_routing_identity() {
+        let ids = ids();
+        for event in [
+            Event::ToolExecutionStarted {
+                id: "core-call".into(),
+            },
+            Event::ToolResultContent {
+                id: "core-call".into(),
+                blocks: vec![codewhale_tools::ToolResultContentBlock::Image {
+                    mime_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+            },
+        ] {
+            let projected = event_to_protocol(&event, &ids);
+            assert_eq!(projected.thread_id(), &ids.thread_id);
+            assert_eq!(projected.session_id(), &ids.session_id);
+            let value = serde_json::to_value(&projected).unwrap();
+            assert_eq!(
+                serde_json::from_value::<wire::EventMsg>(value).unwrap(),
+                projected
+            );
+        }
     }
 }

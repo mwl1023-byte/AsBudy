@@ -29,6 +29,7 @@ pub(crate) struct FakeControl {
     pub(crate) start_info: Option<RemoteStartInfo>,
     pub(crate) stop_refusal: Option<Option<String>>,
     pub(crate) hosted: Option<Option<HostedWorkTarget>>,
+    pub(crate) blockers: Vec<String>,
     pub(crate) calls: RefCell<Vec<String>>,
 }
 
@@ -54,6 +55,10 @@ impl CommandSessionControlContext for FakeControl {
     fn transition_blocked(&self) -> bool {
         self.call("transition_blocked", None);
         self.blocked
+    }
+    fn transition_blockers(&self) -> Vec<String> {
+        self.call("transition_blockers", None);
+        self.blockers.clone()
     }
     fn relay_projection(&self) -> RelayProjection {
         self.call("relay_projection", None);
@@ -115,6 +120,14 @@ impl CommandSessionControlContext for FakeControl {
             None => Err("unexpected clear_window_title on empty fake".to_string()),
         }
     }
+    fn composer_color(&self) -> Option<String> {
+        self.call("composer_color", None);
+        None
+    }
+    fn set_composer_color(&mut self, color: Option<String>) -> Result<(), String> {
+        self.call("set_composer_color", color.as_deref());
+        Err("unexpected set_composer_color on empty fake".to_string())
+    }
     fn remote_status(&self) -> String {
         self.call("remote_status", None);
         self.remote_status
@@ -150,6 +163,7 @@ impl CommandSessionControlContext for FakeControl {
 pub(crate) fn relay_projection_fixture() -> RelayProjection {
     RelayProjection {
         compact_template: "# Session relay".to_string(),
+        handoff_path: ".codewhale/handoff.md".to_string(),
         workspace: "/work".to_string(),
         mode: "operate".to_string(),
         model: "model-x".to_string(),

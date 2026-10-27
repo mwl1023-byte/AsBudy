@@ -28,6 +28,9 @@ const tuiLocaleDir = path.join(repoRoot, "crates", "tui", "locales");
 const promptPath = path.join(repoRoot, "crates", "tui", "src", "prompts", "text.rs");
 
 const STEMS = {
+  features: { exportName: "features", typeName: "FeaturesDict" },
+  "docs-skills": { exportName: "docsSkills", typeName: "DocsPageDict" },
+  "docs-claude-code": { exportName: "docsClaudeCode", typeName: "DocsPageDict" },
   chrome: { exportName: "chrome", typeName: "ChromeDict" },
   home: { exportName: "home", typeName: "HomeDict" },
   "docs-guide": { exportName: "docsGuide", typeName: "DocsGuideDict" },
@@ -43,7 +46,6 @@ const STEMS = {
   "docs-sandbox": { exportName: "docsSandbox", typeName: "DocsSandboxDict" },
   "docs-subagents": { exportName: "docsSubagents", typeName: "DocsSubagentsDict" },
   "docs-web": { exportName: "docsWeb", typeName: "DocsWebDict" },
-  "docs-computers": { exportName: "docsComputers", typeName: "DocsComputersDict" },
   "docs-auth": { exportName: "docsAuth", typeName: "DocsAuthDict" },
   "docs-trust": { exportName: "docsTrust", typeName: "DocsTrustDict" },
   states: { exportName: "states", typeName: "StatesDict" },

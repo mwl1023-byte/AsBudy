@@ -6,7 +6,7 @@
 //! Help lead with commands, while keyboard shortcuts lead with the key
 //! reference that the footer promises. The command list is sourced from
 //! [`crate::commands::command_infos()`] and the keybinding list from
-//! [`crate::tui::keybindings::KEYBINDINGS`] so neither can drift from the
+//! [`crate::keybinding_table::KEYBINDINGS`] so neither can drift from the
 //! wired-up handlers.
 //!
 //! Keys: any printable character extends the filter, `Backspace` (or `Ctrl+H`)
@@ -18,6 +18,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -31,7 +32,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
-use crate::tui::keybindings::KEYBINDINGS;
+use crate::keybinding_table::KEYBINDINGS;
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, render_modal_footer, render_panel_scroll_rail,
@@ -92,7 +93,7 @@ struct HelpEntry {
     section: HelpSection,
     /// Sort-within-section key — keybinding entries reuse their declared
     /// section's rank so the help overlay groups Navigation, Editing, … in
-    /// the same order as `tui::keybindings`.
+    /// the same order as `keybinding_table`.
     sub_rank: u8,
     label: String,
     description: String,
@@ -160,6 +161,7 @@ impl HelpView {
     /// Discoverability index over every user-invocable surface (#3912):
     /// built-ins, workspace commands, and discovered skills. `skills` comes
     /// from `App::cached_skills`; pass `&[]` only where none are discovered.
+    #[cfg(test)]
     pub fn new_for_workspace(
         locale: Locale,
         workspace: &Path,
@@ -170,17 +172,20 @@ impl HelpView {
         })
     }
 
-    /// Open Help as the keyboard reference promised by shell shortcut hints.
-    pub fn new_for_shortcuts(
-        locale: Locale,
-        workspace: &Path,
-        skills: &[(String, String)],
-    ) -> Self {
-        commands::user_registry::with_registry_for_workspace(Some(workspace), |registry| {
-            Self::new_with_registry(locale, HelpOrdering::KeybindingsFirst, registry, skills)
+    pub fn new_for_app(app: &crate::tui::app::App, shortcuts: bool) -> Self {
+        commands::user_registry::with_registry_for_app(app, |registry| {
+            Self::new_with_registry(
+                app.ui_locale,
+                if shortcuts {
+                    HelpOrdering::KeybindingsFirst
+                } else {
+                    HelpOrdering::CommandsFirst
+                },
+                registry,
+                &app.cached_skills,
+            )
         })
     }
-
     fn new_with_ordering(locale: Locale, ordering: HelpOrdering) -> Self {
         let registry = commands::user_registry::UserCommandRegistry::new();
         Self::new_with_registry(locale, ordering, &registry, &[])
@@ -404,12 +409,12 @@ impl HelpView {
             .copied()
             .unwrap_or(label_cap);
         let inline_capacity = inner_width.saturating_sub(label_width + 4);
-        let inline = shed_to_width(&entry.description, inline_capacity);
-        let full = shed_to_width(&entry.description, inner_width);
+        let inline = shed_to_width(&entry.description, inline_capacity, self.locale);
+        let full = shed_to_width(&entry.description, inner_width, self.locale);
         let repaired = (full != inline && !full.is_empty()).then(|| full.to_string());
         match (entry.usage.as_deref(), repaired) {
             (None, repaired) => repaired,
-            (Some(usage), None) => Some(shed_to_width(usage, inner_width).to_string()),
+            (Some(usage), None) => Some(shed_to_width(usage, inner_width, self.locale).to_string()),
             (Some(usage), Some(description)) => {
                 // They join at a joint `shed_to_width` already sheds on, and
                 // the description leads: repairing the shed is what this slot
@@ -417,7 +422,7 @@ impl HelpView {
                 // spend itself on the argument shape and drop the sentence
                 // the row could not print.
                 let joined = format!("{description} — {usage}");
-                Some(shed_to_width(&joined, inner_width).to_string())
+                Some(shed_to_width(&joined, inner_width, self.locale).to_string())
             }
         }
     }
@@ -502,7 +507,15 @@ fn build_entries(
             .iter()
             .copied()
             .filter(|alias| registry.get(alias).is_none())
+            .filter(|alias| alias_is_listed_for(locale, alias))
             .collect::<Vec<_>>();
+        // Every alias stays findable by typing it, listed or not.
+        let alias_terms = command
+            .aliases
+            .iter()
+            .map(|alias| format!("/{alias}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let description = if visible_aliases.is_empty() {
             localized.to_string()
         } else {
@@ -517,10 +530,11 @@ fn build_entries(
             )
         };
         let haystack = format!(
-            "{} {} {}",
+            "{} {} {} {}",
             label.to_ascii_lowercase(),
             description.to_ascii_lowercase(),
-            command.usage.to_ascii_lowercase()
+            command.usage.to_ascii_lowercase(),
+            alias_terms.to_lowercase()
         );
         entries.push(HelpEntry {
             section: HelpSection::Command,
@@ -619,6 +633,57 @@ fn build_entries(
     entries
 }
 
+/// Romanized Chinese (pinyin) command aliases. They dispatch in every locale,
+/// but only the Chinese packs list them: an English reader sees `/clear`, not
+/// `/clear (aliases: /qingping)`.
+const ROMANIZED_ALIASES: &[&str] = &[
+    "bangzhu",
+    "chongmingming",
+    "chongshi",
+    "daili",
+    "dangan",
+    "daochu",
+    "digui",
+    "fujian",
+    "gaiming",
+    "gouzi",
+    "jiazai",
+    "jihua",
+    "jineng",
+    "jinengliebiao",
+    "lianjie",
+    "maodian",
+    "moxing",
+    "moxingliebiao",
+    "qingchu",
+    "qingping",
+    "shencha",
+    "shouye",
+    "tuichu",
+    "xinren",
+    "xitong",
+    "yasuo",
+    "yuyin",
+    "yuyincontrol",
+    "yuyinsend",
+    "zhinengti",
+    "zhuye",
+    "zidong",
+    "zuoye",
+];
+
+/// Whether `/help` lists `alias` beside its command for `locale`. Chinese
+/// aliases (Han script or pinyin) are listed only in the Chinese packs.
+fn alias_is_listed_for(locale: Locale, alias: &str) -> bool {
+    if matches!(locale, Locale::ZhHans | Locale::ZhHant) {
+        return true;
+    }
+    let han = alias
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    !han && !ROMANIZED_ALIASES.contains(&alias)
+}
+
 /// The usage line worth printing beside a row, or `None` when it only
 /// restates the label.
 ///
@@ -697,14 +762,14 @@ fn group_label(entry: &HelpEntry, locale: Locale) -> String {
     }
 }
 
-fn keybinding_section_for_rank(rank: u8) -> Option<crate::tui::keybindings::KeybindingSection> {
-    crate::tui::keybindings::KeybindingSection::ALL
+fn keybinding_section_for_rank(rank: u8) -> Option<crate::keybinding_table::KeybindingSection> {
+    crate::keybinding_table::KeybindingSection::ALL
         .into_iter()
         .find(|section| section.rank() == rank)
 }
 
 fn default_collapsed(ordering: HelpOrdering) -> HashSet<String> {
-    use crate::tui::keybindings::KeybindingSection;
+    use crate::keybinding_table::KeybindingSection;
     let kb_keys = KeybindingSection::ALL
         .into_iter()
         .map(|section| format!("kb:{}", section.rank()));
@@ -751,7 +816,7 @@ const FIELD_JOINTS: [&str; 6] = [" (", "; ", " — ", ". ", ": ", ", "];
 /// share prefixes. So the description sheds its alias parenthetical first,
 /// then trailing clauses at its own joints, and finally itself. The label is
 /// never shed at all: it is the string the user has to type.
-fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
+fn shed_to_width(text: &str, max_width: usize, locale: Locale) -> Cow<'_, str> {
     let trimmed = text.trim_end();
     if max_width == 0 {
         return Cow::Borrowed("");
@@ -814,7 +879,7 @@ fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
         } else {
             oversize_clause
         };
-        shed_to_words(source, max_width)
+        shed_to_words(source, max_width, locale)
     } else {
         Cow::Borrowed(best)
     }
@@ -840,9 +905,9 @@ fn widest_char_prefix(text: &str, max_width: usize) -> &str {
 /// The scan used to stop on a space, so the last word was never included
 /// even when it fitted, and the two-pass short-word trim then left a simple
 /// verb + modifier + noun phrase without the noun — `/automation` read
-/// `Manage durable scheduled`. If that prefix lost the head noun, intervening
-/// modifiers are dropped so the noun survives.
-fn shed_to_words(text: &str, max_width: usize) -> Cow<'_, str> {
+/// `Manage durable scheduled`. In English, if that prefix lost the head noun,
+/// intervening modifiers are dropped so the noun survives.
+fn shed_to_words(text: &str, max_width: usize, locale: Locale) -> Cow<'_, str> {
     let mut end = 0usize;
     for (idx, ch) in text.char_indices() {
         if ch == ' ' && text[..idx].width() <= max_width {
@@ -875,7 +940,9 @@ fn shed_to_words(text: &str, max_width: usize) -> Cow<'_, str> {
         head = &head[..cut];
     }
     let head = head.trim_end_matches([' ', ',', ';', ':', '—', '-']);
-    if let Some(kept) = keep_simple_head_noun(text, head, max_width) {
+    if locale == Locale::En
+        && let Some(kept) = keep_simple_head_noun(text, head, max_width)
+    {
         return kept;
     }
     Cow::Borrowed(head)
@@ -1243,7 +1310,7 @@ impl ModalView for HelpView {
                         let pad = label_width.saturating_sub(entry.label.width());
                         let desc_capacity =
                             inner_width.saturating_sub(cursor.width() + label_width + 2);
-                        let desc = shed_to_width(&entry.description, desc_capacity);
+                        let desc = shed_to_width(&entry.description, desc_capacity, self.locale);
                         // The label is the string you type and the description
                         // qualifies it. They were both TEXT_PRIMARY, so the
                         // row said everything at one weight and the eye had
@@ -1324,6 +1391,7 @@ mod tests {
         // #3912: both surfaces executed and autocompleted but were absent
         // from the surface that teaches the product.
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -1423,14 +1491,14 @@ mod tests {
     #[test]
     fn substring_filter_narrows_to_command() {
         let mut view = HelpView::new();
-        type_filter(&mut view, "mode [act");
+        type_filter(&mut view, "mode [work");
         assert!(!view.filtered.is_empty());
         // Every filtered entry should genuinely contain the query in its
         // searchable haystack — no false positives slipped past.
         for idx in &view.filtered {
             assert!(
-                view.entries[*idx].haystack.contains("mode [act"),
-                "entry {:?} leaked through `mode [act` filter",
+                view.entries[*idx].haystack.contains("mode [work"),
+                "entry {:?} leaked through `mode [work` filter",
                 view.entries[*idx]
             );
         }
@@ -1440,7 +1508,7 @@ mod tests {
             view.filtered
                 .iter()
                 .any(|idx| view.entries[*idx].label == "/mode"),
-            "/mode should match the `mode [act` filter"
+            "/mode should match the `mode [work` filter"
         );
     }
 
@@ -1756,7 +1824,7 @@ mod tests {
     fn shedding_never_leaves_a_parenthesis_open() {
         let text = "Attach media  (aliases: /image, /media)";
         for width in 4..text.len() {
-            let shed = shed_to_width(text, width);
+            let shed = shed_to_width(text, width, Locale::En);
             let opens = shed.matches('(').count();
             let closes = shed.matches(')').count();
             assert_eq!(opens, closes, "unbalanced at width {width}: {shed:?}");
@@ -1770,7 +1838,7 @@ mod tests {
     #[test]
     fn a_jointless_description_sheds_to_whole_words() {
         let text = "Move the active branch to an existing session entry";
-        let shed = shed_to_width(text, 26);
+        let shed = shed_to_width(text, 26, Locale::En);
         assert!(text.starts_with(&*shed), "{shed:?}");
         assert!(!shed.is_empty());
         assert!(!shed.ends_with(" an"), "{shed:?}");
@@ -1996,6 +2064,7 @@ mod tests {
     #[test]
     fn a_workspace_command_states_its_declared_usage() {
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -2115,14 +2184,14 @@ mod tests {
     #[test]
     fn render_with_filter_shows_only_matching_section_and_status() {
         let mut view = HelpView::new();
-        type_filter(&mut view, "mode [act");
+        type_filter(&mut view, "mode [work");
         let area = Rect::new(0, 0, 96, 24);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
 
         let dump = buffer_text(&buf, area);
         assert!(
-            dump.contains("Filter: mode [act"),
+            dump.contains("Filter: mode [work"),
             "filter echo missing:\n{dump}"
         );
         assert!(
@@ -2135,7 +2204,7 @@ mod tests {
         );
         assert!(
             !dump.contains("/model"),
-            "non-matching commands should not render under a `mode [act` filter:\n{dump}"
+            "non-matching commands should not render under a `mode [work` filter:\n{dump}"
         );
     }
 
@@ -2471,7 +2540,7 @@ mod tests {
 
 #[cfg(test)]
 mod shed_to_words_script_tests {
-    use super::{shed_to_words, widest_char_prefix};
+    use super::{Locale, shed_to_words, widest_char_prefix};
     use unicode_width::UnicodeWidthStr;
 
     /// Japanese, Chinese and Thai do not put spaces between words, so a
@@ -2485,7 +2554,7 @@ mod shed_to_words_script_tests {
             "切換背景顧問",
         ] {
             for width in [8usize, 12, 20, 30] {
-                let shed = shed_to_words(text, width);
+                let shed = shed_to_words(text, width, Locale::En);
                 assert!(
                     !shed.is_empty(),
                     "{text:?} at {width}: description rendered blank",
@@ -2508,7 +2577,7 @@ mod shed_to_words_script_tests {
     #[test]
     fn an_overlong_first_word_sheds_to_characters_rather_than_nothing() {
         let text = "Internationalisation settings";
-        let shed = shed_to_words(text, 10);
+        let shed = shed_to_words(text, 10, Locale::En);
         assert!(!shed.is_empty(), "long first word rendered blank");
         assert!(shed.width() <= 10, "{shed:?}");
     }
@@ -2518,7 +2587,7 @@ mod shed_to_words_script_tests {
     #[test]
     fn english_still_sheds_on_word_boundaries() {
         let text = "Toggle the background advisor for this session";
-        let shed = shed_to_words(text, 24);
+        let shed = shed_to_words(text, 24, Locale::En);
         assert!(shed.width() <= 24, "{shed:?}");
         assert!(!shed.ends_with(' '), "{shed:?}");
         assert!(
@@ -2548,7 +2617,7 @@ mod shed_to_words_script_tests {
         // 35 is the description slot at 60 columns (measured).
         // 36 is the full phrase.
         for width in [24usize, 28, 32, 35, 36] {
-            let shed = shed_to_words(text, width);
+            let shed = shed_to_words(text, width, Locale::En);
             assert!(
                 shed.contains("automations"),
                 "width {width} dropped the head noun: {shed:?}"
@@ -2564,7 +2633,7 @@ mod shed_to_words_script_tests {
         // one column over the 35-column slot, so last-resort word shed must
         // run on that clause, not on the alias list.
         let aliased = "Manage durable scheduled automations  (aliases: /automations, /scheduled)";
-        let shed = super::shed_to_width(aliased, 35);
+        let shed = super::shed_to_width(aliased, 35, Locale::En);
         assert!(
             shed.contains("automations"),
             "aliased row dropped the head noun: {shed:?}"

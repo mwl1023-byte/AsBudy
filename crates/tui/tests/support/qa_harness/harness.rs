@@ -294,6 +294,20 @@ impl Harness {
         self.wait_for(move |f| f.contains(&owned), timeout)
     }
 
+    /// Wait for the composer. A launch with no model key opens the provider
+    /// picker first (#6566); tests that only need the composer close it with
+    /// Esc, which returns to the composer without connecting anything.
+    pub fn wait_for_composer(&mut self, timeout: Duration) -> Result<()> {
+        const PICKER: &str = "Choose your model provider";
+        const COMPOSER: &str = "Type a message";
+        self.wait_for(|f| f.contains(PICKER) || f.contains(COMPOSER), timeout)?;
+        if self.frame().contains(PICKER) {
+            self.send(super::keys::key::esc())?;
+            self.wait_for(|f| !f.contains(PICKER) && f.contains(COMPOSER), timeout)?;
+        }
+        Ok(())
+    }
+
     /// Wait for stable output: no new bytes for `quiet_for` consecutive
     /// pump ticks, bounded by `max`. Useful for "let the UI settle".
     pub fn wait_for_idle(&mut self, quiet_for: Duration, max: Duration) -> Result<()> {
@@ -484,32 +498,9 @@ impl Harness {
         }
     }
 
-    /// Resolve a binary by Cargo bin-name (uses `CARGO_BIN_EXE_<name>`).
-    /// Tests should call this rather than hard-coding paths.
-    ///
-    /// `QA_TUI_BIN` overrides the `codewhale-tui` resolution entirely — cargo
-    /// itself always sets `CARGO_BIN_EXE_*` for integration tests, so an
-    /// inherited value cannot win. Release QA uses this to A/B an older
-    /// released binary against the in-tree build (e.g. the #5424 sweep).
-    pub fn cargo_bin(name: &str) -> PathBuf {
-        if name == "codewhale-tui"
-            && let Some(path) = std::env::var_os("QA_TUI_BIN")
-            && !path.is_empty()
-        {
-            return PathBuf::from(path);
-        }
-        // Newer Cargo exposes CARGO_BIN_EXE_* at runtime; older supported
-        // Cargo versions expose it to the integration test at compile time.
-        let key = format!("CARGO_BIN_EXE_{name}");
-        if let Some(path) = std::env::var_os(&key) {
-            return PathBuf::from(path);
-        }
-        if name == "codewhale-tui"
-            && let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui")
-        {
-            return PathBuf::from(path);
-        }
-        panic!("env {key} not set; is the binary declared in this crate?")
+    /// Resolve the canonical executable, including an explicit QA_TUI_BIN selection.
+    pub fn codewhale_binary() -> PathBuf {
+        crate::binary::codewhale()
     }
 
     /// Best-effort cooperative shutdown.
@@ -594,9 +585,20 @@ fn consume_cursor_position_queries(tail: &mut Vec<u8>, bytes: &[u8]) -> usize {
 /// Construct a sealed-`HOME` workspace under a `tempfile::TempDir` so the
 /// scenario can never read or mutate the developer's real config / skills.
 pub fn make_sealed_workspace() -> Result<SealedWorkspace> {
+    sealed_workspace_at(|tmp, _home| tmp.join("workspace"))
+}
+
+/// Like [`make_sealed_workspace`], but the workspace is `HOME/<project>`, so
+/// the TUI displays it as `~/<project>` the way a real user's checkout reads
+/// instead of an absolute tempdir path. Used for published website captures.
+pub fn make_sealed_workspace_in_home(project: &str) -> Result<SealedWorkspace> {
+    sealed_workspace_at(|_tmp, home| home.join(project))
+}
+
+fn sealed_workspace_at(workspace: impl FnOnce(&Path, &Path) -> PathBuf) -> Result<SealedWorkspace> {
     let tmp = tempfile::TempDir::new().context("tempdir")?;
-    let workspace = tmp.path().join("workspace");
     let home = tmp.path().join("home");
+    let workspace = workspace(tmp.path(), &home);
     std::fs::create_dir_all(&workspace).context("mkdir workspace")?;
     std::fs::create_dir_all(home.join(".codewhale")).context("mkdir home/.codewhale")?;
     std::fs::create_dir_all(home.join(".deepseek")).context("mkdir home/.deepseek")?;

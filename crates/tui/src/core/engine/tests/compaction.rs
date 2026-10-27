@@ -6,13 +6,13 @@ async fn rejected_manual_compaction_route_closes_typed_lifecycle() {
     let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let route_config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("structurally resolve route without credential");
@@ -48,10 +48,23 @@ async fn rejected_manual_compaction_route_closes_typed_lifecycle() {
                 order.push("failed");
             }
             Event::Error { .. } => order.push("error"),
+            Event::TurnComplete {
+                turn_id,
+                submission_id,
+                compaction_id,
+                status,
+                ..
+            } => {
+                assert!(turn_id.is_none());
+                assert!(submission_id.is_none());
+                assert_eq!(compaction_id.as_deref(), Some("compact-route-invalid"));
+                assert_eq!(status, TurnOutcomeStatus::Failed);
+                order.push("terminal");
+            }
             _ => {}
         }
     }
-    assert_eq!(order, ["started", "failed", "error"]);
+    assert_eq!(order, ["started", "failed", "error", "terminal"]);
     assert_eq!(started_id, failed_id);
 }
 
@@ -61,13 +74,13 @@ async fn queued_manual_compaction_cancellation_is_idempotent_and_skips_route_act
     let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let route_config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("structurally resolve route without credential");
@@ -89,8 +102,9 @@ async fn queued_manual_compaction_cancellation_is_idempotent_and_skips_route_act
         [
             Event::CompactionStarted { id: started, auto: false, .. },
             Event::CompactionCancelled { id: cancelled, auto: false, .. },
-            Event::TurnComplete { status: TurnOutcomeStatus::Interrupted, .. }
-        ] if started == id && cancelled == id
+            Event::TurnComplete { turn_id: None, submission_id: None,
+                compaction_id: Some(terminal), status: TurnOutcomeStatus::Interrupted, .. }
+        ] if started == id && cancelled == id && terminal == id
     ));
     assert!(
         !drained
@@ -111,6 +125,190 @@ async fn queued_manual_compaction_cancellation_is_idempotent_and_skips_route_act
         "running cancellation reaches its token"
     );
     engine.finish_compaction(id);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn terminal_correlation_preflight_failures_keep_each_submitted_owner() {
+    let _env_lock = lock_test_env();
+    let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
+    let workspace = tempdir().expect("isolated workspace");
+    let route_config = Config {
+        provider: Some("deepseek".to_string()),
+        default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
+        ..Config::default()
+    }
+    .with_legacy_root(Some(String::new()), None);
+    let invalid_route = resolve_runtime_route(
+        &route_config,
+        ProviderKind::Deepseek,
+        Some(crate::config::DEFAULT_TEXT_MODEL),
+    )
+    .expect("structurally resolved route");
+    assert!(
+        invalid_route.clone().validate().is_err(),
+        "fixture must fail at engine route installation"
+    );
+    let (engine, handle) =
+        Engine::new(deterministic_engine_config(workspace.path()), &route_config);
+    let task = tokio::spawn(engine.run());
+    for submission in [None, Some("sub-route-rejected")] {
+        let mut op = external_user_message_op("invalid route", AppMode::Agent, &Config::default());
+        if let Op::SendMessage(TurnSpec {
+            route,
+            provenance,
+            submission_id,
+            ..
+        }) = &mut op
+        {
+            **route = invalid_route.clone();
+            *submission_id = submission.map(str::to_string);
+            if submission.is_none() {
+                *provenance = UserInputProvenance::Runtime;
+            }
+        }
+        handle.send(op).await.expect("queue route rejection");
+    }
+    handle
+        .send(Op::EditLastTurn {
+            new_message: "rejected edit".into(),
+            submission_id: Some("sub-edit-rejected".into()),
+        })
+        .await
+        .expect("queue rejected edit");
+    handle
+        .send(Op::CompactContext {
+            id: "compact-after-rejections".into(),
+            route: Box::new(invalid_route),
+            compaction: Box::new(CompactionConfig::default()),
+        })
+        .await
+        .expect("queue compaction rejection");
+    let expected = [
+        (None, None),
+        (Some("sub-route-rejected"), None),
+        (Some("sub-edit-rejected"), None),
+        (None, Some("compact-after-rejections")),
+    ];
+    let mut terminal_count = 0;
+    {
+        let mut rx = handle.rx_event.write().await;
+        while terminal_count < expected.len() {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("every rejected operation must settle")
+                .expect("engine event");
+            match event {
+                Event::TurnStarted { .. } => panic!("preflight rejections must not start turns"),
+                Event::TurnComplete {
+                    turn_id,
+                    submission_id,
+                    compaction_id,
+                    status,
+                    error,
+                    ..
+                } => {
+                    assert!(turn_id.is_none());
+                    assert_eq!(
+                        (submission_id.as_deref(), compaction_id.as_deref()),
+                        expected[terminal_count]
+                    );
+                    assert_eq!(status, TurnOutcomeStatus::Failed);
+                    assert!(error.is_some());
+                    terminal_count += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    handle.send(Op::Shutdown).await.expect("shutdown");
+    task.await.expect("engine task");
+    let mut rx = handle.rx_event.write().await;
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+            event,
+            Event::TurnStarted { .. } | Event::TurnComplete { .. }
+        )),
+        "each rejected operation has exactly one terminal and no provider turn"
+    );
+}
+
+#[tokio::test]
+async fn terminal_correlation_started_failure_matches_its_original_submission() {
+    let workspace = tempdir().expect("isolated workspace");
+    let model = std::sync::Arc::new(FailingGoalModelClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        message: "deterministic terminal correlation failure".into(),
+    });
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let (engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op_with_submission(
+            "fail this turn",
+            AppMode::Agent,
+            &Config::default(),
+            Some("sub-started-failure".into()),
+        ))
+        .await
+        .expect("submit");
+    let mut started = None;
+    {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("failed model turn must settle")
+                .expect("engine event");
+            match event {
+                Event::TurnStarted {
+                    turn_id,
+                    submission_id,
+                    ..
+                } => {
+                    assert!(started.is_none(), "exactly one start");
+                    assert_eq!(submission_id.as_deref(), Some("sub-started-failure"));
+                    started = Some(turn_id);
+                }
+                Event::TurnComplete {
+                    turn_id,
+                    submission_id,
+                    compaction_id,
+                    status,
+                    error,
+                    ..
+                } => {
+                    assert!(started.is_some());
+                    assert_eq!(turn_id, started);
+                    assert_eq!(submission_id.as_deref(), Some("sub-started-failure"));
+                    assert!(compaction_id.is_none());
+                    assert_eq!(status, TurnOutcomeStatus::Failed);
+                    assert!(
+                        error
+                            .as_deref()
+                            .is_some_and(|s| s.contains("terminal correlation failure"))
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    handle.send(Op::Shutdown).await.expect("shutdown");
+    task.await.expect("engine task");
+    assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let mut rx = handle.rx_event.write().await;
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+            event,
+            Event::TurnStarted { .. } | Event::TurnComplete { .. }
+        )),
+        "a model failure must not produce a second terminal"
+    );
 }
 
 struct BlockingEmergencyCompactionModelClient {
@@ -210,10 +408,12 @@ async fn manual_compaction_accounts_accepted_and_rejected_responses_once() {
             .await;
         let route_config = Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("fixture-key".to_string()),
-            base_url: Some(format!("{}/v1", server.uri())),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(
+            Some("fixture-key".to_string()),
+            Some(format!("{}/v1", server.uri())),
+        );
         let (mut engine, handle) = Engine::new(
             EngineConfig {
                 workspace: workspace.path().to_path_buf(),
@@ -396,5 +596,96 @@ async fn emergency_compaction_cancellation_drops_provider_and_never_mutates_cont
             Event::CompactionCompleted { .. } | Event::CompactionFailed { .. }
         )),
         "a canceled emergency pass must have one canceled terminal event"
+    );
+}
+
+/// Experience mark 2: a one-message conversation has nothing to summarize.
+/// Emergency recovery must not start a pass (no spinner, no model call)
+/// before the failure the caller reports anyway.
+#[tokio::test]
+async fn emergency_recovery_skips_a_history_with_nothing_to_compact() {
+    use crate::llm_client::mock::MockLlmClient;
+    let _env_lock = lock_test_env();
+    let workspace = tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", workspace.path());
+    let (mut engine, handle) = Engine::new(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+    );
+    engine.session.messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    }]
+    .into();
+    let client = MockLlmClient::new(Vec::new());
+    let mut turn = TurnContext::new(1);
+    assert!(
+        !engine
+            .recover_context_overflow(&client, None, "preflight token budget", &mut turn)
+            .await
+    );
+    assert_eq!(client.call_count(), 0, "no summary request for one message");
+    assert_eq!(turn.stop_diagnostics.emergency_compaction_attempts, 0);
+    let mut events = handle.rx_event.write().await;
+    let drained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !drained.iter().any(|event| matches!(
+            event,
+            Event::CompactionStarted { .. } | Event::CompactionFailed { .. }
+        )),
+        "{drained:?}"
+    );
+}
+
+#[test]
+fn recovery_failures_from_the_provider_are_told_apart_from_budget_failures() {
+    use super::super::compaction::is_provider_rejection;
+    use crate::llm_client::LlmError;
+    assert!(is_provider_rejection(&anyhow::Error::new(
+        LlmError::ModelError("\"nomic-embed-text:latest\" does not support chat".to_string())
+    )));
+    assert!(is_provider_rejection(&anyhow::anyhow!(
+        "connection refused while contacting http://localhost:11434"
+    )));
+    assert!(!is_provider_rejection(&anyhow::Error::new(
+        LlmError::ContextLengthError("prompt is too long".to_string())
+    )));
+    assert!(!is_provider_rejection(&anyhow::anyhow!(
+        "Making room did not shrink the context; the original conversation was preserved."
+    )));
+}
+
+#[test]
+fn a_request_that_cannot_fit_names_the_cause_and_one_next_step() {
+    use super::super::context::context_does_not_fit_message;
+    let embed =
+        context_does_not_fit_message(true, true, "nomic-embed-text:latest", 5_200, 1_500, 5_100);
+    assert_eq!(
+        embed,
+        "nomic-embed-text:latest can't chat. Pick a chat model: /model."
+    );
+    let window = context_does_not_fit_message(true, true, "qwen3:4b", 5_300, 3_000, 5_100);
+    assert!(
+        window.contains("qwen3:4b's context window (~3000 tokens usable)"),
+        "{window}"
+    );
+    assert!(
+        window.contains("working instructions (~5100 tokens)"),
+        "{window}"
+    );
+    assert!(window.ends_with("raise num_ctx: /model."), "{window}");
+    assert!(!window.contains("compaction"), "{window}");
+    let message = context_does_not_fit_message(false, false, "small-model", 9_000, 6_000, 2_000);
+    assert!(
+        message.contains("there is not enough earlier conversation to summarize"),
+        "{message}"
+    );
+    assert!(message.ends_with("choose a larger model."), "{message}");
+    assert!(
+        !message.contains("/model"),
+        "headless has no command layer: {message}"
     );
 }

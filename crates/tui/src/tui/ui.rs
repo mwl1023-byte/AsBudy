@@ -55,18 +55,21 @@ use crate::client::{
 use crate::commands;
 use crate::compaction::CompactionConfig;
 use crate::compaction::{estimate_input_tokens_conservative, estimate_tokens};
+#[cfg(test)]
+use crate::config::ProviderConfig;
 use crate::config::{
-    ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig, StatusItem,
-    UpdateConfig, persist_external_credential_consent_for_at,
-    revoke_external_credential_consent_for_at,
+    Config, ProviderIdentity, ProviderKind, ProvidersConfig, StatusItem, UpdateConfig,
+    persist_external_credential_consent_for_at, revoke_external_credential_consent_for_at,
 };
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
-use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
+use crate::core::ops::{Op, ProviderRuntimeStatus, UserInputProvenance};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::prompts;
-use crate::route_runtime::{resolve_runtime_route, resolve_runtime_route_for_identity};
+#[cfg(test)]
+use crate::route_runtime::resolve_runtime_route;
+use crate::route_runtime::resolve_runtime_route_for_identity;
 #[cfg(test)]
 use crate::session_manager::create_saved_session_with_id_and_mode;
 use crate::session_manager::{
@@ -150,14 +153,14 @@ use super::approval::{
     ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    ExecCell, HistoryCell, ReasoningAction, ThinkingFold, ToolCell, ToolStatus,
+    CellFoldAction, ExecCell, HistoryCell, ToolCell, ToolStatus, TranscriptFold,
     history_cells_from_message, summarize_tool_output,
 };
 use super::slash_menu::{
     apply_slash_menu_selection, partial_inline_skill_mention_at_cursor,
     try_autocomplete_slash_command, visible_slash_menu_entries,
 };
-use super::views::{ConfigView, ContextMenuAction, HelpView, ModalKind, ViewAction, ViewEvent};
+use super::views::{ConfigView, HelpView, ModalKind, ViewAction, ViewEvent};
 use super::widgets::pending_input_preview::{ContextPreviewItem, PendingInputPreview};
 use super::widgets::{ChatWidget, ComposerWidget, Renderable};
 
@@ -188,20 +191,18 @@ use self::activity_detail::{
 const SLASH_MENU_LIMIT: usize = 128;
 const MIN_CHAT_HEIGHT: u16 = 3;
 const MIN_COMPOSER_HEIGHT: u16 = 2;
-const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
-const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
+use codewhale_runtime::context_budget::{
+    CONTEXT_CRITICAL_THRESHOLD_PERCENT, CONTEXT_WARNING_THRESHOLD_PERCENT,
+};
 const CONTEXT_SUGGEST_COMPACT_THRESHOLD_PERCENT: f64 = 60.0;
 const UI_IDLE_POLL_MS: u64 = 48;
 const UI_ACTIVE_POLL_MS: u64 = 24;
 const SUBAGENT_HOOK_PREVIEW_LIMIT: usize = 2_048;
 const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
-/// Minimum wall-clock time a turn may stay in `"in_progress"` before the UI
-/// assumes the engine stalled (e.g. sub-agent hang, lost completion event,
-/// engine panic).  The effective watchdog also respects the configured stream
-/// idle timeout so legitimate long model-reasoning pauses are not interrupted
-/// prematurely.
+/// Wall-clock time a turn may stay in `"in_progress"` with no activity before
+/// the UI assumes the engine stalled (sub-agent hang, lost completion event,
+/// engine panic) — unless the engine heartbeat reports a live bounded wait.
 const TURN_STALL_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
-const TURN_STALL_WATCHDOG_GRACE: Duration = Duration::from_secs(30);
 /// Running tools can legitimately exceed the silent-turn timeout, but a tool
 /// with no progress heartbeat or output beyond this ceiling is treated as hung.
 // Must stay comfortably above `turn_stall_watchdog_timeout` so a running tool
@@ -212,6 +213,7 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(600);
 // the per-tool spinner pulse — keep this fast enough that the whale-spout
 // braille pattern reads as continuous motion instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
+const UI_QUIET_STATUS_ANIMATION_MS: u64 = 1_000;
 /// Ambient fish, the idle-mark caustic, and the completion wake use a modest
 /// ~12.5fps clock by default. On measured high-Hz displays the adaptive probe
 /// may raise this (still bounded); low_motion always freezes the cadence.
@@ -265,7 +267,7 @@ const REQUIRED_RELEASE_ASSETS: &[&str] = &[
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
 
-type PendingToolUses = Vec<(String, String, serde_json::Value)>;
+type PendingToolUses = Vec<ContentBlock>;
 
 #[derive(Debug)]
 enum TranslationEvent {
@@ -282,7 +284,7 @@ enum TranslationEvent {
     Thinking {
         origin_session_fingerprint: Option<String>,
         origin_turn_fingerprint: Option<String>,
-        placeholder: String,
+        translation_id: u64,
         translated: anyhow::Result<String>,
         usage: Option<codewhale_models::Usage>,
     },
@@ -488,8 +490,18 @@ mod memory_quick_add_tests {
     }
 }
 
-fn spawn_tui_engine(config: EngineConfig, api_config: &Config) -> EngineHandle {
-    let handle = spawn_engine(config, api_config);
+fn spawn_tui_engine(
+    app: &mut App,
+    api_config: &Config,
+    mcp_handoff: Option<crate::mcp::McpHandoff>,
+) -> EngineHandle {
+    let handle = spawn_engine(
+        build_engine_config(app, api_config),
+        api_config,
+        mcp_handoff,
+    );
+    app.mcp_snapshot_generation = 0;
+    app.mcp_snapshot_generation_invalidated = false;
     // Prime durable agent + coordination state through the same engine event
     // used by later refreshes. All TUI engine replacements use this wrapper,
     // so workspace switches and provider recovery cannot retain stale Work.
@@ -497,11 +509,54 @@ fn spawn_tui_engine(config: EngineConfig, api_config: &Config) -> EngineHandle {
     handle
 }
 
+async fn retire_tui_engine(
+    app: &mut App,
+    engine_handle: &EngineHandle,
+) -> Option<crate::mcp::McpHandoff> {
+    let mcp_handoff = engine_handle.retire_mcp_for_handoff();
+    let active = app
+        .active_compaction
+        .as_ref()
+        .map(|active| (active.id.clone(), active.auto));
+    let queued = (app.manual_compaction_queued && app.deferred_manual_compaction.is_none())
+        .then(|| app.manual_compaction_id.clone().unwrap_or_default());
+    for id in active.iter().map(|(id, _)| id).chain(queued.iter()) {
+        let _ = engine_handle.cancel_compaction(id.clone());
+    }
+    let _ = engine_handle.send(Op::Shutdown).await;
+    if active.is_some() || queued.is_some() {
+        let (id, auto) = active.unwrap_or_else(|| (queued.unwrap_or_default(), false));
+        app.manual_compaction_queued = false;
+        app.manual_compaction_id = None;
+        let text = app
+            .tr(MessageId::ContextCompactionStoppedOnEngineSwitch)
+            .into_owned();
+        apply_compaction_cancelled(app, &id, auto, text);
+    }
+    if std::mem::take(&mut app.is_purging) {
+        let text = app
+            .tr(MessageId::ContextPurgeAbandonedOnEngineSwitch)
+            .into_owned();
+        add_compaction_receipt(app, &text);
+        app.push_status_toast(text, StatusToastLevel::Warning, Some(5_000));
+    }
+    mcp_handoff
+}
+
+async fn replace_tui_engine(app: &mut App, api_config: &Config, engine_handle: &mut EngineHandle) {
+    let mcp_handoff = retire_tui_engine(app, engine_handle).await;
+    *engine_handle = spawn_tui_engine(app, api_config, mcp_handoff);
+}
+
 /// Startup and consent-triggered replacement restore the same conversation
 /// before admitting any pending input. The existing engine remains the sole
 /// owner of model-facing history and the frozen system prefix.
-async fn spawn_tui_engine_with_session(app: &mut App, config: &Config) -> Result<EngineHandle> {
-    let handle = spawn_tui_engine(build_engine_config(app, config), config);
+async fn spawn_tui_engine_with_session(
+    app: &mut App,
+    config: &Config,
+    mcp_handoff: Option<crate::mcp::McpHandoff>,
+) -> Result<EngineHandle> {
+    let handle = spawn_tui_engine(app, config, mcp_handoff);
     let restored = async {
         if !app.api_messages.is_empty() {
             handle
@@ -609,7 +664,9 @@ fn deliver_constitution_draft_result(
                 let preview = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::setup::SetupWizardView>()
-                    .map(|wizard| wizard.install_model_draft(constitution, model_label.clone()));
+                    .and_then(|wizard| {
+                        wizard.install_model_draft(constitution, model_label.clone())
+                    });
                 app.view_stack.push_boxed(boxed);
                 if let Some((title, content)) = preview {
                     open_text_pager(app, title, content);
@@ -656,7 +713,7 @@ fn deliver_fleet_draft_result(
                 let installed = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
-                    .map(|wizard| {
+                    .and_then(|wizard| {
                         wizard.install_model_draft(
                             draft,
                             model_label.clone(),
@@ -718,10 +775,15 @@ fn is_work_graph_mutation_tool(name: &str) -> bool {
     )
 }
 
-fn turn_stall_watchdog_timeout(app: &App) -> Duration {
-    let stream_budget = Duration::from_secs(app.stream_chunk_timeout_secs)
-        .saturating_add(TURN_STALL_WATCHDOG_GRACE);
-    TURN_STALL_WATCHDOG_TIMEOUT.max(stream_budget)
+/// UI watchdog bound for an in-progress turn with no activity (#6184).
+///
+/// Decoupled from `stream_chunk_timeout_secs`: tying it to that budget made
+/// the UI watchdog unable to fire before the 900s stream idle timeout. A
+/// quiet model wait is protected by the engine heartbeat instead — while the
+/// engine reports a bounded wait it has not flagged as overdue, the UI defers
+/// to it (`reconcile_turn_liveness_with`).
+fn turn_stall_watchdog_timeout(_app: &App) -> Duration {
+    TURN_STALL_WATCHDOG_TIMEOUT
 }
 
 fn active_turn_has_running_tool(app: &App) -> bool {
@@ -736,47 +798,13 @@ fn active_turn_has_running_tool(app: &App) -> bool {
 // Per-turn notification composition (settings, message body, summary)
 // moved to `tui/notifications.rs` alongside the dispatch primitives.
 
-async fn tool_result_content_for_api_message(
-    app: &App,
-    id: &str,
-    name: &str,
-    output: &ToolResult,
-) -> String {
-    let raw = output.content.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-
-    if matches!(
-        name,
-        "run_tests" | "run_verifiers" | "task_gate_run" | "tasks"
-    ) {
-        return crate::core::engine::compact_tool_result_for_route(
-            app.api_provider,
-            &app.model,
-            app.active_route_limits,
-            name,
-            output,
-        );
-    }
-
-    if raw.chars().count() > crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
-        let messages = live_tool_receipt_messages(app, id, raw, output.success);
-        let artifacts = app.session_artifacts.clone();
-        let raw = raw.to_string();
-        match tokio::task::spawn_blocking(move || {
-            compact_live_tool_receipt(messages, artifacts, raw)
-        })
-        .await
-        {
-            Ok(Some(receipt)) => return receipt,
-            Ok(None) => {}
-            Err(err) => {
-                crate::logging::warn(format!("live tool-output receipt compaction failed: {err}"));
-            }
-        }
-    }
-
+/// The TUI's copy of a tool result for its API-message mirror. It is the same
+/// view the engine gives the model (#6508): whole within the route's inline
+/// budget, otherwise cut around a footer that names the saved full output.
+/// A separate receipt here used to replace anything over 12,000 characters
+/// with a 240-character preview, and that copy is what `SyncSession` sends
+/// back to the engine.
+fn tool_result_content_for_api_message(app: &App, name: &str, output: &ToolResult) -> String {
     crate::core::engine::compact_tool_result_for_route(
         app.api_provider,
         &app.model,
@@ -793,16 +821,12 @@ async fn tool_result_content_for_api_message(
 #[derive(Debug, Clone)]
 pub(crate) struct UserDispatchOutcome {
     turn_compaction: CompactionConfig,
-    effective_provider: ApiProvider,
+    effective_provider: ProviderKind,
     effective_model: String,
     effective_provider_identity: String,
     effective_provider_label: String,
     effective_reasoning_effort: EffectiveReasoningEffort,
     auto_selection: Option<crate::model_routing::AutoRouteSelection>,
-}
-
-fn is_model_visible_tool_call(id: &str) -> bool {
-    !id.starts_with(USER_SHELL_TOOL_ID_PREFIX)
 }
 
 /// Tell the operator that an explicit "make this my default" request did not
@@ -922,6 +946,7 @@ use std::process::{Command, Stdio};
 // moved verbatim, and are re-exported so every existing path still resolves.
 mod apply;
 mod approval_routing;
+pub(crate) mod feedback_host;
 use approval_routing::*;
 mod event_loop;
 mod handlers;
@@ -1007,7 +1032,16 @@ async fn execute_command_input(
         return Ok(false);
     }
 
-    let result = commands::execute(input, app);
+    let result = commands::execute_with_config(input, app, config);
+    // The NOTES view reads the notes file off the render path on the
+    // workspace-context tick; a `/note` change refreshes it at once (#6565).
+    if input
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| command.eq_ignore_ascii_case("/note"))
+    {
+        workspace_context::refresh_now(app, Instant::now());
+    }
     // After /logout: clear the in-memory api_key fields so the next
     // onboarding round entering a new key doesn't see the stale value
     // (#343). The on-disk side is handled by clear_api_key() inside
@@ -1018,7 +1052,7 @@ async fn execute_command_input(
         // already removes all saved keys; clearing only the active slot here
         // prevents surprising side-effects when the user has multiple providers
         // configured.
-        clear_active_provider_api_key_from_memory(app, config);
+        clear_active_provider_api_key_from_memory(app, config).map_err(anyhow::Error::msg)?;
         app.api_key_env_only = crate::config::active_provider_uses_env_only_api_key(config);
     }
     apply_command_result(terminal, app, engine_handle, task_manager, config, result).await
@@ -1038,7 +1072,7 @@ pub(crate) struct SteerPausedSnapshot {
 fn use_bundled_constitution(app: &mut App, config: &Config) {
     let mut state = crate::tui::setup::load_setup_state_for_app(app, config);
     state.complete_constitution_checkpoint(
-        crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+        crate::prompts::CONSTITUTION_CHECKPOINT_VERSION,
         codewhale_config::ConstitutionChoice::Bundled,
     );
     state.constitution_source = codewhale_config::ConstitutionSource::Bundled;
@@ -1049,7 +1083,7 @@ fn use_bundled_constitution(app: &mut App, config: &Config) {
         codewhale_config::StepEntry::new(
             codewhale_config::StepStatus::Verified,
             true,
-            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            crate::prompts::CONSTITUTION_CHECKPOINT_VERSION,
         )
         .with_result("bundled/default constitution"),
     );
@@ -1095,6 +1129,7 @@ pub(crate) struct ApprovalDecisionEvent {
 }
 
 fn mark_active_turn_cancelled_locally(app: &mut App) {
+    settle_pending_human_requests(app);
     app.retire_action_notices(None);
     // #2739: every local cancel surface (Esc, Ctrl+C, approval abort, paused
     // command abort) must snapshot before it clears turn state. Otherwise
@@ -1104,6 +1139,9 @@ fn mark_active_turn_cancelled_locally(app: &mut App) {
     app.finalize_streaming_assistant_as_interrupted();
     persist_recovery_snapshot(app);
     app.is_loading = false;
+    // #6800: a dispatch still waiting on engine admission fails back now, not
+    // after its 60 s bound; its closure retires `dispatch_in_flight`.
+    app.cancel_in_flight_dispatch();
     app.dispatch_started_at = None;
     app.turn_started_at = None;
     app.turn_last_activity_at = None;
@@ -1167,6 +1205,10 @@ pub(crate) fn escape_cancel_request(
     }
 }
 
+/// Stream events a local cancel hides until the turn completes. Approval,
+/// sandbox-elevation, and question requests are never silently hidden:
+/// `resolve_stale_parent_request` answers a stale parent request explicitly,
+/// and a child agent's request is always delivered (approvals C1).
 fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {
     matches!(
         event,
@@ -1179,9 +1221,6 @@ fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallHeartbeat
             | EngineEvent::ToolCallComplete { .. }
-            | EngineEvent::ApprovalRequired { .. }
-            | EngineEvent::UserInputRequired { .. }
-            | EngineEvent::ElevationRequired { .. }
             | EngineEvent::SessionUpdated { .. }
     )
 }
@@ -1198,61 +1237,52 @@ fn ignore_stale_stream_event_while_idle(event: &EngineEvent) -> bool {
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallHeartbeat
             | EngineEvent::ToolCallComplete { .. }
-            | EngineEvent::ApprovalRequired { .. }
-            | EngineEvent::UserInputRequired { .. }
-            | EngineEvent::ElevationRequired { .. }
     )
 }
 
-type ProviderKeyVerification<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+/// `Ok` carries the `/models` roster the probe already downloaded, when it
+/// was one complete listing (see [`crate::client::verify_provider_api_key`]).
+type ProviderKeyVerification<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<codewhale_config::catalog::ProviderCatalogDelta>, String>>
+            + Send
+            + 'a,
+    >,
+>;
 
-pub(crate) fn request_foreground_shell_background(app: &mut App) {
-    if !app.is_loading {
-        app.status_message = Some("No foreground shell wait to move to /jobs".to_string());
-        return;
-    }
-    if !active_foreground_shell_running(app) {
-        // #3032 AC3: name the reason backgrounding is unavailable —
-        // interactive execs and non-shell blocking tools are visibly running
-        // but cannot be detached, and a generic shrug reads like a bug.
-        let reason = if terminal_pause_has_live_owner(app) {
-            "the running command is interactive"
-        } else if app
-            .active_cell
-            .as_ref()
-            .is_some_and(|active| !active.is_empty())
-        {
-            "the running tool is not a foreground shell command"
-        } else {
-            "no foreground shell command is running"
-        };
-        app.status_message = Some(format!(
-            "Cannot move to /jobs: {reason}. Press Ctrl+C to cancel the turn, or wait for completion."
-        ));
-        return;
-    }
-
-    match request_active_foreground_shell_background(app) {
-        Ok(()) => {
-            app.status_message = Some("Moving current shell command to /jobs...".to_string());
+pub(crate) fn request_shell_wait_detach(app: &mut App) {
+    let (notice, level) = match request_active_shell_wait_detach(app) {
+        Ok(true) => (
+            app.tr(MessageId::ShellWaitReleased)
+                .replace("{jobs}", "/jobs"),
+            StatusToastLevel::Info,
+        ),
+        Ok(false) => {
+            let message = if terminal_pause_has_live_owner(app) {
+                MessageId::ShellWaitInteractive
+            } else if app.is_loading {
+                MessageId::ShellWaitUnavailable
+            } else {
+                MessageId::ShellWaitNoActive
+            };
+            (app.tr(message).to_string(), StatusToastLevel::Info)
         }
-        Err(err) => {
-            app.status_message = Some(err.to_string());
-        }
-    }
+        Err(err) => (err.to_string(), StatusToastLevel::Error),
+    };
+    app.push_status_toast(notice, level, Some(6_000));
 }
 
-fn request_active_foreground_shell_background(app: &App) -> Result<()> {
-    let shell_manager = app
-        .runtime_services
-        .shell_manager
-        .clone()
-        .context("No shell session is active.")?;
+fn request_active_shell_wait_detach(app: &App) -> Result<bool> {
+    let Some(session_id) = app.current_session_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(shell_manager) = app.runtime_services.shell_manager.as_ref() else {
+        return Ok(false);
+    };
     let mut manager = shell_manager.lock().map_err(|_| {
         anyhow::anyhow!("Shell tracking hit an internal error — restart Codewhale to recover.")
     })?;
-    manager.request_foreground_background();
-    Ok(())
+    Ok(manager.request_shell_wait_detach(session_id))
 }
 
 pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
@@ -1262,7 +1292,7 @@ pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
         || !app
             .task_panel
             .iter()
-            .any(|task| task.id.starts_with("shell_") && task.status == "running")
+            .any(crate::tui::background_indicator::is_live_shell_entry)
     {
         return false;
     }
@@ -1271,20 +1301,6 @@ pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
     app.cursor_position = app.input.len();
     app.status_message = Some("Press Enter to cancel all running commands".to_string());
     true
-}
-
-pub(crate) fn active_foreground_shell_running(app: &App) -> bool {
-    app.active_cell.as_ref().is_some_and(|active| {
-        active.entries().iter().any(|cell| {
-            matches!(
-                cell,
-                HistoryCell::Tool(ToolCell::Exec(exec))
-                    if exec.status == ToolStatus::Running
-                        && exec.interaction.is_none()
-                        && exec.shell_task_id.is_none()
-            )
-        })
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1298,20 +1314,80 @@ pub(crate) fn clamp_event_poll_timeout(timeout: Duration) -> Duration {
     timeout.max(MIN_EVENT_POLL_TIMEOUT)
 }
 
-/// Decide whether an `AgentComplete` event should fire a subagent-completion
-/// desktop notification, per the `[notifications].subagent_completion` mode.
+/// Announce the background work that finished since the last notice, when
+/// the `[notifications].subagent_completion` mode says it is time (#6565).
+///
+/// Finite work still live (running agents that are not suspect ghosts, a
+/// running workflow, queued or running durable tasks that are not stale)
+/// holds a `final-only`
+/// batch; a running background shell never does. `parent_idle` forces the
+/// parent-turn half of the rule open, for the moment a turn completes.
 /// `settings()` still has the final say (method=off / condition=never).
-fn should_notify_subagent_completion(
-    mode: crate::config::SubagentCompletionNotification,
-    has_other_running_subagents: bool,
-    workflow_tool_running: bool,
-) -> bool {
-    use crate::config::SubagentCompletionNotification as Mode;
-    match mode {
-        Mode::Off => false,
-        Mode::Always => true,
-        Mode::FinalOnly => !has_other_running_subagents && !workflow_tool_running,
+pub(crate) fn flush_background_finished(app: &mut App, config: &Config, parent_idle: bool) {
+    use crate::tui::background_finished::{background_finished_payload, ready_to_flush};
+    if app.background_finished.is_empty() {
+        return;
     }
+    let mode = config.notifications_config().subagent_completion;
+    let finite_work_live = session_state::live_running_agent_count(app) > 0
+        || frame::workflow_tool_is_running(app)
+        || app.task_panel.iter().any(|entry| {
+            // A stale entry (a recovered task whose ownership is unverified)
+            // is not known to be running and could hold the batch forever,
+            // the same reason suspect ghost agents are left out.
+            !entry.stale
+                && entry.kind != TaskPanelEntryKind::Shell
+                && matches!(entry.status.as_str(), "queued" | "running")
+        });
+    let parent_busy = app.is_loading && !parent_idle;
+    if !ready_to_flush(
+        mode,
+        &app.background_finished,
+        finite_work_live,
+        parent_busy,
+    ) {
+        return;
+    }
+    let batch = std::mem::take(&mut app.background_finished);
+    if mode == crate::config::SubagentCompletionNotification::Off {
+        return;
+    }
+    let Some((method, threshold, include_summary)) = notifications::settings(config) else {
+        return;
+    };
+    let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+    let notices: Vec<&[crate::tui::background_finished::FinishedWork]> =
+        if mode == crate::config::SubagentCompletionNotification::Always {
+            batch.chunks(1).collect()
+        } else {
+            vec![batch.as_slice()]
+        };
+    for items in notices {
+        let elapsed = items
+            .iter()
+            .map(|item| item.elapsed)
+            .max()
+            .unwrap_or_default();
+        if let Some(payload) = background_finished_payload(app.ui_locale, items, include_summary) {
+            notifications::notify_done(method, in_tmux, &payload, threshold, elapsed);
+        }
+    }
+}
+
+/// Settle the background-finished batch when the parent turn ends (#6565).
+///
+/// A completed turn sends its own notice, which covers the shells and tasks
+/// that finished while it ran, so those are dropped rather than announced a
+/// second time. Whatever else was held for the turn is then flushed.
+pub(crate) fn settle_background_finished_at_turn_end(
+    app: &mut App,
+    config: &Config,
+    turn_completed: bool,
+) {
+    if turn_completed {
+        crate::tui::background_finished::drop_reported_by_turn(&mut app.background_finished);
+    }
+    flush_background_finished(app, config, true);
 }
 
 // Keyboard-shortcut predicates moved to `tui/key_shortcuts.rs`.
@@ -1371,7 +1447,7 @@ impl UpdateNotice {
         };
         format!(
             "Update available: v{current} -> v{latest}\n\
-             Release notes: https://github.com/Hmbown/CodeWhale/releases/tag/v{latest}\n\
+             Release notes: https://github.com/codewhale-hq/CodeWhale/releases/tag/v{latest}\n\
              {action}",
             current = self.current,
             latest = self.latest
@@ -1433,14 +1509,14 @@ mod provider_key_validation_tests {
         let options = TuiOptions {
             start_in_agent_mode: true,
             skip_onboarding: false,
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         // These suites assert legacy strip geometry (work surface above the
         // transcript). The Bottom default (round 3, 2026-09-01) has its own
         // coverage in work_surface::rail_panels_render_in_all_placements.
         app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app.model = "deepseek-v4-pro".to_string();
         app.auto_model = false;
         app
@@ -1471,14 +1547,18 @@ mod provider_key_validation_tests {
             ..Default::default()
         };
 
-        mirror_saved_api_key_in_config(
-            &mut config,
-            ApiProvider::Xai,
-            "codewhale-owned-api-key".to_string(),
-        );
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Xai);
+            mirror_saved_api_key_in_config(
+                &mut config,
+                &captured_fixture_identity,
+                "codewhale-owned-api-key".to_string(),
+            )
+            .expect("admitted API-key fixture")
+        };
 
         let xai = config
-            .provider_config_for(ApiProvider::Xai)
+            .provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai))
             .expect("xAI live config");
         assert_eq!(xai.auth_mode.as_deref(), Some("api_key"));
         assert_eq!(xai.api_key.as_deref(), Some("codewhale-owned-api-key"));
@@ -1487,18 +1567,25 @@ mod provider_key_validation_tests {
 
     struct MockProviderKeyVerifier {
         result: Result<(), String>,
-        calls: std::sync::Mutex<Vec<(ApiProvider, String, String)>>,
+        roster: Option<codewhale_config::catalog::ProviderCatalogDelta>,
+        calls: std::sync::Mutex<Vec<(ProviderKind, String, String)>>,
     }
 
     impl MockProviderKeyVerifier {
         fn new(result: Result<(), String>) -> Self {
             Self {
                 result,
+                roster: None,
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
 
-        fn calls(&self) -> Vec<(ApiProvider, String, String)> {
+        fn with_roster(mut self, roster: codewhale_config::catalog::ProviderCatalogDelta) -> Self {
+            self.roster = Some(roster);
+            self
+        }
+
+        fn calls(&self) -> Vec<(ProviderKind, String, String)> {
             self.calls.lock().expect("calls lock").clone()
         }
     }
@@ -1506,7 +1593,7 @@ mod provider_key_validation_tests {
     impl ProviderKeyVerifier for MockProviderKeyVerifier {
         fn verify<'a>(
             &'a self,
-            provider: ApiProvider,
+            provider: ProviderKind,
             api_key: &'a str,
             base_url: &'a str,
         ) -> ProviderKeyVerification<'a> {
@@ -1515,7 +1602,9 @@ mod provider_key_validation_tests {
                 api_key.to_string(),
                 base_url.to_string(),
             ));
-            Box::pin(std::future::ready(self.result.clone()))
+            Box::pin(std::future::ready(
+                self.result.clone().map(|()| self.roster.clone()),
+            ))
         }
     }
 
@@ -1591,6 +1680,92 @@ mod provider_key_validation_tests {
         );
     }
 
+    /// Release QA: a DeepSeek key probe returned two served ids, yet guided
+    /// setup offered catalog rows the endpoint rejects at the first turn. The
+    /// roster the probe already downloaded must become the route's model list.
+    #[tokio::test]
+    async fn provider_key_probe_roster_becomes_the_model_pick_roster() {
+        use codewhale_config::catalog::{
+            CatalogOffering, CatalogSource, ProviderCatalogDelta, base_url_fingerprint, now_unix,
+        };
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::provider_catalog_live::reset_cache_for_test();
+                crate::provider_lake::clear_live_snapshot();
+            }
+        }
+        let _config_env = ConfigPathEnvGuard::new();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let _reset = Reset;
+        crate::provider_catalog_live::reset_cache_for_test();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = Config::default();
+        let identity = picker_provider_identity(&config, ProviderKind::Deepseek, None)
+            .expect("DeepSeek identity");
+        let mut scoped = config.clone();
+        scoped
+            .scope_to_provider_identity(&identity)
+            .expect("scope DeepSeek");
+        let base_url = scoped.active_route_base_url();
+        let fingerprint = base_url_fingerprint(&base_url);
+        let fetched_at = now_unix();
+        let served = ["deepseek-flash", "deepseek-v4-pro"];
+        // Scoped to the provider kind, exactly as the live probe returns it,
+        // plus an id the catalog does not offer as a chat model.
+        let roster = ProviderCatalogDelta {
+            provider: "deepseek".into(),
+            base_url_fingerprint: fingerprint.clone(),
+            fetched_at,
+            offerings: served
+                .iter()
+                .chain(&["deepseek-embedding-fixture"])
+                .map(|id| CatalogOffering {
+                    provider: "deepseek".into(),
+                    wire_model_id: (*id).into(),
+                    endpoint_key: "chat".into(),
+                    source: CatalogSource::Live {
+                        base_url_fingerprint: fingerprint.clone(),
+                        fetched_at,
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        assert_ne!(
+            crate::provider_lake::catalog_models_for_route(
+                ProviderKind::Deepseek,
+                identity.key.as_str(),
+                &base_url,
+            ),
+            served,
+            "precondition: the catalog fallback lists more than the endpoint serves"
+        );
+        let verifier = MockProviderKeyVerifier::new(Ok(())).with_roster(roster);
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            identity.clone(),
+            "sk-verified".to_string(),
+            None,
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
+        assert_eq!(
+            crate::provider_lake::catalog_models_for_route(
+                ProviderKind::Deepseek,
+                identity.key.as_str(),
+                &base_url,
+            ),
+            served
+        );
+    }
+
     #[tokio::test]
     async fn provider_key_submit_opens_model_pick_without_persisting_on_validation_success() {
         let config_env = ConfigPathEnvGuard::new();
@@ -1598,7 +1773,7 @@ mod provider_key_validation_tests {
         let mut engine = mock_engine_handle();
         let mut config = openrouter_config("https://mock.openrouter.test/v1");
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_api_key_with_verifier(
@@ -1615,14 +1790,14 @@ mod provider_key_validation_tests {
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "sk-verified".to_string(),
                 "https://mock.openrouter.test/v1".to_string()
             )]
         );
         // Validation success must not persist or switch yet (#3875 residual):
         // the guided flow continues at model pick first.
-        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, ProviderKind::Deepseek);
         assert_eq!(config.provider.as_deref(), None);
         assert_eq!(
             config
@@ -1635,15 +1810,26 @@ mod provider_key_validation_tests {
         assert!(!saved.contains("sk-verified"));
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
         assert!(
-            app.status_message.as_deref().is_some_and(|status| {
-                status.contains("Connection checked (/models returned 2xx)")
-            }),
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| { status.contains("The provider accepted the key") }),
             "status names connection-probe success: {:?}",
             app.status_message
         );
+        // The probe proves only this temporary credential generation, not the
+        // original uncredentialed Config or any model's entitlement.
+        let mut probed_config = config.clone();
+        let probed_identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
+            .expect("captured OpenRouter identity");
+        probed_config
+            .scope_to_provider_identity(&probed_identity)
+            .expect("scope probe");
+        probed_config
+            .set_provider_api_key_override(&probed_identity, Some("sk-verified".to_string()))
+            .expect("temporary probe key");
         let verified_route = crate::provider_readiness::route_identity_for_model(
-            &config,
-            ApiProvider::Openrouter,
+            &probed_config,
+            &probed_identity,
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(
@@ -1670,8 +1856,8 @@ mod provider_key_validation_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            rendered.contains("Connection checked (/models returned 2xx)")
-                && rendered.contains("Pick a default model"),
+            rendered.contains("The provider accepted the key")
+                && rendered.contains("pick the model to use by default"),
             "expected model-pick stage UI, got:\n{rendered}"
         );
     }
@@ -1687,7 +1873,7 @@ mod provider_key_validation_tests {
             providers.openrouter.api_key = Some("sk-saved".to_string());
         }
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_test_connection_with_verifier(
@@ -1703,7 +1889,7 @@ mod provider_key_validation_tests {
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "sk-saved".to_string(),
                 "https://mock.openrouter.test/v1".to_string()
             )]
@@ -1712,17 +1898,15 @@ mod provider_key_validation_tests {
         assert_eq!(config.provider.as_deref(), Some("openrouter"));
         assert!(
             app.status_toasts.iter().any(|toast| {
-                toast
-                    .text
-                    .contains("Connection checked (/models returned 2xx)")
-                    && !toast.text.contains("Pick a default model")
+                toast.text.contains("The provider accepted the key")
+                    && !toast.text.contains("pick the model")
             }),
             "test connection names reachability only: {:?}",
             app.status_toasts
         );
         let verified_route = crate::provider_readiness::route_identity_for_model(
             &config,
-            ApiProvider::Openrouter,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(
@@ -1753,7 +1937,7 @@ mod provider_key_validation_tests {
         let mut engine = mock_engine_handle();
         let mut config = openrouter_config("https://mock.openrouter.test/v1");
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_test_connection_with_verifier(
@@ -1777,7 +1961,7 @@ mod provider_key_validation_tests {
         );
         let verified_route = crate::provider_readiness::route_identity_for_model(
             &config,
-            ApiProvider::Openrouter,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(
@@ -1805,7 +1989,7 @@ mod provider_key_validation_tests {
             "HTTP 401: upstream echoed sk-saved in a long diagnostic body that must not stay visible"
                 .repeat(4),
         ));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_test_connection_with_verifier(
@@ -1838,7 +2022,7 @@ mod provider_key_validation_tests {
         );
         let verified_route = crate::provider_readiness::route_identity_for_model(
             &config,
-            ApiProvider::Openrouter,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert!(matches!(
@@ -1862,7 +2046,7 @@ mod provider_key_validation_tests {
         let mut engine = mock_engine_handle();
         let mut config = Config::default();
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Stepfun, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Stepfun, None)
             .expect("StepFun identity");
 
         apply_provider_picker_api_key_with_verifier(
@@ -1879,7 +2063,7 @@ mod provider_key_validation_tests {
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 "step-plan-key".to_string(),
                 crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL.to_string()
             )],
@@ -1909,7 +2093,7 @@ mod provider_key_validation_tests {
         let mut app = create_test_app();
         let mut engine = mock_engine_handle();
         let mut config = Config::default();
-        let identity = picker_provider_identity(&config, ApiProvider::Stepfun, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Stepfun, None)
             .expect("StepFun identity");
 
         apply_provider_picker_setup_confirmed(
@@ -1979,7 +2163,7 @@ auth_mode = "kimi_oauth"
             }),
             ..Config::default()
         };
-        let identity = picker_provider_identity(&config, ApiProvider::Moonshot, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Moonshot, None)
             .expect("Moonshot identity");
         let verifier = MockProviderKeyVerifier::new(Ok(()));
 
@@ -1997,7 +2181,7 @@ auth_mode = "kimi_oauth"
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "sk-kimi-supported".to_string(),
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string(),
             )],
@@ -2063,7 +2247,7 @@ api_key = "fixture-other-provider-key"
             .anthropic
             .api_key = Some("fixture-other-provider-key".to_string());
         let model = "deepseek/deepseek-v4-pro".to_string();
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_setup_confirmed(
@@ -2078,7 +2262,7 @@ api_key = "fixture-other-provider-key"
         )
         .await;
 
-        assert_eq!(app.api_provider, ApiProvider::Openrouter);
+        assert_eq!(app.api_provider, ProviderKind::Openrouter);
         assert_eq!(config.provider.as_deref(), Some("openrouter"));
         assert_eq!(
             config
@@ -2125,7 +2309,7 @@ api_key = "fixture-other-provider-key"
         let mut engine = mock_engine_handle();
         let mut config = openrouter_config("https://mock.openrouter.test/v1");
         let verifier = MockProviderKeyVerifier::new(Err("HTTP 401: unauthorized".to_string()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_api_key_with_verifier(
@@ -2139,7 +2323,7 @@ api_key = "fixture-other-provider-key"
         )
         .await;
 
-        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, ProviderKind::Deepseek);
         assert_eq!(config.provider.as_deref(), None);
         assert_eq!(
             config
@@ -2154,7 +2338,7 @@ api_key = "fixture-other-provider-key"
         assert!(
             app.status_message
                 .as_deref()
-                .is_some_and(|status| status.contains("API key verification failed")),
+                .is_some_and(|status| status.contains("The provider did not accept this key")),
             "status names validation failure: {:?}",
             app.status_message
         );
@@ -2171,18 +2355,23 @@ api_key = "fixture-other-provider-key"
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Verification failed: HTTP 401: unauthorized"));
+        // #6566: a plain sentence with the next step, not the raw reply.
+        assert!(
+            rendered.contains("The provider did not accept this key"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("HTTP 401"), "{rendered}");
     }
 
     #[tokio::test]
     async fn named_custom_verification_failure_and_dismiss_keep_committed_a_route() {
         let _config_env = ConfigPathEnvGuard::new();
         let mut app = create_test_app();
-        app.set_provider_identity(ApiProvider::Custom, "custom-a");
+        app.set_provider_identity(ProviderKind::Custom, "custom-a");
         app.set_model_selection("model-a".to_string());
         let mut engine = mock_engine_handle();
         let mut config = two_named_custom_routes();
-        let identity = picker_provider_identity(&config, ApiProvider::Custom, Some("custom-b"))
+        let identity = picker_provider_identity(&config, ProviderKind::Custom, Some("custom-b"))
             .expect("custom B identity");
         let verifier = MockProviderKeyVerifier::new(Err("HTTP 401: unauthorized".to_string()));
 
@@ -2202,7 +2391,7 @@ api_key = "fixture-other-provider-key"
         app.view_stack.pop().expect("failed verifier picker");
         sync_config_provider_from_app(&mut config, &app);
         let route = validated_app_runtime_route(&app, &config).expect("committed A route");
-        assert_eq!(route.identity.key, "custom-a");
+        assert_eq!(route.identity.key.as_str(), "custom-a");
         assert_eq!(route.client.base_url(), "http://127.0.0.1:18181/v1");
     }
 
@@ -2226,11 +2415,11 @@ model = "model-b"
         )
         .expect("seed named custom config");
         let mut app = create_test_app();
-        app.set_provider_identity(ApiProvider::Custom, "custom-a");
+        app.set_provider_identity(ProviderKind::Custom, "custom-a");
         app.set_model_selection("model-a".to_string());
         let mut engine = mock_engine_handle();
         let mut config = two_named_custom_routes();
-        let identity = picker_provider_identity(&config, ApiProvider::Custom, Some("custom-b"))
+        let identity = picker_provider_identity(&config, ProviderKind::Custom, Some("custom-b"))
             .expect("custom B identity");
 
         apply_provider_picker_setup_confirmed(
@@ -2255,7 +2444,7 @@ model = "model-b"
     }
 
     #[test]
-    fn legacy_literal_custom_identity_persistence_stays_root_shaped() {
+    fn legacy_literal_custom_identity_persistence_moves_into_the_custom_table() {
         let config_env = ConfigPathEnvGuard::new();
         std::fs::write(
             config_env.config_path(),
@@ -2267,10 +2456,10 @@ default_text_model = "legacy-model"
         .expect("seed legacy root route");
         let config = Config {
             provider: Some("custom".to_string()),
-            base_url: Some("http://127.0.0.1:18180/v1".to_string()),
             default_text_model: Some("legacy-model".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
         let identity = config
             .resolve_provider_identity("custom")
             .expect("legacy identity");
@@ -2280,23 +2469,40 @@ default_text_model = "legacy-model"
         crate::config::save_provider_model_for_identity(&identity, &config, "legacy-model-updated")
             .expect("save legacy model");
 
+        // The literal custom route's top-level fields now live in
+        // `[providers.custom]` (#6394); the saves write there and the write
+        // moves the old top-level endpoint alongside.
         let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
-        assert!(saved.contains("api_key = \"legacy-saved-key\""));
-        assert!(saved.contains("default_text_model = \"legacy-model-updated\""));
-        assert!(!saved.contains("[providers.custom]"));
+        let table: toml::Table = toml::from_str(&saved).expect("saved config parses");
+        assert!(
+            !codewhale_config::legacy_root::has_legacy_root_keys(&table),
+            "{saved}"
+        );
+        let custom = table["providers"]["custom"]
+            .as_table()
+            .expect("custom table");
+        assert_eq!(custom["api_key"].as_str(), Some("legacy-saved-key"));
+        assert_eq!(custom["model"].as_str(), Some("legacy-model-updated"));
+        assert_eq!(
+            custom["base_url"].as_str(),
+            Some("http://127.0.0.1:18180/v1")
+        );
         let reloaded = Config::load(Some(config_env.config_path()), None).expect("reload legacy");
-        assert!(reloaded.uses_legacy_literal_custom_route());
+        assert!(reloaded.selects_literal_custom_provider());
         assert_eq!(
             reloaded
                 .resolve_provider_identity("custom")
                 .expect("repeat legacy identity"),
             identity
         );
-        let route =
-            resolve_runtime_route(&reloaded, ApiProvider::Custom, Some("legacy-model-updated"))
-                .expect("resolve reloaded legacy")
-                .validate()
-                .expect("preflight reloaded legacy");
+        let route = resolve_runtime_route(
+            &reloaded,
+            ProviderKind::Custom,
+            Some("legacy-model-updated"),
+        )
+        .expect("resolve reloaded legacy")
+        .validate()
+        .expect("preflight reloaded legacy");
         assert_eq!(route.client.base_url(), "http://127.0.0.1:18180/v1");
     }
 
@@ -2318,7 +2524,7 @@ model = "model-b"
         )
         .expect("seed coexistence config");
         let config = Config::load(Some(config_env.config_path()), None).expect("load config");
-        assert!(config.uses_legacy_literal_custom_route());
+        assert!(config.selects_literal_custom_provider());
         let identity = config
             .resolve_provider_identity("custom-b")
             .expect("named custom identity");
@@ -2329,7 +2535,13 @@ model = "model-b"
             .expect("save named custom model");
 
         let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
-        assert!(saved.contains("api_key = \"legacy-root-key\""));
+        let table: toml::Table = toml::from_str(&saved).expect("saved config parses");
+        // The literal route's key moved into its own table, untouched by the
+        // named route's save (#6394).
+        assert_eq!(
+            table["providers"]["custom"]["api_key"].as_str(),
+            Some("legacy-root-key")
+        );
         assert!(saved.contains("default_text_model = \"legacy-model\""));
         assert!(saved.contains("[providers.custom-b]"));
         assert!(saved.contains("api_key = \"saved-b-key\""));
@@ -2359,7 +2571,7 @@ fn fleet_role_entry_opens_shared_picker_and_cancel_restores_parked_roster() {
     let workspace = tempfile::tempdir().unwrap();
     let config = Config::default();
     let mut app = App::new(
-        crate::test_support::test_tui_options(workspace.path()),
+        crate::tui::test_support::test_tui_options(workspace.path()),
         &config,
     );
     app.view_stack

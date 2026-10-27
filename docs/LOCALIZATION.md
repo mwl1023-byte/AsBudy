@@ -1,10 +1,12 @@
 # Localization Matrix
 
+> 阅读简体中文版：[zh_hans/LOCALIZATION.md](zh_hans/LOCALIZATION.md)。
+
 Canonical tracking document for every locale Codewhale ships, is actively
 building, is planning, or has explicitly deferred.
 
 > **Scope note (2026-07-12):** this matrix covers three surfaces — the TUI
-> locale packs (`crates/localization/locales/`), the translated READMEs (repo root),
+> locale packs (`crates/localization/locales/`), the translated READMEs (`docs/i18n/`),
 > and the website (`web/`). The three ship on different cadences, so a
 > locale can be **shipped** on one surface and **planned** on another; the
 > per-surface tables below are the per-surface truth. The website registry
@@ -43,23 +45,23 @@ only at exact raw key parity with it, enforced by
 `crates/localization/src/lib.rs`. See `crates/localization/locales/AGENTS.md` for the
 authoring contract.
 
-| Locale | File | Keys vs `en.json` (1299) | Status | Notes |
+| Locale | File | Keys vs `en.json` | Status | Notes |
 |--------|------|--------------------------|--------|-------|
-| English | `en.json` | 1299/1299 | **shipped** | Reference pack. |
-| Japanese | `ja.json` | 1299/1299 | **shipped** | Complete. |
-| Simplified Chinese | `zh-Hans.json` | 1299/1299 | **shipped** | Complete. |
-| Traditional Chinese | `zh-Hant.json` | 1299/1299 | **shipped** | Complete (#5143). Awaiting native-speaker review. |
-| Brazilian Portuguese | `pt-BR.json` | 1299/1299 | **shipped** | Complete. |
-| Latin American Spanish | `es-419.json` | 1299/1299 | **shipped** | Complete. Note the website tracks `es` — the shipped TUI pack is Latin American Spanish, not `es-ES`. |
-| Vietnamese | `vi.json` | 1299/1299 | **shipped** | Complete. |
-| Korean | `ko.json` | 1299/1299 | **shipped** | Complete. |
-| Catalan | `ca.json` | 1299/1299 | **shipped** | Complete (#4749/#4788). Awaiting native-speaker review. |
-| German | `de.json` | 1299/1299 | **shipped** | Complete (#4788). Awaiting native-speaker review. |
-| French | `fr.json` | 1299/1299 | **shipped** | Complete (#4788). Awaiting native-speaker review. |
-| Indonesian | `id.json` | 1299/1299 | **shipped** | Complete (#4789). Awaiting native-speaker review. |
-| Hindi | `hi.json` | 1299/1299 | **shipped** | Complete (#4790). Devanagari shaping spike: `docs/evidence/v092-devanagari-terminal-shaping.md` — code-level guarantees only; terminal visual QA and native review still open. |
-| Russian | `ru.json` | 1299/1299 | **shipped** | Complete (#3092). Cyrillic script fixtures guard against mixed-language copy. Awaiting native-speaker review. |
-| Ukrainian | `uk.json` | 1299/1299 | **shipped** | Complete (#4791). Cyrillic script fixtures keep it distinct from Russian (no ы/э/ъ; і/ї/є/ґ present). Awaiting native-speaker review. |
+| English | `en.json` | all | **shipped** | Reference pack. |
+| Japanese | `ja.json` | all | **shipped** | Complete. |
+| Simplified Chinese | `zh-Hans.json` | all | **shipped** | Complete. |
+| Traditional Chinese | `zh-Hant.json` | all | **shipped** | Complete (#5143). Awaiting native-speaker review. |
+| Brazilian Portuguese | `pt-BR.json` | all | **shipped** | Complete. |
+| Latin American Spanish | `es-419.json` | all | **shipped** | Complete. Note the website tracks `es` — the shipped TUI pack is Latin American Spanish, not `es-ES`. |
+| Vietnamese | `vi.json` | all | **shipped** | Complete. |
+| Korean | `ko.json` | all | **shipped** | Complete. |
+| Catalan | `ca.json` | all | **shipped** | Complete (#4749/#4788). Awaiting native-speaker review. |
+| German | `de.json` | all | **shipped** | Complete (#4788). Awaiting native-speaker review. |
+| French | `fr.json` | all | **shipped** | Complete (#4788). Awaiting native-speaker review. |
+| Indonesian | `id.json` | all | **shipped** | Complete (#4789). Awaiting native-speaker review. |
+| Hindi | `hi.json` | all | **shipped** | Complete (#4790). The Devanagari shaping spike (moved out of this repository in `7242381022`) gave code-level guarantees only; terminal visual QA and native review still open. |
+| Russian | `ru.json` | all | **shipped** | Complete (#3092). Cyrillic script fixtures guard against mixed-language copy. Awaiting native-speaker review. |
+| Ukrainian | `uk.json` | all | **shipped** | Complete (#4791). Cyrillic script fixtures keep it distinct from Russian (no ы/э/ъ; і/ї/є/ґ present). Awaiting native-speaker review. |
 
 ## Website locales
 
@@ -136,24 +138,24 @@ what the `(partial)` badge is honest about.
 | Locale | File | Status | Parity check |
 |--------|------|--------|-------------|
 | English | `README.md` | **shipped** | Canonical source |
-| Simplified Chinese | `README.zh-CN.md` | **shipped** | `scripts/check-readme-translations.py` (stamp + fences + URLs + sections) |
-| Japanese | `README.ja-JP.md` | **shipped** | Same |
-| Vietnamese | `README.vi.md` | **shipped** | Same |
-| Korean | `README.ko-KR.md` | **shipped** | Same |
-| Latin American Spanish | `README.es-419.md` | **shipped** | Same |
-| Brazilian Portuguese | `README.pt-BR.md` | **shipped** | Same |
-| Russian | `README.ru.md` | **shipped** | Same (#3092). Awaiting native-speaker review. |
-| Ukrainian | `README.uk.md` | **shipped** | Same (#4791). Awaiting native-speaker review. |
-| Indonesian | `README.id.md` | **shipped** | Same (#4789). Awaiting native-speaker review. |
-| French | `README.fr.md` | **shipped** | Same. Awaiting native-speaker review. |
-| German | `README.de.md` | **shipped** | Same. Awaiting native-speaker review. |
-| Traditional Chinese | `README.zh-TW.md` | **shipped** | Same. Awaiting native-speaker review. |
-| Hindi | `README.hi.md` | **shipped** | Same. Awaiting native-speaker review. |
-| Turkish | `README.tr.md` | **shipped** | Same. Awaiting native-speaker review. |
-| Italian | `README.it.md` | **shipped** | Same. Awaiting native-speaker review. |
-| Polish | `README.pl.md` | **shipped** | Same. Awaiting native-speaker review. |
-| Arabic | `README.ar.md` | **shipped** | Same. Awaiting native-speaker review. Markdown only; no HTML `dir` attributes. |
-| Catalan | `README.ca.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Simplified Chinese | `docs/i18n/README.zh-CN.md` | **shipped** | `scripts/check-readme-translations.py` (stamp + fences + URLs + sections) |
+| Japanese | `docs/i18n/README.ja-JP.md` | **shipped** | Same |
+| Vietnamese | `docs/i18n/README.vi.md` | **shipped** | Same |
+| Korean | `docs/i18n/README.ko-KR.md` | **shipped** | Same |
+| Latin American Spanish | `docs/i18n/README.es-419.md` | **shipped** | Same |
+| Brazilian Portuguese | `docs/i18n/README.pt-BR.md` | **shipped** | Same |
+| Russian | `docs/i18n/README.ru.md` | **shipped** | Same (#3092). Awaiting native-speaker review. |
+| Ukrainian | `docs/i18n/README.uk.md` | **shipped** | Same (#4791). Awaiting native-speaker review. |
+| Indonesian | `docs/i18n/README.id.md` | **shipped** | Same (#4789). Awaiting native-speaker review. |
+| French | `docs/i18n/README.fr.md` | **shipped** | Same. Awaiting native-speaker review. |
+| German | `docs/i18n/README.de.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Traditional Chinese | `docs/i18n/README.zh-TW.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Hindi | `docs/i18n/README.hi.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Turkish | `docs/i18n/README.tr.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Italian | `docs/i18n/README.it.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Polish | `docs/i18n/README.pl.md` | **shipped** | Same. Awaiting native-speaker review. |
+| Arabic | `docs/i18n/README.ar.md` | **shipped** | Same. Awaiting native-speaker review. Markdown only; no HTML `dir` attributes. |
+| Catalan | `docs/i18n/README.ca.md` | **shipped** | Same. Awaiting native-speaker review. |
 
 ## Drift checks
 
@@ -188,13 +190,26 @@ carry an explicit `planned`/`partial`/`deferred` row in this matrix.
    `parse_locale`/`shipped`/`shipped_complete` arms in
    `crates/localization/src/lib.rs`, and the `include_str!` arm in the
    test module.
-3. Wire the typed settings schema (`UiLocale` in
-   `crates/tui/src/config_ui.rs`) plus the pickers and displays that enumerate
-   locales: onboarding language picker
-   (`crates/tui/src/tui/onboarding/language.rs` — a test forces every shipped
-   locale to be offered), setup-wizard match arms, and the locale display arms
-   in the `/config` and changelog commands. Keep the schema/round-trip invariant
-   tied to `Locale::shipped()` so these surfaces cannot silently drift.
+3. Wire the surfaces that still enumerate locales by hand. The `locale`
+   setting is a plain string row in `crates/config/src/settings_schema.rs`,
+   validated by `normalize_configured_locale` (which reuses `parse_locale`
+   from step 2), and the `/config` value list (`config_choice_values` in
+   `crates/tui/src/tui/views/mod.rs`) and hint text
+   (`configured_locale_values`) derive from `Locale::shipped()`, so those need
+   no edit. Review the setup wizard (`crates/tui/src/tui/setup/mod.rs`) and
+   `locale_display` in `crates/tui/src/commands/groups/config/config.rs` for
+   explicit locale mappings. Also review `public_site_locale_segment` in
+   `crates/tui/src/commands/groups/core/links.rs`: the portable `/links` command
+   matches locale tags, not the host `Locale` enum. Unlisted tags fall back to
+   English website pages, so the compiler will not flag a newly added locale
+   here. Add an explicit tag mapping when that locale is available on the website,
+   and verify `/links` selects the intended documentation/community URLs.
+   Add a `LANGUAGE_OPTIONS`
+   entry to the onboarding language picker
+   (`crates/tui/src/tui/onboarding/language.rs`); its
+   `picker_offers_every_shipped_locale` test fails until you do. Several no-English-leak tests
+   (for example in `status_picker.rs` and `tool_card.rs`) list locales
+   explicitly; add the new tag there when the pack is complete.
 4. Run `python3 scripts/check-tui-locale-parity.py` and
    `cargo test -p codewhale-tui localization`.
 5. If the pack must ship incomplete, declare it partial: keep it out of
@@ -206,7 +221,7 @@ carry an explicit `planned`/`partial`/`deferred` row in this matrix.
 
 ### 2. README
 
-1. Translate `README.md` into `README.<tag>.md`, preserving structure,
+1. Translate `README.md` into `docs/i18n/README.<tag>.md`, preserving structure,
    commands, and the #3087 factual history.
 2. Cross-link it from the language line in `README.md` and from the other
    translated READMEs.

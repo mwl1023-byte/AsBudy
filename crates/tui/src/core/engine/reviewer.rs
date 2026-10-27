@@ -1,6 +1,6 @@
 //! Model-backed Auto-Review guardian tier (v0.9.8).
 //!
-//! The deterministic policy engine (see [`crate::tui::auto_review`]) decides
+//! The deterministic policy engine (see [`crate::core::authority::auto_review`]) decides
 //! first: configured block rules and the built-in safety floor are hard
 //! blocks that never reach a model. Only deterministic *fallback holds* — the
 //! `AskUser` outcomes Auto posture would otherwise turn into bare permission
@@ -12,12 +12,12 @@
 
 use std::time::Duration;
 
-use crate::core::model_client::ModelClient;
-use crate::tools::spec::ToolError;
-use crate::tui::auto_review::{
+use crate::core::authority::auto_review::{
     AutoReviewAction, DEFAULT_GUARDIAN_POLICY, ReviewerRiskLevel, ReviewerVerdict,
     parse_reviewer_verdict,
 };
+use crate::core::model_client::ModelClient;
+use crate::tools::spec::ToolError;
 use codewhale_models::Role;
 use codewhale_models::{
     ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,
@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 /// One-shot reviewer deadline. Slow reviewers are denials, surfaced
 /// separately from explicit denials (a timeout proves nothing about safety).
 const REVIEWER_TIMEOUT: Duration = Duration::from_secs(90);
+const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Keep one exact held call comfortably inside every supported model context.
 /// Truncating tool input could hide the unsafe part, so oversized reviews deny.
 const MAX_REVIEW_CONTEXT_BYTES: usize = 64 * 1024;
@@ -89,7 +90,7 @@ impl ReviewerOutcome {
                 "Auto-Review guardian denied tool '{tool_name}': {reason}. Do not work around this denial; find a materially safer path or stop."
             ))),
             Self::Unavailable { reason } => Err(ToolError::permission_denied(format!(
-                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). Switch to Ask to review this call yourself."
+                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). To run it, the person can switch Permissions to Full Access, or to Ask where a prompt can be answered."
             ))),
             Self::Cancelled => Err(ToolError::cancelled(
                 "Auto-Review guardian request cancelled",
@@ -142,6 +143,9 @@ pub(crate) async fn consult_reviewer(
             None,
         );
     }
+    let deepseek = client.provider_name() == crate::config::ProviderKind::Deepseek.as_str();
+    let reasoning_effort = deepseek.then(|| "low".to_string());
+    let temperature = reasoning_effort.is_none().then_some(0.0);
     let request = MessageRequest {
         model: client.model().to_string(),
         messages: vec![Message {
@@ -151,15 +155,15 @@ pub(crate) async fn consult_reviewer(
                 cache_control: None,
             }],
         }],
-        max_tokens: REVIEWER_MAX_TOKENS,
+        max_tokens: REVIEWER_MAX_OUTPUT_TOKENS,
         system: Some(SystemPrompt::Text(DEFAULT_GUARDIAN_POLICY.to_string())),
         tools: None,
         tool_choice: None,
         metadata: None,
         thinking: None,
-        reasoning_effort: Some(REVIEWER_REASONING_EFFORT.to_string()),
+        reasoning_effort,
         stream: Some(false),
-        temperature: Some(0.0),
+        temperature,
         top_p: None,
     };
     if cancel_token.is_cancelled() {
@@ -254,11 +258,15 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = crate::client::CodewhaleClient::new(&crate::config::Config {
-            api_key: Some("test-guardian-cache-key".to_string()),
-            base_url: Some(server.uri()),
-            ..Default::default()
-        })
+        let client = crate::client::CodewhaleClient::new(
+            &crate::config::Config {
+                ..Default::default()
+            }
+            .with_legacy_root(
+                Some("test-guardian-cache-key".to_string()),
+                Some(server.uri()),
+            ),
+        )
         .unwrap();
         for (decision, risk) in [("allow", "low"), ("deny", "high")] {
             server.reset().await;

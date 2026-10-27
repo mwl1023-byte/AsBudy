@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::client::CodewhaleClient;
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::fleet::exact::{ExactFleetWorkflow, StaticFleetRouter};
 use crate::fleet::members::add_fleet_model;
 use crate::fleet::store::{FleetFile, FleetScope, save_fleet, set_selected};
@@ -30,19 +30,28 @@ impl RouteFixture {
         let fleet = FleetFile::new("Workflow fixture".into(), None).expect("empty saved Fleet");
         save_fleet(&fleet, FleetScope::Workspace, workspace).expect("save fixture Fleet");
         set_selected(&fleet.name, FleetScope::Workspace, workspace).expect("select fixture Fleet");
-        let (parent, parent_calls, _) = tests::fake_chat_client_capturing("parent route").await;
-        let (target, target_calls, target_bodies) =
+        let (parent, parent_calls, _, _) = tests::fake_chat_client_capturing("parent route").await;
+        let (target, target_calls, target_bodies, _) =
             tests::fake_chat_client_capturing("frozen route result").await;
         let mut config = Config {
-            api_key: Some("fixture-key".into()),
-            base_url: Some(parent.base_url().to_string()),
             ..Default::default()
-        };
-        config.set_provider_api_key_override(ApiProvider::Openrouter, Some("fixture-key".into()));
-        config.set_provider_base_url_override(
-            ApiProvider::Openrouter,
-            Some(target.base_url().to_string()),
+        }
+        .with_legacy_root(
+            Some("fixture-key".into()),
+            Some(parent.base_url().to_string()),
         );
+        config
+            .set_provider_api_key_override(
+                &config.test_identity_for_kind(ProviderKind::Openrouter),
+                Some("fixture-key".into()),
+            )
+            .unwrap();
+        config
+            .set_provider_base_url_override(
+                &config.test_identity_for_kind(ProviderKind::Openrouter),
+                Some(target.base_url().to_string()),
+            )
+            .unwrap();
         let client = CodewhaleClient::new(&config).expect("parent fixture client");
         let manager = new_shared_subagent_manager(workspace.to_path_buf(), 4);
         let runtime = SubAgentRuntime::new(
@@ -229,10 +238,20 @@ async fn native_non_shortlisted_model_is_rejected_without_a_provider_call() {
     let source = native_script(json!({
         "prompt": "read-only route check", "type": "reviewer", "model": "openrouter/outside-fixture",
     }));
-    let error = run_script(&source, fixture.driver(WorkflowFleetBinding::None))
+    let driver = fixture.driver(WorkflowFleetBinding::None);
+    let result = run_script(&source, driver.clone())
         .await
-        .expect_err("closed shortlist");
-    assert!(error.contains("outside the selected Fleet"), "{error}");
+        .expect("rejected children settle without aborting independent work");
+    assert_eq!(result, json!({"plan-child-1": null}));
+    let runs = driver.state.runs.lock().expect("run ledger");
+    let record = runs.get(&driver.run_id).expect("run receipt");
+    assert_eq!(record.dispatch_failure_count, 1);
+    assert!(
+        record.dispatch_failures[0]
+            .message
+            .contains("outside the selected Fleet")
+    );
+    assert_eq!(driver.dead_fanout_count(), 1);
     assert_eq!(fixture.parent_calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.target_calls.load(Ordering::SeqCst), 0);
 }
@@ -354,10 +373,12 @@ async fn exact_fleet_changed_provider_endpoint_is_rejected_before_dispatch() {
     )
     .expect("capture exact route");
     let mut changed = fixture.config.clone();
-    changed.set_provider_base_url_override(
-        ApiProvider::Openrouter,
-        Some(fixture.runtime.client.base_url().to_string()),
-    );
+    changed
+        .set_provider_base_url_override(
+            &changed.test_identity_for_kind(ProviderKind::Openrouter),
+            Some(fixture.runtime.client.base_url().to_string()),
+        )
+        .unwrap();
     fixture.runtime.api_config = Some(Arc::new(changed));
     let error = run_script(
         "return await task({description:'read-only check', profile:'auditor', writeAuthority:'read_only'});",
@@ -412,11 +433,8 @@ async fn native_exact_fleet_builder_keeps_the_plan_read_only_ceiling() {
         !profile.permissions.write,
         "the authored read_only mode must remain executable policy"
     );
-    assert_eq!(profile.shell, crate::worker_profile::ShellPolicy::None);
-    assert_eq!(
-        profile.tools,
-        crate::worker_profile::ToolScope::Explicit(vec!["File".into()])
-    );
+    assert_eq!(profile.shell, crate::worker_profile::ShellPolicy::ReadOnly);
+    assert_eq!(profile.tools, crate::worker_profile::ToolScope::Inherit);
     assert_eq!(
         records[0].spec.child_route.as_ref().unwrap().provider_id,
         "openrouter"

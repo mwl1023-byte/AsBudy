@@ -123,6 +123,7 @@ fn clear_queue(app: &mut App) -> CommandResult {
     let queued = app.queued_message_count();
     let had_draft = app.queued_draft.take().is_some();
     app.queued_messages.clear();
+    app.held_restored_queue = 0;
     if queued == 0 && !had_draft {
         return CommandResult::message(tr(locale, MessageId::CmdQueueAlreadyEmpty));
     }
@@ -168,7 +169,7 @@ mod tests {
             memory_path: tmpdir.path().join("memory.md"),
             notes_path: tmpdir.path().join("notes.txt"),
             mcp_config_path: tmpdir.path().join("mcp.json"),
-            ..crate::test_support::test_tui_options(tmpdir.path())
+            ..crate::tui::test_support::test_tui_options(tmpdir.path())
         };
         App::new(options, &Config::default())
     }

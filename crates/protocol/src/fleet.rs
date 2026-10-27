@@ -6,8 +6,8 @@
 //! fields and are unaffected by fleet extensions.
 //!
 //! See:
-//! - <https://github.com/Hmbown/CodeWhale/issues/3154> (Agent Fleet control plane)
-//! - <https://github.com/Hmbown/CodeWhale/issues/3096> (Runtime API sub-agent direction)
+//! - <https://github.com/codewhale-hq/CodeWhale/issues/3154> (Agent Fleet control plane)
+//! - <https://github.com/codewhale-hq/CodeWhale/issues/3096> (Runtime API sub-agent direction)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -263,6 +263,8 @@ pub struct FleetTaskWorkerProfile {
 /// Workspace and environment constraints needed before a task starts.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FleetWorkspaceRequirements {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::placement::PlacementRequirements>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<PathBuf>,
     #[serde(default)]
@@ -400,6 +402,8 @@ pub enum FleetScorerSpec {
 /// Worker specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetWorkerSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::placement::ExecutionEnvironment>,
     pub id: String,
     pub name: String,
     pub host: FleetHostSpec,
@@ -421,6 +425,12 @@ pub struct FleetWorkerSpec {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FleetHostSpec {
     Local,
+    Tailscale {
+        node_id: String,
+        user: String,
+        working_directory: PathBuf,
+        codewhale_binary: String,
+    },
     Ssh {
         host: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -432,9 +442,8 @@ pub enum FleetHostSpec {
         /// Known hosts file for host-key verification.
         #[serde(skip_serializing_if = "Option::is_none")]
         known_hosts: Option<PathBuf>,
-        /// Expected host key fingerprint (SHA256:...) for key pinning.
-        /// When set, the connection is only trusted if the server's
-        /// host key matches this fingerprint exactly.
+        /// Legacy field retained for decoding; the SSH host adapter rejects it
+        /// when set. Configure `known_hosts` for host-key verification instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         host_key_fingerprint: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -666,7 +675,9 @@ pub enum FleetWorkerAuth {
         /// Known hosts file for host-key verification.
         #[serde(skip_serializing_if = "Option::is_none")]
         known_hosts: Option<PathBuf>,
-        /// Expected host key fingerprint for pinning.
+        /// Legacy metadata; does not enforce key pinning. The SSH host adapter
+        /// rejects `FleetHostSpec::Ssh::host_key_fingerprint` when set; configure
+        /// `known_hosts` on the host spec for host-key verification instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         host_key_fingerprint: Option<String>,
         /// SSH user for the connection.
@@ -1200,6 +1211,7 @@ mod tests {
                     capabilities: vec!["rust".to_string()],
                 }),
                 workspace: Some(FleetWorkspaceRequirements {
+                    placement: None,
                     root: Some(PathBuf::from(".")),
                     required_files: vec![PathBuf::from("Cargo.toml")],
                     writable_paths: vec![],

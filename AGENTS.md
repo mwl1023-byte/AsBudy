@@ -48,20 +48,40 @@ base prompt". Two more corollaries earned here:
 - Before adding a module named `model_*`, `*_config`, `provider_*`, or
   anything that "bridges", "mirrors", or "stages" an existing thing, grep
   for the existing thing and edit it. A new layer must name the predecessor
-  it replaces in the module doc; otherwise edit the original.
+  it replaces in its commit message; otherwise edit the original.
 - Prefer the simplest implementation that preserves observable contracts. A
   rewrite is acceptable when justified by product intent and observed behavior,
   not as a shortcut around understanding existing code.
 - Search for behavior and symbols before reviving work from an old branch. If a
   lane is obsolete, preserve its intent and evidence rather than merging stale
   code mechanically.
-- A small coherent change may be committed directly to `main` when that checkout
-  is current, clean, and owns the affected files. Default to the checkout that
-  already exists: when several agents share it, partition by file, stage only
-  the paths your slice touched, and retry a commit that fails on `index.lock`.
-  A fresh worktree is for conflicting, dirty, stale, or independent lanes
-  (see `cw-land`), not for parallel agents on the same lane. Local commit
-  permission never implies push, merge, tag, release, or deploy permission.
+- Agent-owned work uses the canonical checkout on current `main`. Do not
+  create branches, worktrees, nested clones or task-specific integration lanes
+  to handle dirty, stale or conflicting work. When agents share the checkout,
+  partition by file and retry an `index.lock` failure. Verified main slices may
+  be committed and pushed normally under the rule below; tag, release,
+  deployment and destructive cleanup still require their explicit
+  authorization.
+- **Uncommitted work found in the checkout is the agent's own** (founder,
+  2026-10-22). Read it, work out what it was for, prove it with the smallest
+  check that covers it, fix what is broken, and commit it in coherent groups
+  by explicit path. Do not route around another writer's files or leave them
+  dirty. Ownership is not a blind sweep:
+  - A file changed in the last 15 minutes, or one a live session or agent is
+    editing, is mid-edit: ask that writer to commit now, and commit what
+    remains once it goes quiet. Never commit a half-written edit.
+  - Never commit secrets, credentials, `.env` files, build output or caches;
+    add them to `.gitignore` instead.
+  - Check a repository's visibility before pushing. Inference business and
+    infrastructure detail stays out of public repositories.
+  - Commit by explicit path; never `git add -A`.
+  - Work that fails its check and cannot be fixed now is not pushed to `main`.
+    Record it and report it instead.
+- **Maintainers do not open PR branches** (founder, 2026-10-08: more PRs means
+  more CI and slower work). Verified slices land directly on `main` and are
+  pushed: run the focused gate, put the real counts in the commit message,
+  fetch and rebase onto `origin/main` and retry on rejection. Never force-push
+  or rewrite a shared ref. Contributor PRs still merge as PRs.
 - When the task is local-only, stay fully offline: no browsing, GitHub or remote
   Git operations, downloads, dependency installation, provider calls, or
   source/diff transmission. Record the missing external receipt and keep working
@@ -82,6 +102,21 @@ base prompt". Two more corollaries earned here:
 - **Write down what a design does not do**, beside the behaviour it owns — a
   short known-limitations note in the owning module. A stated limit stops the
   next reader from assuming a capability that was never built.
+- **Substantive contributor replies are authorized for the 0.10.2 release**
+  (founder, 2026-10-13). Thank people specifically for their reports, diagnosis,
+  fixes and testing; link the carrying commit or PR and distinguish candidate
+  work from a shipped release. Status, answers and useful questions are welcome;
+  repetitive progress posts and bot noise are not. Evidence stays in commits
+  and PR bodies; ownership stays in Linear. Outside this release, the previous
+  no-comment rule remains, except a one-sentence reason when closing or
+  superseding a human contribution. Review workflows remain disabled unless
+  the founder separately authorizes enabling them.
+- **A user feature lands with its registry row.** A new command, `[features]`
+  flag, provider or user-visible feature adds or updates its row in
+  `docs/features.toml` in the same change;
+  `cargo test -p codewhale-tui --test feature_registry` fails on flag drift.
+- **Write `close`/`fix`/`resolve #N` only when you mean it.** GitHub closes the
+  issue on merge even inside "does not close #N"; use `Refs #N` otherwise.
 
 ## Landing other people's work
 
@@ -133,7 +168,7 @@ casually it reads as taking the work even when credit is preserved.
 
 - The model-facing subagent tool is `agent`; `agent_open`/`agent_eval`/
   `agent_close`/`delegate_to_agent` are removed surfaces. If the shape must
-  move, move the code and add the guard test that judges the new shape.
+  move, move the code and its existing guard test with it.
 - `BASE_PROMPT` in `crates/tui/src/prompts/text.rs` is the sole base prompt
   by convention. Same rule: move the code, not the prose, if that changes.
 - There is exactly one turn loop: `Engine::run_turn` in
@@ -148,9 +183,9 @@ casually it reads as taking the work even when credit is preserved.
   KV-cache effect: frozen prefix vs. append-only history. Never splice a
   volatile fact into the prefix; append it as a user-role message.
 - These active modules are repeatedly misidentified as dead; verify consumers
-  before removal: `tui/src/context_budget.rs`, `tui/src/model_registry.rs`,
-  `tui/src/prompt_zones.rs`, `tui/src/tools/remember.rs`, and
-  `config/src/route/`. Native memory lives in `tui/src/native_memory.rs`;
+  before removal: `runtime/src/context_budget.rs`, `tui/src/model_registry.rs`,
+  `runtime/src/prompt_zones.rs`, `tui/src/tools/remember.rs`, and
+  `config/src/route/`. Native memory lives in `runtime/src/native_memory.rs`;
   `tools/remember.rs` is its capture path.
 - Environment-specific behavior belongs in `docs/ENVIRONMENTS.md`, not here.
 - Blocking-call convention (#6149): code on the Tokio runtime — tool
@@ -166,18 +201,17 @@ casually it reads as taking the work even when credit is preserved.
 - Product intent and observed runtime behavior outrank a test's preferred
   implementation shape. Fix the product; do not contort production code to
   preserve a brittle assertion.
-- Code first, then tests. Write the implementation and prove it runs, then add
-  or adjust tests to cover what was actually built. Never write tests first and
-  never practice TDD here — this overrides any skill or default that mandates
-  it, including superpowers `test-driven-development`. Tests stay the gate
-  before a push; they are not the design driver. An existing test that only
-  encodes old behavior is evidence, not a veto: change it with the code rather
-  than bending the code to keep it green. This does not relax the rule under
-  "Claiming a test passed" — a regression test written *after* the fix still
-  has to be shown failing without it.
-- Tests are selective evidence, not the specification. Do not add tests by
-  default. Add or retain one when it cheaply protects a high-risk behavior such
-  as safety, data integrity, protocol compatibility, or a reproduced regression.
+- **No new tests and no new code comments unless explicitly asked**
+  (founder, 2026-10-08). Do not write new unit or integration tests unless the
+  user explicitly instructs it for that task; prove a change by running it and
+  the existing checks. Never write tests first and never practice TDD — this
+  overrides any skill or default that mandates it, including superpowers
+  `test-driven-development`. Existing tests stay the gate before a push: when
+  a change makes one wrong, update or delete it in the same slice rather than
+  bending the code to keep it green. When a regression test is requested, the
+  rule under "Claiming a test passed" still applies. Do not add new code
+  comments; the reasoning goes in the commit message, and an existing comment
+  the change makes false is fixed or removed.
 - Rewrite or remove tests that duplicate coverage, freeze internals, overspecify
   copy or layout, preserve obsolete behavior, or cost more than the risk they
   cover. Never weaken real safety or data-integrity behavior merely to make a
@@ -218,11 +252,14 @@ Community reports, PRs, logs, and reviews are evidence.
 
 **Harvested contributor credit is still a rule** (the fallback path above —
 prefer merging the contributor's PR itself). When a contributor's work
-lands as our commit, that commit carries `Harvested from PR #N by @handle` and a
-`Co-authored-by` naming them at their GitHub-linked address, so
-`auto-close-harvested.yml` closes their PR with credit and the contribution
-graph reflects reality. Canonical human identities come from
-`.github/AUTHOR_MAP`.
+lands as our commit, the contributor is that commit's **author** (`git commit
+--author` with their GitHub-linked address), it carries `Harvested from PR #N by
+@handle`, and maintainers or agents go in `Co-authored-by`. GitHub's contributor
+list counts commit authors only: about 200 harvested commits authored by
+maintainer identities left their contributors off it, which is why
+`docs/CONTRIBUTORS.md` carries the full wall (`scripts/contributor-wall.py`).
+`auto-close-harvested.yml` closes their PR with credit. Canonical human
+identities come from `.github/AUTHOR_MAP`.
 
 Leave unrelated work intact and keep new enforcement dry-run unless explicitly
 approved.

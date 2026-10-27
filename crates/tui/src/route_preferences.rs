@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::config::{ApiProvider, Config, ProviderIdentity};
+use crate::config::{BaseUrlEnvReceipt, Config, ProviderIdentity, ProviderKind};
 use crate::config_persistence as persistence;
 
 /// Whether a config key names a provider or model selection.
@@ -24,61 +24,45 @@ fn provider_model_id(key: &str) -> Option<&str> {
 }
 
 fn parse_config(body: &str) -> Result<Config> {
-    toml::from_str(body)
+    crate::config::parse_config_base(body)
         .map_err(|_| anyhow::anyhow!("Could not parse route configuration; contents omitted"))
 }
 
 fn model_identity(config: &Config, key: &str) -> Result<ProviderIdentity> {
-    if key == "default_model" {
-        let provider = if config.api_provider() == ApiProvider::DeepseekCN {
-            ApiProvider::DeepseekCN
-        } else {
-            ApiProvider::Deepseek
-        };
-        config.resolve_provider_pin_identity(provider.as_str())
-    } else if let Some(id) = provider_model_id(key) {
-        // Leaf keys name TOML tables, whose canonical spelling can differ
-        // from the public provider selector. Exact custom tables still win.
+    let identity = if key == "default_model" {
+        let china = codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id;
         let selector = if config
+            .active_provider_identity()
+            .is_ok_and(|identity| identity.key.as_str() == china)
+        {
+            china
+        } else {
+            ProviderKind::Deepseek.as_str()
+        };
+        config.resolve_provider_pin_identity(selector)
+    } else if let Some(id) = provider_model_id(key) {
+        let custom = config
             .providers
             .as_ref()
             .and_then(|providers| providers.custom_provider_config(id))
-            .is_some()
-        {
+            .is_some();
+        let selector = if custom {
             id
-        } else if id == "deepseek_cn" {
-            ApiProvider::DeepseekCN.as_str()
         } else {
-            ApiProvider::all()
+            codewhale_config::descriptors::provider_compatibility()
                 .iter()
-                .find(|provider| {
-                    provider
-                        .metadata()
-                        .is_some_and(|metadata| metadata.provider_config_key() == id)
-                })
-                .map_or(id, |provider| provider.as_str())
+                .find(|row| row.config_key == id)
+                .map_or(id, |row| row.id)
         };
-        config.resolve_provider_pin_identity(selector)
+        config.resolve_provider_selection_identity(selector)
     } else {
-        config.active_provider_identity(config.api_provider())
-    }
-    .map_err(anyhow::Error::msg)
+        config.active_provider_identity()
+    };
+    identity.map_err(anyhow::Error::msg)
 }
 
 fn model_slot(identity: &ProviderIdentity) -> Result<Vec<&str>> {
-    if identity.provider == ApiProvider::Custom && identity.persisted_id().is_none() {
-        return Ok(vec!["default_text_model"]);
-    }
-    let key = match identity.provider {
-        ApiProvider::Custom => identity.key.as_str(),
-        ApiProvider::DeepseekCN => "deepseek_cn",
-        ApiProvider::OllamaCloud if identity.migrated_legacy_ollama_cloud_route => "ollama",
-        provider => provider
-            .metadata()
-            .context("provider model table")?
-            .provider_config_key(),
-    };
-    Ok(vec!["providers", key, "model"])
+    Ok(vec!["providers", identity.config_table_key()?, "model"])
 }
 
 /// Locate the canonical model leaf in a saved document without applying
@@ -197,8 +181,10 @@ pub fn scrub_root_model_aliases_for_export(document: &mut toml::value::Table) ->
             // what the route would then resolve. A foreign DeepSeek root
             // ignored by the active vendor remains DeepSeek's fallback.
             let mut scoped = config.clone();
-            scoped.scope_to_provider_identity(&identity);
-            scoped.set_provider_model_override(identity.provider, None);
+            scoped
+                .scope_to_provider_identity(&identity)
+                .map_err(anyhow::Error::msg)?;
+            scoped.set_provider_model_override(&identity, None)?;
             scoped.legacy_model = None;
             scoped.default_text_model = Some(value.to_string());
             let wire_model = crate::config::wire_model_for_provider_route(
@@ -295,9 +281,11 @@ pub fn get(path: &Path, key: &str) -> Result<Option<String>> {
         ));
     }
     let identity = model_identity(&config, key)?;
-    config.scope_to_provider_identity(&identity);
+    config
+        .scope_to_provider_identity(&identity)
+        .map_err(anyhow::Error::msg)?;
     Ok(config
-        .provider_config_for(identity.provider)
+        .provider_config_for(&identity)
         .and_then(|entry| entry.model.clone())
         .or_else(|| {
             (provider_model_id(key).is_none()
@@ -312,11 +300,11 @@ pub fn selected_route(path: &Path) -> Result<(String, String, codewhale_config::
     let store = codewhale_config::ConfigStore::load(Some(path.to_path_buf()))?;
     let config = saved_config(&store)?;
     let identity = config
-        .active_provider_identity(config.api_provider())
+        .active_provider_identity()
         .map_err(anyhow::Error::msg)?;
-    let provider = identity.key;
+    let provider = identity.key.to_string();
     let source = if config
-        .provider_config_for(identity.provider)
+        .provider_config_for(&identity)
         .and_then(|entry| entry.model.as_ref())
         .is_some()
     {
@@ -331,6 +319,110 @@ pub fn selected_route(path: &Path) -> Result<(String, String, codewhale_config::
         codewhale_config::ModelSource::ProviderDefault
     };
     Ok((provider, config.default_model(), source))
+}
+
+pub fn list_models(
+    store: &codewhale_config::ConfigStore,
+    filter: Option<ProviderKind>,
+) -> Result<Vec<(ProviderKind, Vec<String>)>> {
+    crate::models_dev_live::maybe_load_persisted_cache();
+    let mut config = saved_config(store)?;
+    config.base_url_env_receipt = config
+        .active_provider_identity()
+        .map_or(BaseUrlEnvReceipt::NoOwner, |identity| {
+            BaseUrlEnvReceipt::Route(identity.provider, identity.key.to_string())
+        });
+    let providers = filter
+        .as_ref()
+        .map_or(ProviderKind::all(), std::slice::from_ref);
+    let mut catalogs = Vec::with_capacity(providers.len());
+    for provider in providers {
+        if *provider == ProviderKind::Custom
+            && config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider.as_str()))
+                .is_none()
+        {
+            continue;
+        }
+        let identity = config
+            .legacy_selection_identity(provider.as_str())
+            .map_err(anyhow::Error::msg)?;
+        let mut route_config = config.clone();
+        route_config
+            .scope_to_provider_identity(&identity)
+            .map_err(anyhow::Error::msg)?;
+        let mut models = crate::provider_lake::configured_catalog_models_for_route(
+            &route_config,
+            identity.provider,
+            identity.key.as_str(),
+            &route_config.active_route_base_url(),
+        );
+        if identity.provider != ProviderKind::OpenaiCodex {
+            let default_model = route_config.default_model();
+            if !default_model.is_empty() && !default_model.eq_ignore_ascii_case("auto") {
+                models.push(default_model);
+            }
+            models.sort();
+            models.dedup();
+        }
+        catalogs.push((*provider, models));
+    }
+    Ok(catalogs)
+}
+
+pub fn resolve_model(
+    path: &Path,
+    provider_identity: &str,
+    base_url: &str,
+    model: Option<&str>,
+) -> Result<codewhale_config::route::ReadyRouteCandidate> {
+    crate::models_dev_live::maybe_load_persisted_cache();
+    let store = codewhale_config::ConfigStore::load(Some(path.to_path_buf()))?;
+    let mut config = saved_config(&store)?;
+    let identity = config
+        .resolve_provider_selection_identity(provider_identity)
+        .map_err(anyhow::Error::msg)?;
+    config.set_provider_base_url_override(&identity, Some(base_url.into()))?;
+    crate::provider_catalog_live::maybe_load_persisted_cache_for_config(&config);
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(&config, &identity, model)
+        .map_err(anyhow::Error::msg);
+    if !route.as_ref().is_ok_and(|route| {
+        (route.identity.provider == ProviderKind::OpenaiCodex
+            && crate::codex_model_cache::model_roster_for(&route.config)
+                .metadata_for(route.candidate.wire_model_id().as_str())
+                .is_some())
+            || crate::provider_lake::configured_catalog_offering_for_route(
+                &route.config,
+                route.identity.provider,
+                route.identity.key.as_str(),
+                &route.candidate.endpoint().base_url,
+                route.candidate.wire_model_id().as_str(),
+            )
+            .is_some()
+    }) {
+        if crate::provider_catalog_live::cached_entry_for_route(
+            identity.provider,
+            identity.key.as_str(),
+            base_url,
+        )?
+        .is_some_and(|entry| entry.fetched_at > 0)
+        {
+            return Err(
+                codewhale_agent::ModelResolutionError::ModelNotAvailableForProvider {
+                    provider: identity.provider,
+                    requested: model.unwrap_or("auto").to_string(),
+                }
+                .into(),
+            );
+        }
+        codewhale_agent::ModelRegistry::default().resolve(
+            model.filter(|model| *model != "auto"),
+            Some(identity.provider),
+        )?;
+    }
+    Ok(route?.candidate)
 }
 
 /// Save one explicit route preference after atomically adopting legacy choices.
@@ -369,12 +461,12 @@ pub fn set_document(
     let config = parse_config(&doc.to_string())?;
     if key == "provider" {
         let identity = config
-            .resolve_provider_pin_identity(value)
+            .resolve_provider_selection_identity(value)
             .map_err(anyhow::Error::msg)?;
         persistence::set_document_value(
             doc,
             &["provider"],
-            identity.persisted_id().unwrap_or(&identity.key),
+            identity.persisted_id().unwrap_or(identity.key.as_str()),
         )?;
         // Same root-alias authority as the Runtime/TUI provider writer: a CLI
         // switch must not leave the incoming route holding the outgoing one's
@@ -382,12 +474,7 @@ pub fn set_document(
         return persistence::reconcile_root_model_aliases(doc, &config, &identity);
     }
     let identity = model_identity(&config, key)?;
-    persistence::set_provider_model_document(
-        doc,
-        identity.provider,
-        identity.persisted_id().unwrap_or(&identity.key),
-        value,
-    )
+    persistence::set_provider_model_document(doc, &identity, value)
 }
 
 /// Clear a canonical selection without allowing archived Settings to restore it.
@@ -404,16 +491,16 @@ pub fn unset(path: &Path, key: &str) -> Result<()> {
         // Clear relevant legacy fallbacks as well, or deleting the canonical
         // leaf would restore an older choice on reload. Root fields belong to
         // the active route, with DeepSeek's historical default as an exception.
-        if matches!(
-            identity.provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN
-        ) || config
-            .active_provider_identity(config.api_provider())
-            .is_ok_and(|active| active == identity)
+        if matches!(identity.provider, ProviderKind::Deepseek)
+            || config
+                .active_provider_identity()
+                .is_ok_and(|active| active == identity)
         {
             let mut scoped = config.clone();
-            scoped.scope_to_provider_identity(&identity);
-            scoped.set_provider_model_override(identity.provider, None);
+            scoped
+                .scope_to_provider_identity(&identity)
+                .map_err(anyhow::Error::msg)?;
+            scoped.set_provider_model_override(&identity, None)?;
             scoped.legacy_model = None;
             for root_key in ["default_text_model", "model"] {
                 let Some(model) = doc.get(root_key).and_then(toml_edit::Item::as_str) else {
@@ -501,7 +588,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(settings_path)?, settings);
         // An unrelated typed store write must preserve the migration receipt.
         let mut store = codewhale_config::ConfigStore::load(Some(path.clone()))?;
-        store.config.set_value("verbosity", "quiet")?;
+        store.config.set_value("verbosity", "concise")?;
         store.save()?;
         assert_eq!(
             document(&path)["route_preferences_version"].as_integer(),
@@ -576,21 +663,23 @@ model = "Other-X"
         .collect();
         let path = home.path().join("config.toml");
 
-        // The incoming route owns its own leaf, so the outgoing root fallback
-        // is inert saved state. A CLI switch must not delete it, and switching
-        // back must still find it.
+        // The outgoing route was resolving the root fallback as its own
+        // model, so a CLI switch moves it onto that route's leaf (never
+        // deletes it), and switching back must still find it.
         std::fs::write(
             &path,
             "route_preferences_version = 1\nprovider = \"zai\"\ndefault_text_model = \"GLM-4.6\"\n[providers.deepseek]\nmodel = \"deepseek-v4-pro\"\n",
         )?;
         set(&path, "provider", "deepseek")?;
-        assert_eq!(
-            document(&path)["default_text_model"].as_str(),
-            Some("GLM-4.6")
-        );
+        let doc = document(&path);
+        assert!(doc.get("default_text_model").is_none());
+        assert_eq!(doc["providers"]["zai"]["model"].as_str(), Some("GLM-4.6"));
         let switched = Config::load(Some(path.clone()), None)
             .expect("a CLI provider switch must remain loadable");
-        assert_eq!(switched.api_provider(), ApiProvider::Deepseek);
+        assert_eq!(
+            switched.active_provider_identity().unwrap().provider,
+            ProviderKind::Deepseek
+        );
         assert_eq!(switched.default_model(), "deepseek-v4-pro");
         set(&path, "provider", "zai")?;
         assert_eq!(

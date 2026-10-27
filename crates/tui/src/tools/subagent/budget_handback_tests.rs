@@ -1,11 +1,11 @@
-use super::tests::{make_worker_spec, stub_runtime};
+use super::tests::{chat_fixture_response, make_worker_spec, stub_runtime};
 use super::*;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use tempfile::{TempDir, tempdir};
 use tokio::sync::Notify;
 
 struct Fixture {
-    workspace: TempDir,
+    _workspace: TempDir,
     manager: SharedSubAgentManager,
     task: Option<JoinHandle<()>>,
     server: JoinHandle<()>,
@@ -19,7 +19,7 @@ struct Fixture {
 
 impl Fixture {
     async fn finish(&mut self) -> SubAgentResult {
-        tokio::time::timeout(Duration::from_secs(5), self.task.take().unwrap())
+        tokio::time::timeout(Duration::from_secs(30), self.task.take().unwrap())
             .await
             .expect("bounded worker")
             .expect("worker task");
@@ -41,6 +41,14 @@ impl Drop for Fixture {
 }
 
 async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixture {
+    // Only these cases exercise wall/API timeouts. The other cases exercise
+    // budget and report semantics, so leave room for full-suite scheduling.
+    let timeout_case = matches!(mode, "hold" | "timeout" | "work-timeout");
+    let wall_time_secs = if matches!(mode, "hold" | "timeout") {
+        5
+    } else {
+        30
+    };
     let workspace = tempdir().unwrap();
     fs::write(
         workspace.path().join("README.md"),
@@ -61,13 +69,13 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
             async move {
                 let call = {
                     let mut requests = requests.lock().unwrap();
-                    requests.push(body);
+                    requests.push(body.clone());
                     requests.len()
                 };
-                let choice = if call == 1 {
+                let choice = if call == 1 || mode == "tool-only" {
                     json!({"index": 0, "message": {"role": "assistant",
                         "content": if mode == "tool-only" { Value::Null } else { json!("RECORDED_FINDING: checksum validation is missing.") },
-                        "tool_calls": [{"id": "read-one", "type": "function", "function": {
+                        "tool_calls": [{"id": format!("read-{call}"), "type": "function", "function": {
                             "name": "read", "arguments": "{\"path\":\"README.md\"}"
                         }}]}, "finish_reason": "tool_calls"})
                 } else {
@@ -81,6 +89,8 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
                             "tool_calls": [{"id": "must-not-write", "type": "function", "function": {
                                 "name": "write_file", "arguments": "{\"path\":\"report.md\",\"content\":\"must not execute\"}"
                             }}]}, "finish_reason": "tool_calls"})
+                    } else if mode == "truncated" {
+                        json!({"index": 0, "message": {"role": "assistant", "content": "TRUNCATED_REPORT: README evid"}, "finish_reason": "length"})
                     } else {
                         json!({"index": 0, "message": {"role": "assistant", "content":
                             "PARTIAL_REPORT: README evidence identifies missing checksum validation. No report file was produced. Next: implement and verify the checksum check."}, "finish_reason": "stop"})
@@ -90,7 +100,7 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
                     else if call == 1 { json!({"prompt_tokens": first_tokens.saturating_sub(5), "completion_tokens": 5, "total_tokens": first_tokens}) }
                     else if mode == "resume-unknown" { json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}) }
                     else { json!({"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}) };
-                Json(json!({"id": format!("handback-{call}"), "model": "deepseek-v4-flash", "choices": [choice], "usage": usage})).into_response()
+                chat_fixture_response(body.get("stream").and_then(Value::as_bool).unwrap_or(false), json!({"id": format!("handback-{call}"), "model": "deepseek-v4-flash", "choices": [choice], "usage": usage})).into_response()
             }
         }
     }));
@@ -100,17 +110,22 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         axum::serve(listener, app).await.unwrap();
     });
     let config = crate::config::Config {
-        api_key: Some("fixture-key".to_string()),
-        base_url: Some(format!("http://{address}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("fixture-key".to_string()),
+        Some(format!("http://{address}/v1")),
+    );
     let manager = Arc::new(RwLock::new(
         SubAgentManager::new(workspace.path().to_path_buf(), 4)
             .with_state_path(workspace.path().join(".codewhale/subagents/state.json")),
@@ -118,12 +133,10 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     let mut spec = make_worker_spec("report-worker", workspace.path().to_path_buf());
     spec.max_steps = max_steps;
     spec.runtime_profile.max_steps = max_steps;
-    spec.runtime_profile.wall_time_secs = Some(5);
-    spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 5_000);
+    spec.runtime_profile.wall_time_secs = Some(wall_time_secs);
+    spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + wall_time_secs * 1_000);
     if mode == "work-timeout" {
-        // A partly consumed original deadline leaves time to persist the
-        // missing-coverage receipt after the in-flight call is abandoned.
-        spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 2_000);
+        spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 9_000);
     }
     spec.launch_manifest = Some(serde_json::from_value(json!({
         "owner_session": "root", "child_id": "report-worker", "profile": spec.runtime_profile,
@@ -146,8 +159,12 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     runtime.accept_edits = false;
     runtime.step_api_timeout = if mode == "timeout" {
         Duration::from_millis(100)
-    } else {
+    } else if mode == "work-timeout" {
+        Duration::from_secs(10)
+    } else if timeout_case {
         Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
     };
     let cancel = runtime.cancel_token.clone();
     let (parent_tx, completions) = mpsc::channel(16);
@@ -188,13 +205,14 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         fork_context: false,
         started_at: Instant::now(),
         max_steps,
-        wall_time: Duration::from_secs(5),
+        wall_time: Some(Duration::from_secs(wall_time_secs)),
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
     }));
     Fixture {
-        workspace,
+        _workspace: workspace,
         manager,
         task: Some(task),
         server,
@@ -209,15 +227,15 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn budget_handback_turn_consolidates_tool_only_work_and_checks_declared_deliverables() {
+async fn owner_step_limit_preserves_tool_only_work_without_an_extra_request() {
     let _retry = crate::retry_status::test_guard();
     crate::retry_status::clear_rate_limit();
-    let mut fixture = fixture("tool-only", 15, 1).await;
+    let mut fixture = fixture("tool-only", 15, 2).await;
     let result = fixture.finish().await;
     assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
     assert_eq!(result.steps_taken, 2);
     assert_eq!(result.usage.as_ref().unwrap().total_tokens, Some(45));
-    assert!(result.result.as_deref().unwrap().contains("PARTIAL_REPORT"));
+    assert!(result.result.as_deref().unwrap().contains("README.md"));
     assert!(
         result
             .checkpoint
@@ -228,7 +246,7 @@ async fn budget_handback_turn_consolidates_tool_only_work_and_checks_declared_de
             .flat_map(|message| &message.content)
             .any(
                 |block| matches!(block, ContentBlock::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "read-one" && content.contains("TOOL_EVIDENCE"))
+                if tool_use_id == "read-1" && content.contains("TOOL_EVIDENCE"))
             ),
         "the read must execute successfully before reporting: {:?}",
         result.checkpoint,
@@ -242,20 +260,6 @@ async fn budget_handback_turn_consolidates_tool_only_work_and_checks_declared_de
             .unwrap()
             .iter()
             .any(|tool| tool["function"]["name"] == "read")
-    );
-    assert_eq!(requests[1]["model"], requests[0]["model"]);
-    assert!(requests[1].get("tools").is_none_or(Value::is_null));
-    assert!(requests[1].get("tool_choice").is_none_or(Value::is_null));
-    assert!(
-        requests[1].to_string().contains("TOOL_EVIDENCE"),
-        "report must read actual completed tool output"
-    );
-    assert!(
-        requests[1]["max_tokens"]
-            .as_u64()
-            .or_else(|| requests[1]["max_completion_tokens"].as_u64())
-            .unwrap()
-            <= 1_024
     );
     drop(requests);
     let guard = fixture.manager.read().await;
@@ -275,111 +279,34 @@ async fn budget_handback_turn_consolidates_tool_only_work_and_checks_declared_de
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn budget_handback_turn_rejects_provider_tools_and_preserves_fallback_verdicts() {
+async fn owner_step_limit_keeps_the_digest_as_the_deliverable() {
     let _retry = crate::retry_status::test_guard();
     crate::retry_status::clear_rate_limit();
-    let mut fixture = fixture("tool", 15, 1).await;
+    let mut fixture = fixture("truncated", 15, 1).await;
     let result = fixture.finish().await;
-    assert_eq!(fixture.requests.lock().unwrap().len(), 2);
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
     assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-    assert!(!fixture.workspace.path().join("report.md").exists());
+    let text = result.result.as_deref().unwrap();
     assert!(
-        result
-            .result
-            .as_deref()
-            .unwrap()
-            .contains("provider returned a tool call")
+        text.contains("RECORDED_FINDING"),
+        "digest is the result: {text}"
     );
-    assert!(
-        !result
-            .result
-            .as_deref()
-            .unwrap()
-            .contains("REJECTED_REPORT")
-    );
-    assert_eq!(result.usage.as_ref().unwrap().total_tokens, Some(45));
-    let history = &result.checkpoint.as_ref().unwrap().messages;
-    let completed = history
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    for block in history.iter().flat_map(|message| &message.content) {
-        match block {
-            ContentBlock::ToolUse { id, .. } => assert!(
-                completed.contains(id.as_str()),
-                "no orphan tool call may survive for replay"
-            ),
-            ContentBlock::ServerToolUse { .. } => {
-                panic!("a rejected server tool call entered history")
-            }
-            ContentBlock::Text { text, .. } => assert!(!text.contains("REJECTED_REPORT")),
-            _ => {}
-        }
-    }
-    assert!(
-        history
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| matches!(block,
-        ContentBlock::Text { text, .. } if text.contains("Host budget hand-back receipt")))
-    );
-    assert_eq!(
-        fixture.manager.read().await.worker_records["report-worker"]
-            .verification
-            .status,
-        "deliverable_missing"
-    );
-}
+    assert!(!text.contains("TRUNCATED_REPORT"), "{text}");
+    assert!(text.contains("this child's deliverable"), "{text}");
 
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn budget_handback_turn_failure_and_timeout_do_not_add_worker_retries() {
-    let _retry = crate::retry_status::test_guard();
-    crate::retry_status::clear_rate_limit();
-    for (mode, reason) in [
-        ("failure", "provider call failed"),
-        ("timeout", "report deadline expired"),
-    ] {
-        let mut fixture = fixture(mode, 15, 1).await;
-        let result = fixture.finish().await;
-        assert_eq!(fixture.requests.lock().unwrap().len(), 2);
-        assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-        assert!(
-            result.result.as_deref().unwrap().contains(reason),
-            "{result:?}"
-        );
-        assert_eq!(result.usage.as_ref().unwrap().total_tokens, Some(15));
-        assert_eq!(
-            fixture.manager.read().await.worker_records["report-worker"].has_unreported_usage,
-            mode == "timeout",
-            "only the timed-out dispatched call establishes missing coverage here",
-        );
-        assert_eq!(
-            fixture.manager.read().await.worker_records["report-worker"]
-                .verification
-                .status,
-            "deliverable_missing"
-        );
-    }
-}
-
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn budget_handback_turn_missing_report_usage_is_not_claimed_as_zero_cost() {
-    let _retry = crate::retry_status::test_guard();
-    crate::retry_status::clear_rate_limit();
-    let mut fixture = fixture("report-unknown", 15, 1).await;
-    let result = fixture.finish().await;
-    assert_eq!(fixture.requests.lock().unwrap().len(), 2);
-    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-    assert_eq!(result.usage.as_ref().unwrap().total_tokens, Some(15));
-    let report = result.result.as_deref().unwrap();
-    assert!(report.contains("PARTIAL_REPORT"));
-    assert!(report.contains("only a subtotal, not a zero-cost report"));
+    let state_root = fixture.manager.read().await.state_root.clone();
+    let artifact = checked_subagent_state_path(
+        &state_root,
+        &Path::new(".codewhale/state/subagent-results").join(format!(
+            "{}.md",
+            crate::hashing::sha256_hex(b"report-worker")
+        )),
+    )
+    .unwrap();
+    let saved = fs::read_to_string(&artifact).expect("digest artifact written");
+    assert!(saved.contains("RECORDED_FINDING"), "{saved}");
+    assert!(!saved.contains("TRUNCATED_REPORT"), "{saved}");
+    assert!(text.contains(&artifact.display().to_string()), "{text}");
 }
 
 #[tokio::test]
@@ -395,12 +322,12 @@ async fn budget_handback_inflight_wall_timeout_persists_unreported_usage() {
             .result
             .as_deref()
             .unwrap()
-            .contains("wall-time budget exhausted during a model request")
+            .contains("child wall-time work budget exhausted")
     );
     assert_eq!(
         fixture.requests.lock().unwrap().len(),
-        3,
-        "the reserved hand-back turn still dispatches after an unmeasured in-flight request; its own deadline bounds it"
+        2,
+        "the owner deadline does not admit another model request for reporting"
     );
     let manager = fixture.manager.read().await;
     assert!(manager.worker_records["report-worker"].has_unreported_usage);
@@ -434,8 +361,6 @@ fn budget_handback_coverage_marker_is_sticky_without_reclassifying_legacy_or_mea
     let legacy: AgentWorkerRecord = serde_json::from_value(legacy).unwrap();
     assert!(!legacy.has_unreported_usage);
     manager.worker_records.insert("worker".to_string(), legacy);
-    let (_output, lease) = manager.reserve_handback("worker", 500, 1_024).unwrap();
-    drop(lease);
     manager.record_worker_usage("worker", "missing", &Usage::default(), None);
     manager.record_worker_usage(
         "worker",
@@ -458,7 +383,7 @@ fn budget_handback_coverage_marker_is_sticky_without_reclassifying_legacy_or_mea
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn budget_handback_turn_cancellation_wins_once_and_releases_shared_reservation() {
+async fn child_work_cancellation_wins_once() {
     let _retry = crate::retry_status::test_guard();
     crate::retry_status::clear_rate_limit();
     let mut fixture = fixture("hold", 15, 2).await;
@@ -479,20 +404,11 @@ async fn budget_handback_turn_cancellation_wins_once_and_releases_shared_reserva
             .contains("cancelled")
     );
     assert!(fixture.completions.try_recv().is_err());
-    assert!(
-        fixture
-            .manager
-            .read()
-            .await
-            .handback_reservations
-            .values()
-            .all(|value| value.upgrade().is_none())
-    );
 }
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn budget_handback_turn_cancellation_after_response_preserves_actual_usage() {
+async fn child_work_cancellation_after_response_preserves_actual_usage() {
     let _retry = crate::retry_status::test_guard();
     crate::retry_status::clear_rate_limit();
     let mut fixture = fixture("hold", 15, 2).await;
@@ -507,9 +423,23 @@ async fn budget_handback_turn_cancellation_after_response_preserves_actual_usage
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let entry = fixture.mailbox.recv().await.unwrap();
-            if matches!(entry.message, MailboxMessage::TokenUsage { ref source_id, .. } if source_id.contains(":handback:")) { break; }
+            if let MailboxMessage::TokenUsage {
+                agent_id,
+                source_id,
+                usage,
+                ..
+            } = entry.message
+                && agent_id == "report-worker"
+                && usage_total_tokens(&usage) == 30
+            {
+                assert!(source_id.starts_with("child:report-worker:turn:"));
+                assert!(source_id.contains(":request:2:dispatch:"));
+                break;
+            }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     fixture.cancel.cancel();
     drop(guard);
     let result = fixture.finish().await;
@@ -527,26 +457,8 @@ async fn budget_handback_turn_cancellation_after_response_preserves_actual_usage
     assert!(fixture.completions.try_recv().is_err());
 }
 
-#[test]
-fn handback_reservation_uses_the_fixed_allowance_and_refuses_a_second_turn() {
-    let tmp = tempdir().unwrap();
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
-    manager.register_worker(make_worker_spec("w", tmp.path().to_path_buf()));
-    let (output, lease) = manager.reserve_handback("w", 500, 1_024).unwrap();
-    assert_eq!(output, 1_024);
-    assert!(matches!(
-        manager.reserve_handback("w", 500, 1_024),
-        Err(reason) if reason.contains("already in flight")
-    ));
-    drop(lease);
-    assert!(matches!(
-        manager.reserve_handback("w", 8_200, 1_024),
-        Err(reason) if reason.contains("fixed hand-back allowance")
-    ));
-}
-
 #[tokio::test]
-async fn budget_handback_expired_original_deadline_refuses_the_model_call() {
+async fn child_job_preserves_the_original_deadline_without_a_reserve() {
     let tmp = tempdir().unwrap();
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
@@ -559,31 +471,30 @@ async fn budget_handback_expired_original_deadline_refuses_the_model_call() {
         .write()
         .await
         .register_worker(make_worker_spec("expired", tmp.path().to_path_buf()));
-    let mut steps = 1;
-    let outcome = budget_handback::request_report(
-        &runtime,
-        "expired",
-        &SubAgentAssignment::new("report".to_string(), None),
-        &mut vec![],
-        &mut steps,
+    runtime.worker_profile.wall_deadline_ms = Some(epoch_millis_now().saturating_sub(1));
+    let authority = engine::ChildAuthority::capture(
+        runtime.clone(),
+        FleetRole::Worker,
+        "expired".into(),
+        "report".into(),
+        None,
+    );
+    let job = engine::ChildJob::admitted(
+        authority,
+        SubAgentAssignment::new("report".into(), None),
+        Instant::now(),
         2,
-        Some(Instant::now() - Duration::from_millis(1)),
-        "wall-time budget exhausted",
+        false,
+        None,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
-        matches!(outcome, budget_handback::Outcome::Fallback(ref why) if why.contains("deadline has expired"))
+        job.deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
     );
-    assert_eq!(steps, 1, "no model turn was admitted");
+    assert_eq!(job.steps(), 0, "no model turn was admitted");
     assert!(!runtime.manager.read().await.worker_records["expired"].has_unreported_usage);
-    assert!(
-        runtime
-            .manager
-            .read()
-            .await
-            .handback_reservations
-            .is_empty()
-    );
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -598,6 +509,156 @@ fn git(root: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Addendum F4 (fleet-5): cancelling keeps the work. A Stop on a
+/// write-scoped child appends the same preservation receipt a budget death
+/// gets, exactly once, and leaves a read-only child's result alone.
+#[tokio::test]
+async fn cancel_appends_work_preservation_note_once() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Budget test"]);
+    git(root, &["config", "user.email", "budget@example.invalid"]);
+    fs::write(root.join("src.rs"), "baseline\n").unwrap();
+    git(root, &["add", "--", "src.rs"]);
+    git(root, &["commit", "--quiet", "-m", "baseline"]);
+
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(root.to_path_buf(), 2)));
+    for (agent_id, write) in [("cancel-writer", true), ("cancel-scout", false)] {
+        let mut spec = make_worker_spec(agent_id, root.to_path_buf());
+        spec.runtime_profile.permissions.write = write;
+        let mut guard = manager.write().await;
+        guard.register_worker(spec);
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            agent_id.to_string(),
+            FleetRole::Worker,
+            "work that gets stopped".to_string(),
+            SubAgentAssignment {
+                native_preset: None,
+                objective: "edit".to_string(),
+                role: Some("worker".to_string()),
+            },
+            "deepseek-v4-flash".to_string(),
+            None,
+            None,
+            input_tx,
+            root.to_path_buf(),
+            guard.current_session_boot_id.clone(),
+        );
+        agent.task_handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        guard.agents.insert(agent_id.to_string(), agent);
+    }
+    fs::create_dir_all(root.join("scratch")).unwrap();
+    fs::write(root.join("scratch/half-done.rs"), "wip\n").unwrap();
+
+    let stopped = manager.write().await.cancel_agent("cancel-writer").unwrap();
+    let preserved = preserve_cancelled_work(&manager, stopped).await;
+    let text = preserved.result.as_deref().unwrap_or_default();
+    assert!(text.starts_with(CANCELLED_BY_PARENT_RESULT), "{text}");
+    assert!(text.contains("scratch/half-done.rs"), "{text}");
+    let stored = manager.read().await.get_result("cancel-writer").unwrap();
+    assert_eq!(stored.result, preserved.result, "the receipt is persisted");
+
+    // A repeated Stop does not stack a second receipt.
+    let again = manager.write().await.cancel_agent("cancel-writer").unwrap();
+    let again = preserve_cancelled_work(&manager, again).await;
+    assert_eq!(again.result, preserved.result);
+
+    // A read-only child has no baseline: its result stays the plain Stop.
+    let scout = manager.write().await.cancel_agent("cancel-scout").unwrap();
+    let scout = preserve_cancelled_work(&manager, scout).await;
+    assert_eq!(scout.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
+}
+
+/// F4: a Stop cascades to descendants, and each write-scoped descendant
+/// stopped with the parent gets its own receipt; a read-only one does not.
+#[tokio::test]
+async fn cancel_receipts_each_writing_descendant_stopped_with_its_parent() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Budget test"]);
+    git(root, &["config", "user.email", "budget@example.invalid"]);
+    fs::write(root.join("src.rs"), "baseline\n").unwrap();
+    git(root, &["add", "--", "src.rs"]);
+    git(root, &["commit", "--quiet", "-m", "baseline"]);
+
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(root.to_path_buf(), 4)));
+    for (agent_id, write, parent) in [
+        ("tree-parent", true, None),
+        ("tree-writer", true, Some("tree-parent")),
+        ("tree-scout", false, Some("tree-parent")),
+        ("tree-stranger", true, None),
+    ] {
+        let mut spec = make_worker_spec(agent_id, root.to_path_buf());
+        spec.runtime_profile.permissions.write = write;
+        spec.parent_run_id = parent.map(str::to_string);
+        let mut guard = manager.write().await;
+        guard.register_worker(spec);
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            agent_id.to_string(),
+            FleetRole::Worker,
+            "work that gets stopped".to_string(),
+            SubAgentAssignment {
+                native_preset: None,
+                objective: "edit".to_string(),
+                role: Some("worker".to_string()),
+            },
+            "deepseek-v4-flash".to_string(),
+            None,
+            None,
+            input_tx,
+            root.to_path_buf(),
+            guard.current_session_boot_id.clone(),
+        );
+        agent.task_handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        guard.agents.insert(agent_id.to_string(), agent);
+    }
+    fs::create_dir_all(root.join("scratch")).unwrap();
+    fs::write(root.join("scratch/half-done.rs"), "wip\n").unwrap();
+
+    // The cascade order of `cancel_agent_for_session`: descendants, then the
+    // target. The unrelated writer is stopped too but is not a descendant.
+    let parent = {
+        let mut guard = manager.write().await;
+        for id in ["tree-writer", "tree-scout", "tree-stranger"] {
+            guard.cancel_agent(id).unwrap();
+        }
+        guard.cancel_agent("tree-parent").unwrap()
+    };
+    let parent = preserve_cancelled_work(&manager, parent).await;
+    assert!(
+        parent
+            .result
+            .as_deref()
+            .is_some_and(|text| text.contains("scratch/half-done.rs")),
+        "{:?}",
+        parent.result
+    );
+
+    let guard = manager.read().await;
+    let writer = guard.get_result("tree-writer").unwrap();
+    let writer_text = writer.result.as_deref().unwrap_or_default();
+    assert!(
+        writer_text.starts_with(CANCELLED_BY_PARENT_RESULT),
+        "{writer_text}"
+    );
+    assert!(
+        writer_text.contains("scratch/half-done.rs"),
+        "{writer_text}"
+    );
+    let scout = guard.get_result("tree-scout").unwrap();
+    assert_eq!(scout.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
+    let stranger = guard.get_result("tree-stranger").unwrap();
+    assert_eq!(stranger.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
 }
 
 /// #5529: a budget death must name the work the worker left on disk. The
@@ -626,9 +687,10 @@ async fn run_death_preservation_note_names_surviving_workspace_changes() {
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
 
-    let note = budget_work_preservation_note(&runtime, "preserve-worker", "wall_time_budget")
-        .await
-        .expect("write-scoped worker has a baseline");
+    let note =
+        budget_work_preservation_note(&runtime.manager, "preserve-worker", "wall_time_budget")
+            .await
+            .expect("write-scoped worker has a baseline");
     assert!(
         note.contains("scratch/leftover.rs"),
         "note should name the surviving path: {note}"
@@ -641,7 +703,7 @@ async fn run_death_preservation_note_names_surviving_workspace_changes() {
     scout_spec.runtime_profile.permissions.write = false;
     manager.write().await.register_worker(scout_spec);
     assert!(
-        budget_work_preservation_note(&runtime, "scout-worker", "wall_time_budget")
+        budget_work_preservation_note(&runtime.manager, "scout-worker", "wall_time_budget")
             .await
             .is_none()
     );
@@ -664,7 +726,7 @@ async fn run_death_preservation_note_names_surviving_workspace_changes() {
     git(clean_path, &["commit", "--quiet", "-m", "baseline"]);
     clean_spec.workspace = clean_path.to_path_buf();
     manager.write().await.register_worker(clean_spec);
-    let note = budget_work_preservation_note(&runtime, "clean-worker", "wall_time_budget")
+    let note = budget_work_preservation_note(&runtime.manager, "clean-worker", "wall_time_budget")
         .await
         .expect("baseline exists");
     assert!(note.contains("No workspace changes"), "{note}");
@@ -724,9 +786,10 @@ async fn budget_death_checkpoint_commits_uncommitted_work_on_isolated_worktree()
 
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
-    let note = budget_work_preservation_note(&runtime, "checkpoint-worker", "wall_time_budget")
-        .await
-        .expect("note");
+    let note =
+        budget_work_preservation_note(&runtime.manager, "checkpoint-worker", "wall_time_budget")
+            .await
+            .expect("note");
     assert!(
         note.contains("checkpointed in commit"),
         "note should name the salvage commit: {note}"
@@ -763,7 +826,7 @@ async fn budget_death_checkpoint_skips_shared_checkout() {
 
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
-    let note = budget_work_preservation_note(&runtime, "shared-worker", "wall_time_budget")
+    let note = budget_work_preservation_note(&runtime.manager, "shared-worker", "wall_time_budget")
         .await
         .expect("note");
     assert!(!note.contains("checkpointed in commit"), "{note}");
@@ -813,7 +876,7 @@ async fn budget_death_checkpoint_reports_worker_committed_tree() {
 
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
-    let note = budget_work_preservation_note(&runtime, "tidy-worker", "wall_time_budget")
+    let note = budget_work_preservation_note(&runtime.manager, "tidy-worker", "wall_time_budget")
         .await
         .expect("note");
     assert!(note.contains("committed before death"), "{note}");
@@ -828,6 +891,7 @@ fn assistant_message(content: Vec<ContentBlock>) -> Message {
 
 fn tool_use(name: &str, input: Value) -> ContentBlock {
     ContentBlock::ToolUse {
+        execution_id: None,
         id: format!("call_{name}"),
         name: name.to_string(),
         input,
@@ -861,6 +925,7 @@ fn fallback_partial_text_digests_thinking_and_tool_calls_without_text() {
             thinking: "checking whether the ring slot write precedes the read".to_string(),
             signature: None,
             state: None,
+            redacted_data: None,
         }]),
         assistant_message(vec![tool_use("Read", json!({"path": "ring.rs"}))]),
         assistant_message(vec![tool_use(
@@ -913,4 +978,22 @@ fn fallback_partial_text_is_silent_only_when_nothing_was_recorded() {
         budget_handback::fallback_partial_text(&user_only)
             .contains("No assistant text was recorded")
     );
+}
+
+#[test]
+fn budget_repair_only_rewrites_the_newly_synthesized_final_execution() {
+    for (first, last) in [(Some("first"), Some("last")), (None, None)] {
+        let mut messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":first,"name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"reused","execution_id":first,"content":"earlier completed output"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":last,"name":"read","input":{}}]}
+        ])).unwrap();
+        let earlier = messages[..2].to_vec();
+        budget_handback::repair_stopped_tool_calls(&mut messages, "fixture deadline");
+        assert_eq!(&messages[..2], earlier.as_slice());
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::ToolResult { execution_id, content, .. }
+            if execution_id.as_deref() == last && content.contains("budget_exhausted"))
+        );
+    }
 }

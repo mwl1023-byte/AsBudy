@@ -30,12 +30,22 @@ notes="$(printf '%s\n' "${section}" | awk '
   !in_contributors { print }
 ')"
 
+summary="$(printf '%s\n' "${notes}" | awk '/^### / { in_details = 1 } !in_details { print }')"
+details="$(printf '%s\n' "${notes}" | awk '/^### / { in_details = 1 } in_details { print }')"
+if [[ -z "${summary//[[:space:]]/}" ]]; then
+  summary="${notes}"
+  details=""
+fi
+
+render_body() {
+printf "## What's in %s\n\n" "${tag}"
+if [[ -n "${summary}" ]]; then
+  printf '%s\n' "${summary}"
+else
+  printf '%s\n' "See the changelog link below for this release's notes."
+fi
+
 cat <<EOF
-> **Codewhale** is the public product from Shannon Labs. The \`codewhale\`
-> command, npm package, and release-asset names remain lowercase technical
-> identifiers. The legacy npm package \`deepseek-tui\` is deprecated and
-> receives no further releases. Users coming from v0.8.x legacy \`deepseek\` /
-> \`deepseek-tui\` names should migrate with \`docs/REBRAND.md\`.
 
 ## Install
 
@@ -51,7 +61,7 @@ curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION="${tag}" sh
 For Windows, use the matching installer or archive below. For an existing
 direct install, run \`codewhale update\`; it prints the executable path and
 keeps newer builds. If the install directory is occupied by a different build,
-use the fresh-directory migration in [the installation guide](https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md).
+use the fresh-directory migration in [the installation guide](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md).
 
 ### Secondary packaging — npm and Cargo
 
@@ -70,7 +80,7 @@ from this Release. Both contain the same compiled runtime.
 docker run --rm -it \\
   -e DEEPSEEK_API_KEY="\$DEEPSEEK_API_KEY" \\
   -v codewhale-home:/home/codewhale/.codewhale \\
-  ghcr.io/hmbown/codewhale:${tag}
+  ghcr.io/codewhale-hq/codewhale:${tag}
 \`\`\`
 
 The image exposes the same runtime as both \`codewhale\` and \`codew\`. The
@@ -150,13 +160,11 @@ shasum -a 256 -c codewhale-bundles-sha256.txt --ignore-missing
 shasum -a 256 -c codewhale-artifacts-sha256.txt --ignore-missing
 \`\`\`
 
-## What's in ${tag}
 EOF
 
-if [[ -n "${notes}" ]]; then
-  printf '%s\n' "${notes}"
-else
-  printf '%s\n' "See the changelog link below for this release's notes."
+if [[ -n "${details}" ]]; then
+  printf '%s\n\n' '<details>' '<summary>Full release notes</summary>'
+  printf '%s\n\n' "${details}" '</details>'
 fi
 
 cat <<EOF
@@ -172,5 +180,17 @@ fi
 
 cat <<EOF
 
-See [CHANGELOG.md](https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
+See [CHANGELOG.md](https://github.com/codewhale-hq/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
 EOF
+}
+
+body="$(render_body)"
+if (( ${#body} >= 125000 )); then
+  details="The full notes exceed GitHub's release-description limit. Read the [complete changelog for ${tag}](https://github.com/codewhale-hq/CodeWhale/blob/${tag}/CHANGELOG.md)."
+  body="$(render_body)"
+fi
+if (( ${#body} >= 125000 )); then
+  echo "Release summary, installation instructions and contributor credits exceed GitHub's 125000-character limit." >&2
+  exit 1
+fi
+printf '%s\n' "${body}"

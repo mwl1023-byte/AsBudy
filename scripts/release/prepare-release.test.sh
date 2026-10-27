@@ -11,7 +11,7 @@ make_fixture() {
     "${root}/bin" \
     "${root}/crates/example" \
     "${root}/crates/tui" \
-    "${root}/docs" \
+    "${root}/docs/i18n" \
     "${root}/extensions/vscode" \
     "${root}/npm/codewhale" \
     "${root}/npm/runtime-sdk" \
@@ -134,7 +134,23 @@ EOF
   printf 'fixture packaged changelog\n' >"${root}/crates/tui/CHANGELOG.md"
   printf 'fixture generated facts\n' >"${root}/web/lib/facts.generated.ts"
 
-  for readme in README.md README.zh-CN.md README.ja-JP.md README.vi.md README.ko-KR.md; do
+  mkdir -p \
+    "${root}/crates/config/src/route" \
+    "${root}/crates/tui/src/commands/contract/fixtures/config_policy"
+  cat >"${root}/crates/config/src/route/providers-export.golden.json" <<'EOF'
+{
+  "schemaVersion": 1,
+  "runtimeVersion": "0.8.68",
+  "routes": []
+}
+EOF
+  cat >"${root}/crates/tui/src/commands/contract/fixtures/config_policy/status.json" <<'EOF'
+{
+  "message": "codewhale 0.8.68\n\n  Route: fixture\n"
+}
+EOF
+
+  for readme in README.md docs/i18n/README.{zh-CN,ja-JP,vi,ko-KR,de}.md; do
     printf 'Install Codewhale from the package manager.\n' >"${root}/${readme}"
   done
 
@@ -168,12 +184,6 @@ import { writeFileSync } from "node:fs";
 writeFileSync(`${process.env.PREPARE_RELEASE_TEST_MARKERS}/derive-facts`, "");
 EOF
 
-  cat >"${root}/web/scripts/derive-changelog.mjs" <<'EOF'
-import { writeFileSync } from "node:fs";
-
-writeFileSync(`${process.env.PREPARE_RELEASE_TEST_MARKERS}/derive-changelog`, "");
-EOF
-
   chmod +x \
     "${root}/bin/cargo" \
     "${root}/scripts/release/prepare-release.sh" \
@@ -205,6 +215,10 @@ grep -Fq 'RELEASE_TAG="${RELEASE_TAG:-v0.9.0}"' \
   "${success_root}/scripts/remote-smoke/setup-vm.sh"
 grep -Fq '"sourceCandidate": { "version": "0.9.0" }' \
   "${success_root}/docs/public-surface-facts.json"
+grep -Fq '"runtimeVersion": "0.9.0"' \
+  "${success_root}/crates/config/src/route/providers-export.golden.json"
+grep -Fq 'codewhale 0.9.0' \
+  "${success_root}/crates/tui/src/commands/contract/fixtures/config_policy/status.json"
 grep -Fq '"tag": "v0.8.67"' \
   "${success_root}/docs/public-surface-facts.json"
 grep -Fq '"sourceVersion": "0.8.67"' \
@@ -213,14 +227,11 @@ grep -Fq 'prints the published version that was installed' \
   "${success_root}/docs/INSTALL.md"
 grep -Fq -- '--tag v0.9.0' "${success_root}/README.md"
 if grep -R -E -- '--tag v[0-9]+\.[0-9]+\.[0-9]+' \
-  "${success_root}/README.zh-CN.md" \
-  "${success_root}/README.ja-JP.md" \
-  "${success_root}/README.vi.md" \
-  "${success_root}/README.ko-KR.md"; then
+  "${success_root}"/docs/i18n/README.*.md; then
   echo "tag-free localized README unexpectedly gained a release tag" >&2
   exit 1
 fi
-for marker in cargo sync-changelog derive-facts derive-changelog check-versions check-ohos-deps; do
+for marker in cargo sync-changelog derive-facts check-versions check-ohos-deps; do
   [[ -f "${success_markers}/${marker}" ]] || {
     echo "prepare-release did not reach ${marker}" >&2
     exit 1
@@ -250,7 +261,7 @@ PREPARE_RELEASE_TEST_MARKERS="${same_markers}" \
 grep -Fq \
   'Workspace is already at 0.8.68; refreshing generated release state and rerunning gates.' \
   "${same_log}"
-for marker in sync-changelog derive-facts derive-changelog check-versions check-ohos-deps; do
+for marker in sync-changelog derive-facts check-versions check-ohos-deps; do
   [[ -f "${same_markers}/${marker}" ]] || {
     echo "same-version prepare-release did not reach ${marker}" >&2
     exit 1
@@ -315,7 +326,7 @@ stale_markers="${tmp_dir}/stale-markers"
 stale_log="${tmp_dir}/stale.log"
 make_fixture "${stale_root}"
 mkdir -p "${stale_markers}"
-printf 'Stale install example: --tag v0.8.67\n' >"${stale_root}/README.ja-JP.md"
+printf 'Stale install example: --tag v0.8.67\n' >"${stale_root}/docs/i18n/README.de.md"
 
 if PREPARE_RELEASE_TEST_MARKERS="${stale_markers}" \
   PATH="${stale_root}/bin:${PATH}" \
@@ -326,7 +337,7 @@ if PREPARE_RELEASE_TEST_MARKERS="${stale_markers}" \
 fi
 
 grep -Fq \
-  'README.ja-JP.md has release tag version(s) 0.8.67; expected 0.8.68' \
+  'docs/i18n/README.de.md has release tag version(s) 0.8.67; expected 0.8.68' \
   "${stale_log}"
 grep -Fq 'version = "0.8.68"' "${stale_root}/Cargo.toml"
 grep -Fq 'version = "0.8.68"' "${stale_root}/crates/example/Cargo.toml"
@@ -344,6 +355,8 @@ failure_markers="${tmp_dir}/failure-markers"
 failure_log="${tmp_dir}/failure.log"
 make_fixture "${failure_root}"
 mkdir -p "${failure_markers}"
+printf 'Install from a release tag: --tag v0.8.68\ncodewhale --version # 0.8.68\n' \
+  >"${failure_root}/docs/i18n/README.de.md"
 cp -R "${failure_root}" "${failure_snapshot}"
 cat >"${failure_root}/bin/cargo" <<'EOF'
 #!/usr/bin/env bash

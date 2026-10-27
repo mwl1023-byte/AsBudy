@@ -4,11 +4,11 @@
 //! fetched bytes and turns them into one normalized document so `fetch_url`
 //! and `web.run` cannot disagree about HTML, Markdown, PDF, or media handling.
 
+use super::adapter::{AdapterFailure, AdapterResult};
 use std::sync::OnceLock;
 
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
 use regex::Regex;
-use tokio_util::sync::CancellationToken;
 
 use crate::tools::spec::ToolError;
 
@@ -49,8 +49,10 @@ enum MediaFamily {
 }
 
 static TITLE_RE: OnceLock<Regex> = OnceLock::new();
-static FALLBACK_RE: OnceLock<Vec<Regex>> = OnceLock::new();
-static PAGE_CHROME_RE: OnceLock<Regex> = OnceLock::new();
+static META_RE: OnceLock<Regex> = OnceLock::new();
+static FALLBACK_RE: OnceLock<[[Regex; 3]; 2]> = OnceLock::new();
+static PAGE_CHROME_RE: OnceLock<[Regex; 2]> = OnceLock::new();
+static PAGE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
 static TAG_RE: OnceLock<Regex> = OnceLock::new();
 static WHITESPACE_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -63,13 +65,15 @@ pub(crate) async fn extract_document(
     url: &str,
     content_type: Option<&str>,
     bytes: &[u8],
-    cancel: Option<&CancellationToken>,
-) -> Result<ExtractedDocument, ToolError> {
+    truncated: bool,
+    context: Option<&super::super::spec::ToolContext>,
+) -> AdapterResult<ExtractedDocument> {
     extract_document_with_pdf_command(
         url,
         content_type,
         bytes,
-        super::super::pdf::PdfTextCommand::system(cancel),
+        truncated,
+        super::super::pdf::PdfTextCommand::system(context),
     )
     .await
 }
@@ -78,8 +82,10 @@ pub(crate) async fn extract_document_with_pdf_command(
     url: &str,
     content_type: Option<&str>,
     bytes: &[u8],
+    truncated: bool,
     pdf_command: super::super::pdf::PdfTextCommand<'_>,
-) -> Result<ExtractedDocument, ToolError> {
+) -> AdapterResult<ExtractedDocument> {
+    let context = pdf_command.context();
     let declared = normalized_content_type(content_type);
     let declared = declared.as_deref();
 
@@ -96,17 +102,26 @@ pub(crate) async fn extract_document_with_pdf_command(
     }
 
     if validate_pdf_response(url, content_type, bytes)? {
-        return extract_pdf(bytes, pdf_command).await;
+        return extract_pdf(bytes, pdf_command).await.map_err(|error| {
+            if context
+                .is_some_and(|context| context.features.enabled(crate::features::Feature::PdfHost))
+            {
+                AdapterFailure::host(error)
+            } else {
+                error.into()
+            }
+        });
     }
 
     if let Some(signature) = sniff_media(bytes) {
         if let Some(declared_family) = declared_media_family(declared)
             && declared_family != signature.family
         {
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Response media type `{}` did not match its bytes",
                 declared.unwrap_or("unknown")
-            )));
+            )))
+            .into());
         }
         return Ok(ExtractedDocument {
             kind: DocumentKind::Media,
@@ -120,16 +135,23 @@ pub(crate) async fn extract_document_with_pdf_command(
     }
 
     if declared_media_family(declared).is_some() {
-        return Err(ToolError::execution_failed(format!(
+        return Err((ToolError::execution_failed(format!(
             "Response claimed media type `{}`, but its bytes did not match a supported media signature",
             declared.unwrap_or("unknown")
-        )));
+        ))).into());
     }
 
     let sniff_html = should_sniff_html_encoding(declared, url, bytes);
     let body = decode_response_body(bytes, content_type, sniff_html)?;
     if sniff_html || is_html(declared, url, &body) {
-        return extract_html(url, &body);
+        if let Some(context) = context.filter(|context| {
+            context
+                .features
+                .enabled(crate::features::Feature::WebExtractHost)
+        }) {
+            return extract_html_with_host(url, &body, truncated, context).await;
+        }
+        return extract_html(url, &body, truncated).map_err(Into::into);
     }
     if is_markdown(declared, url) {
         return Ok(ExtractedDocument {
@@ -154,10 +176,11 @@ pub(crate) async fn extract_document_with_pdf_command(
         });
     }
 
-    Err(ToolError::execution_failed(format!(
+    Err((ToolError::execution_failed(format!(
         "Unsupported binary response type `{}`; use a dedicated download tool",
         declared.unwrap_or("unknown")
     )))
+    .into())
 }
 
 pub(crate) fn validate_pdf_response(
@@ -183,7 +206,66 @@ pub(crate) fn validate_pdf_response(
     Ok(claimed)
 }
 
-fn extract_html(url: &str, html: &str) -> Result<ExtractedDocument, ToolError> {
+async fn extract_html_with_host(
+    url: &str,
+    html: &str,
+    truncated: bool,
+    context: &super::super::spec::ToolContext,
+) -> AdapterResult<ExtractedDocument> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Choice {
+        kind: String,
+        candidate: Option<u8>,
+    }
+    let parsed_url = reqwest::Url::parse(url)
+        .map_err(|error| ToolError::invalid_input(format!("invalid URL: {error}")))?;
+    let candidates = main_html_candidates(html, truncated);
+    let facts=candidates.iter().map(|(id,html)| {
+        let text=html_to_plain_text(html);
+        serde_json::json!({"id":id,"non_whitespace":text.chars().filter(|value|!value.is_whitespace()).count(),"words":text.split_whitespace().count()})
+    }).collect::<Vec<_>>();
+    let budget = context
+        .turn_deadline
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(std::time::Duration::from_secs(15));
+    let choice: Choice = super::adapter::transform(
+        crate::extension_host::StockOperation::WebExtract,
+        serde_json::json!({"candidates":facts}),
+        context,
+        budget,
+    )
+    .await?;
+    if choice.kind != "web_extract" {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host returned a malformed HTML region choice",
+        )));
+    }
+    let expected = candidates
+        .iter()
+        .find(|(_, html)| meaningful_html(html))
+        .map(|(id, _)| *id);
+    if choice.candidate != expected {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host changed mandatory readable-region order or meaningfulness",
+        )));
+    }
+    let Some(selected) = choice.candidate else {
+        return Err(js_required_error(url).into());
+    };
+    let cleaned = candidates
+        .into_iter()
+        .find(|(id, _)| *id == selected)
+        .map(|(_, html)| html)
+        .ok_or_else(|| {
+            AdapterFailure::host(ToolError::execution_failed(
+                "Web Host returned an unknown HTML region",
+            ))
+        })?;
+    document_from_html_region(url, &parsed_url, html_title(html), cleaned).map_err(Into::into)
+}
+
+fn extract_html(url: &str, html: &str, truncated: bool) -> Result<ExtractedDocument, ToolError> {
     let parsed_url = reqwest::Url::parse(url)
         .map_err(|err| ToolError::invalid_input(format!("invalid URL: {err}")))?;
     let original_title = html_title(html);
@@ -194,8 +276,17 @@ fn extract_html(url: &str, html: &str) -> Result<ExtractedDocument, ToolError> {
     // compiled two incompatible html5ever/markup5ever trees. The fallback
     // main-content regex retains the meaningful-content signal used by the
     // tests (≥32 non-whitespace chars, ≥5 words) without the duplicate tree.
-    let cleaned_html = fallback_main_html(html).ok_or_else(|| js_required_error(url))?;
-    let markdown = html_to_markdown_with_base_url(&cleaned_html, &parsed_url).map_err(|err| {
+    let cleaned_html = fallback_main_html(html, truncated).ok_or_else(|| js_required_error(url))?;
+    document_from_html_region(url, &parsed_url, original_title, cleaned_html)
+}
+
+fn document_from_html_region(
+    url: &str,
+    parsed_url: &reqwest::Url,
+    original_title: Option<String>,
+    cleaned_html: String,
+) -> Result<ExtractedDocument, ToolError> {
+    let markdown = html_to_markdown_with_base_url(&cleaned_html, parsed_url).map_err(|err| {
         ToolError::execution_failed(format!(
             "Failed to convert readable HTML to Markdown: {err}"
         ))
@@ -276,41 +367,102 @@ fn resolve_relative_http_href(base_url: &reqwest::Url, href: &str) -> Option<Str
     base_url.join(href).ok().map(Into::into)
 }
 
-fn fallback_main_html(html: &str) -> Option<String> {
-    let page_chrome = PAGE_CHROME_RE.get_or_init(|| {
-        Regex::new(concat!(
-            r"(?is)(?:<script(?:\s[^>]*)?>.*?</script\s*>",
-            r"|<style(?:\s[^>]*)?>.*?</style\s*>",
-            r"|<noscript(?:\s[^>]*)?>.*?</noscript\s*>",
-            r"|<nav(?:\s[^>]*)?>.*?</nav\s*>",
-            r"|<header(?:\s[^>]*)?>.*?</header\s*>",
-            r"|<footer(?:\s[^>]*)?>.*?</footer\s*>",
-            r"|<aside(?:\s[^>]*)?>.*?</aside\s*>",
-            r"|<form(?:\s[^>]*)?>.*?</form\s*>)",
-        ))
-        .expect("page chrome regex")
-    });
-    for re in FALLBACK_RE.get_or_init(|| {
-        ["article", "main", "body"]
-            .into_iter()
-            .map(|tag| {
-                Regex::new(&format!(r"(?is)<{tag}(?:\s[^>]*)?>(.*?)</{tag}\s*>"))
+/// Pick the readable region of a page with bounded regexes.
+///
+/// Order: every `<article>` (listing, news and forum pages carry one per
+/// card), then `<main>`, then `<body>`. Page chrome is removed from the chosen
+/// region; a `<header>` is chrome only at body level, because inside an
+/// article or `<main>` it carries the title and byline. Forms are unwrapped,
+/// not dropped: ASP.NET-style pages wrap the whole body in one `<form>`, so
+/// only the controls themselves are stripped.
+///
+/// Known limits: the lazy regexes do not balance nested same-name elements
+/// (an `<article>` inside an `<article>` ends at the inner close tag), and no
+/// JavaScript runs, so a client-rendered shell still yields nothing.
+fn main_html_candidates(html: &str, truncated: bool) -> Vec<(u8, String)> {
+    let html = html
+        .rfind('<')
+        .filter(|&start| truncated && !html[start..].contains('>'))
+        .map_or(html, |start| &html[..start]);
+    let [article, main, body] = &FALLBACK_RE.get_or_init(|| {
+        [false, true].map(|open_ended| {
+            ["article", "main", "body"].map(|tag| {
+                let end = element_end(tag, open_ended);
+                Regex::new(&format!(r"(?is)<{tag}(?:\s[^>]*)?>(.*?){end}"))
                     .expect("fallback element regex")
             })
-            .collect()
-    }) {
-        let Some(capture) = re.captures(html) else {
-            continue;
-        };
-        let Some(content) = capture.get(1) else {
-            continue;
-        };
-        let without_chrome = page_chrome.replace_all(content.as_str(), "");
-        if meaningful_html(&without_chrome) {
-            return Some(without_chrome.into_owned());
+        })
+    })[usize::from(truncated)];
+    let articles = article
+        .captures_iter(html)
+        .filter_map(|capture| capture.get(1))
+        .map(|content| strip_page_chrome(content.as_str(), false, truncated))
+        .filter(|content| !html_to_plain_text(content).is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut candidates = vec![(0, articles)];
+    for (id, re, strip_header) in [(1, main, false), (2, body, true)] {
+        if let Some(content) = re.captures(html).and_then(|capture| capture.get(1)) {
+            candidates.push((
+                id,
+                strip_page_chrome(content.as_str(), strip_header, truncated),
+            ));
         }
     }
-    None
+    candidates
+}
+
+fn fallback_main_html(html: &str, truncated: bool) -> Option<String> {
+    main_html_candidates(html, truncated)
+        .into_iter()
+        .find_map(|(_, html)| meaningful_html(&html).then_some(html))
+}
+
+fn element_end(tag: &str, open_ended: bool) -> String {
+    if open_ended {
+        format!(r"(?:</{tag}\s*>|\z)")
+    } else {
+        format!(r"</{tag}\s*>")
+    }
+}
+
+fn strip_page_chrome(html: &str, strip_header: bool, truncated: bool) -> String {
+    let page_chrome = &PAGE_CHROME_RE.get_or_init(|| {
+        [false, true].map(|open_ended| {
+            let block = |tag: &str| {
+                let end = element_end(tag, open_ended);
+                format!(r"<{tag}(?:\s[^>]*)?>.*?{end}")
+            };
+            Regex::new(&format!(
+                "(?is)(?:{}|{}|{}{}",
+                block("script"),
+                block("style"),
+                block("noscript"),
+                concat!(
+                    r"|<nav(?:\s[^>]*)?>.*?</nav\s*>",
+                    r"|<footer(?:\s[^>]*)?>.*?</footer\s*>",
+                    r"|<aside(?:\s[^>]*)?>.*?</aside\s*>",
+                    // Form controls, and the form tags themselves (unwrapped).
+                    r"|<select(?:\s[^>]*)?>.*?</select\s*>",
+                    r"|<textarea(?:\s[^>]*)?>.*?</textarea\s*>",
+                    r"|<button(?:\s[^>]*)?>.*?</button\s*>",
+                    r"|<input(?:\s[^>]*)?>",
+                    r"|</?form(?:\s[^>]*)?>)",
+                ),
+            ))
+            .expect("page chrome regex")
+        })
+    })[usize::from(truncated)];
+    let cleaned = page_chrome.replace_all(html, "");
+    if !strip_header {
+        return cleaned.into_owned();
+    }
+    PAGE_HEADER_RE
+        .get_or_init(|| {
+            Regex::new(r"(?is)<header(?:\s[^>]*)?>.*?</header\s*>").expect("page header regex")
+        })
+        .replace_all(&cleaned, "")
+        .into_owned()
 }
 
 fn meaningful_html(html: &str) -> bool {
@@ -354,6 +506,55 @@ fn html_title(html: &str) -> Option<String> {
         .captures(html)?;
     let title = normalize_text(&decode_common_entities(capture.get(1)?.as_str()));
     (!title.is_empty()).then_some(title)
+}
+
+pub(crate) fn head_summary(
+    url: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> Option<ExtractedDocument> {
+    let declared = normalized_content_type(content_type);
+    let sniff_html = should_sniff_html_encoding(declared.as_deref(), url, bytes);
+    let html = decode_response_body(bytes, content_type, sniff_html).ok()?;
+    let title = html_title(&html).or_else(|| meta_content(&html, "property", "og:title"));
+    let description = meta_content(&html, "name", "description")
+        .or_else(|| meta_content(&html, "property", "og:description"));
+    let text = [title.as_deref(), description.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        return None;
+    }
+    let markdown = if title.is_some() {
+        format!("# {text}")
+    } else {
+        text.clone()
+    };
+    Some(ExtractedDocument {
+        kind: DocumentKind::Text,
+        title,
+        text,
+        markdown,
+        cleaned_html: None,
+        pdf_pages: None,
+        media_extension: None,
+    })
+}
+
+fn meta_content(html: &str, attribute: &str, key: &str) -> Option<String> {
+    META_RE
+        .get_or_init(|| Regex::new(r"(?is)<meta\s[^>]*>").expect("meta regex"))
+        .find_iter(html)
+        .find_map(|tag| {
+            let tag = tag.as_str();
+            html_attribute_value(tag, attribute)
+                .filter(|value| value.eq_ignore_ascii_case(key))
+                .and_then(|_| html_attribute_value(tag, "content"))
+                .map(|content| normalize_text(&decode_common_entities(&content)))
+                .filter(|content| !content.is_empty())
+        })
 }
 
 fn markdown_title(body: &str) -> Option<String> {
@@ -846,9 +1047,15 @@ mod tests {
             <article><h1>Fetch once</h1><p>This is the important article body with enough words to be useful.</p>
             <a href="/proof">Read the proof</a></article>
             <footer>Privacy Cookies Terms</footer></body></html>"#;
-        let document = extract_document("https://example.com/post", Some("text/html"), html, None)
-            .await
-            .expect("extract html");
+        let document = extract_document(
+            "https://example.com/post",
+            Some("text/html"),
+            html,
+            false,
+            None,
+        )
+        .await
+        .expect("extract html");
 
         assert_eq!(document.kind, DocumentKind::Html);
         assert_eq!(document.title.as_deref(), Some("Whale & Signal"));
@@ -893,9 +1100,15 @@ mod tests {
         let html = br#"<html><head><title>Fallback</title></head><body><nav>cookie banner</nav>
             <article><h2>Small source</h2><p>Five useful words survive this compact article fallback path.</p></article>
             </body></html>"#;
-        let document = extract_document("https://example.com/short", Some("text/html"), html, None)
-            .await
-            .expect("extract fallback");
+        let document = extract_document(
+            "https://example.com/short",
+            Some("text/html"),
+            html,
+            false,
+            None,
+        )
+        .await
+        .expect("extract fallback");
 
         assert!(document.markdown.contains("## Small source"));
         assert!(!document.markdown.contains("cookie banner"));
@@ -907,6 +1120,7 @@ mod tests {
             "https://example.com/app",
             Some("text/html"),
             b"<html><body><div id='root'></div><script>boot()</script></body></html>",
+            false,
             None,
         )
         .await
@@ -919,7 +1133,7 @@ mod tests {
             "the shell failure must name the URL: {message}"
         );
         assert!(
-            is_js_shell_error(&error),
+            is_js_shell_error(&error.error),
             "the fetch pipeline recognizes this failure by marker: {message}"
         );
         assert!(
@@ -935,6 +1149,7 @@ mod tests {
             "https://example.com/release.md",
             Some("text/markdown; charset=utf-8"),
             body,
+            false,
             None,
         )
         .await
@@ -951,6 +1166,7 @@ mod tests {
             "https://example.com/not-image.png",
             Some("image/png"),
             b"<html>not really an image</html>",
+            false,
             None,
         )
         .await
@@ -963,6 +1179,7 @@ mod tests {
             "https://example.com/image",
             Some("application/octet-stream"),
             &png,
+            false,
             None,
         )
         .await
@@ -977,6 +1194,7 @@ mod tests {
             "https://example.com/archive.bin",
             Some("application/octet-stream"),
             b"PK\x03\x04archive bytes",
+            false,
             None,
         )
         .await
@@ -990,6 +1208,7 @@ mod tests {
             "https://example.com/no-content",
             Some("application/octet-stream"),
             b"",
+            false,
             None,
         )
         .await
@@ -1004,6 +1223,7 @@ mod tests {
             "https://example.com/document",
             Some("Application/JSON; Charset=UTF-8"),
             br#"{"status":"ok"}"#,
+            false,
             None,
         )
         .await
@@ -1177,10 +1397,15 @@ mod tests {
         ];
         for html in cases {
             let (bytes, _, _) = encoding_rs::WINDOWS_1252.encode(html);
-            let document =
-                extract_document("https://example.com/extensionless", None, &bytes, None)
-                    .await
-                    .expect("leading declarations preserve extensionless HTML sniffing");
+            let document = extract_document(
+                "https://example.com/extensionless",
+                None,
+                &bytes,
+                false,
+                None,
+            )
+            .await
+            .expect("leading declarations preserve extensionless HTML sniffing");
             assert_eq!(document.kind, DocumentKind::Html);
             assert_eq!(document.title.as_deref(), Some("Café release notes"));
         }
@@ -1193,6 +1418,7 @@ mod tests {
             "https://example.com/diagram",
             Some("image/svg+xml"),
             svg,
+            false,
             None,
         )
         .await
@@ -1200,4 +1426,120 @@ mod tests {
         assert_eq!(document.kind, DocumentKind::Media);
         assert_eq!(document.media_extension, Some("svg"));
     }
+
+    async fn extract_html_fixture(url: &str, html: &str) -> ExtractedDocument {
+        extract_document(url, Some("text/html"), html.as_bytes(), false, None)
+            .await
+            .expect("fixture must extract readable text")
+    }
+
+    #[tokio::test]
+    async fn listing_page_keeps_every_article() {
+        let html = r#"<html><body><nav>Home Blog About</nav><main>
+            <article><h2>First post</h2><p>Alpha story body with plenty of words to read here.</p></article>
+            <article><h2>Second post</h2><p>Bravo story body with plenty of words to read here.</p></article>
+            <article><h2>Third post</h2><p>Charlie story body with plenty of words to read here.</p></article>
+            </main></body></html>"#;
+        let document = extract_html_fixture("https://blog.example/", html).await;
+        for needle in [
+            "First post",
+            "Alpha story",
+            "Second post",
+            "Bravo story",
+            "Third post",
+            "Charlie story",
+        ] {
+            assert!(
+                document.markdown.contains(needle),
+                "{needle} missing: {}",
+                document.markdown
+            );
+        }
+        assert!(!document.markdown.contains("Home Blog About"));
+    }
+
+    #[tokio::test]
+    async fn article_header_keeps_title_and_byline() {
+        let html = r#"<html><body><header>Site logo Sign in Subscribe</header>
+            <article><header><h1>Whales sing in dialects</h1><p class="byline">By Ada Lovelace</p></header>
+            <p>Researchers recorded humpback song across three oceans and found regional variation.</p>
+            </article></body></html>"#;
+        let document = extract_html_fixture("https://news.example/whales", html).await;
+        assert!(
+            document.markdown.contains("Whales sing in dialects"),
+            "{}",
+            document.markdown
+        );
+        assert!(
+            document.markdown.contains("By Ada Lovelace"),
+            "{}",
+            document.markdown
+        );
+        assert!(document.markdown.contains("regional variation"));
+        assert!(!document.markdown.contains("Sign in Subscribe"));
+    }
+
+    #[tokio::test]
+    async fn page_wrapped_in_a_form_is_not_mistaken_for_a_javascript_shell() {
+        let html = r#"<html><body><form method="post" action="./Default.aspx" id="form1">
+            <input type="hidden" name="__VIEWSTATE" value="dDwtMTA4MzE0MjEwNTs7Pg==" />
+            <div class="content"><h1>Quarterly report</h1>
+            <p>Revenue grew in every region this quarter, led by the northern division.</p></div>
+            <select name="year"><option>2025</option><option>2026</option></select>
+            <button type="submit">Go</button>
+            </form></body></html>"#;
+        let document = extract_html_fixture("https://legacy.example/Default.aspx", html).await;
+        assert!(
+            document.markdown.contains("Quarterly report"),
+            "{}",
+            document.markdown
+        );
+        assert!(document.markdown.contains("northern division"));
+        assert!(!document.markdown.contains("VIEWSTATE"));
+        assert!(
+            !document.markdown.contains("2026"),
+            "form controls are stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn arxiv_abstract_page_extracts_title_and_abstract() {
+        // Trimmed from the shape of https://arxiv.org/abs/1706.03762 (2026-09).
+        let html = r##"<!DOCTYPE html><html lang="en"><head><title>[1706.03762] Attention Is All You Need</title>
+            <script>window.MathJax = {};</script></head>
+            <body ><div class="flex-wrap-footer"><a href="#content" class="ds-skip-link">Skip to main content</a>
+            <header class="ds-site-header"><a href="https://arxiv.org/">archive home</a>
+            <button type="button" id="ds-nav-toggle">Open menu</button>
+            <nav class="ds-site-header-nav"><a href="https://arxiv.org/search">Search</a><a href="https://arxiv.org/login">Log in</a></nav>
+            </header>
+            <div class="arxiv-search-overlay" hidden><form method="GET" action="https://arxiv.org/search">
+            <label for="q">Search arXiv</label><input type="text" name="query" id="q"></form></div>
+            <main><div id="content"><!-- rdf:RDF <rdf:Description dc:title="Attention Is All You Need" /> -->
+            <div id="abs-outer"><div class="leftcolumn"><div class="subheader"><h1>Computer Science &gt; Computation and Language</h1></div>
+            <div id="abs"><div class="dateline">[Submitted on 12 Jun 2017 (<a href="/abs/1706.03762v1">v1</a>)]</div>
+            <h1 class="title mathjax"><span class="descriptor">Title:</span>Attention Is All You Need</h1>
+            <div class="authors"><span class="descriptor">Authors:</span><a href="/a/vaswani_a_1">Ashish Vaswani</a></div>
+            <blockquote class="abstract mathjax"><span class="descriptor">Abstract:</span>The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.</blockquote>
+            <script type="text/javascript" language="javascript">mathjaxToggle();</script>
+            </div></div></div></div></main>
+            <footer><a href="https://info.arxiv.org/help/contact.html">Contact</a></footer></div></body></html>"##;
+        let document = extract_html_fixture("https://arxiv.org/abs/1706.03762", html).await;
+        assert!(
+            document.markdown.contains("Attention Is All You Need"),
+            "{}",
+            document.markdown
+        );
+        assert!(
+            document.markdown.contains("dominant sequence transduction"),
+            "{}",
+            document.markdown
+        );
+        assert!(document.markdown.contains("Ashish Vaswani"));
+        assert!(!document.markdown.contains("mathjaxToggle"));
+        assert!(!document.markdown.contains("Log in"));
+    }
 }
+
+#[cfg(test)]
+#[path = "extract_host_tests.rs"]
+mod host_tests;

@@ -6,9 +6,11 @@
 //!
 //! # How it works
 //!
-//! When `/usr/bin/bwrap` is executable AND the top-level config key
-//! `prefer_bwrap` is set to `true`, exec_shell commands are routed through
-//! bwrap. The bwrap invocation looks like:
+//! When `/usr/bin/bwrap` actually works — it is executable AND it can create
+//! its namespaces on this host — sandboxed exec_shell commands are routed
+//! through it by default. `prefer_bwrap = false` in the config opts out and
+//! leaves Linux commands unwrapped; the posture then reports policy-only.
+//! The bwrap invocation looks like:
 //!
 //! ```text
 //! bwrap \
@@ -27,6 +29,13 @@
 //! access add `--share-net` after `--unshare-all`. A private `/dev` and
 //! `/proc` plus a tmpfs `/tmp` keep standard toolchain expectations working
 //! (#5410); user-configured extra roots and device nodes append after them.
+//! The read deny-list masks go last; exceptions inside a masked directory
+//! (`SandboxManager::set_denied_read_exceptions`) are bound again after them.
+//!
+//! The extension host (`extension_host::supervisor`) launches through this
+//! builder whenever bubblewrap works, without the `prefer_bwrap` opt-in; it
+//! probes the finished command first and reports the host as unsandboxed,
+//! with bwrap's own error, when it does not run.
 //!
 //! # Important
 //!
@@ -36,9 +45,10 @@
 //! - Fedora: `dnf install bubblewrap`
 //! - Arch: `pacman -S bubblewrap`
 //!
-//! If bwrap is not executable, Codewhale reports no Linux OS sandbox and runs
-//! the command without an OS wrapper. It never labels that fallback as
-//! sandboxed.
+//! If bwrap is missing or cannot run (e.g. user namespaces are restricted,
+//! as on Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns`),
+//! Codewhale reports no Linux OS sandbox and runs the command without an OS
+//! wrapper. It never labels that fallback as sandboxed.
 
 #[cfg(target_os = "linux")]
 use super::policy::WritableRoot;
@@ -59,14 +69,95 @@ pub(crate) fn existing_directory_shim(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub const BWRAP_PATH: &str = "/usr/bin/bwrap";
 
-/// Check if bubblewrap is installed and executable.
+pub(super) fn spawn<T: Send + 'static>(
+    launch: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<T> {
+    use std::sync::{LazyLock, mpsc};
+    type Launch = Box<dyn FnOnce() + Send>;
+    static SPAWNER: LazyLock<std::io::Result<mpsc::Sender<Launch>>> = LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<Launch>();
+        std::thread::Builder::new()
+            .name("codewhale-sandbox-spawner".into())
+            .spawn(move || {
+                for launch in receiver {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(launch));
+                }
+            })?;
+        Ok(sender)
+    });
+    let spawner = SPAWNER
+        .as_ref()
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    spawner
+        .send(Box::new(move || {
+            let _ = sender.send(launch());
+        }))
+        .map_err(|_| std::io::Error::other("sandbox spawner stopped"))?;
+    receiver
+        .recv()
+        .map_err(|_| std::io::Error::other("sandbox spawn did not return"))
+}
+
+/// How long the availability probe may take. A working bwrap runs a wrapped
+/// `/bin/true` in well under a second, even on a loaded host.
+#[cfg(target_os = "linux")]
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether bwrap is executable AND can actually confine a child here.
+///
+/// The exec bit alone lies on hosts where user namespaces are restricted:
+/// bwrap starts but cannot create the sandbox, so every wrapped command
+/// would fail instead of running unsandboxed. The check therefore runs a
+/// real wrapped `/bin/true` once, built by [`build_bwrap_command`] itself so
+/// the probe covers the same argument shape the real path uses, and caches
+/// the verdict for the process.
 #[cfg(target_os = "linux")]
 pub fn is_available() -> bool {
-    is_executable(std::path::Path::new(BWRAP_PATH))
+    fn probe() -> bool {
+        use wait_timeout::ChildExt as _;
+        if !is_executable(std::path::Path::new(BWRAP_PATH)) {
+            return false;
+        }
+        let command = build_bwrap_command(
+            std::path::Path::new("/"),
+            "/bin/true",
+            &[],
+            &[],
+            false,
+            &crate::sandbox::BwrapMountExtensions::default(),
+            &[],
+            &[],
+        );
+        let Some((program, args)) = command.split_first() else {
+            return false;
+        };
+        let mut child = match std::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        match child.wait_timeout(PROBE_DEADLINE) {
+            Ok(Some(status)) => status.success(),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                false
+            }
+        }
+    }
+    static VERDICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERDICT.get_or_init(probe)
 }
 
 #[cfg(target_os = "linux")]
-fn is_executable(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::metadata(path)
@@ -107,6 +198,7 @@ pub fn build_bwrap_command(
     network_access: bool,
     extensions: &crate::sandbox::BwrapMountExtensions,
     denied_read_subpaths: &[std::path::PathBuf],
+    denied_read_exceptions: &[std::path::PathBuf],
 ) -> Vec<String> {
     let (writable_mounts, read_only_mounts) = safe_mounts(writable_roots);
     let (extra_read_only, device_mounts) = extensions.resolve();
@@ -121,6 +213,10 @@ pub fn build_bwrap_command(
     if network_access {
         cmd.push("--share-net".to_string());
     }
+    // Tie the sandbox to the outer bwrap process: if it is killed (the TUI's
+    // parent-death cleanup, a group kill), bwrap's PID-namespace init dies
+    // too and takes every process in the sandbox with it (#6654).
+    cmd.push("--die-with-parent".to_string());
 
     // Read-only bind-mount the entire root filesystem.
     cmd.push("--ro-bind".to_string());
@@ -147,7 +243,7 @@ pub fn build_bwrap_command(
         cmd.push(device);
     }
 
-    for root in writable_mounts {
+    for root in &writable_mounts {
         let root = root.to_string_lossy().into_owned();
         cmd.push("--bind".to_string());
         cmd.push(root.clone());
@@ -178,19 +274,17 @@ pub fn build_bwrap_command(
     // tmpfs, an existing file with a bind of /dev/null. Non-existent paths
     // are skipped — there is nothing to deny.
     for denied in denied_read_subpaths {
-        let Ok(meta) = std::fs::metadata(denied) else {
-            continue;
-        };
-        let denied_str = denied.to_string_lossy().into_owned();
-        if meta.is_dir() {
-            cmd.push("--tmpfs".to_string());
-            cmd.push(denied_str);
-        } else {
-            cmd.push("--ro-bind".to_string());
-            cmd.push("/dev/null".to_string());
-            cmd.push(denied_str);
-        }
+        cmd.extend(super::bwrap_mask_args(denied));
     }
+
+    // Exceptions inside a masked directory (the extension host's own files
+    // and plugin code under a Codewhale home it denies whole) are bound again
+    // after the masks, then any denied path inside them is masked again.
+    cmd.extend(super::bwrap_exception_args(
+        denied_read_subpaths,
+        denied_read_exceptions,
+        &writable_mounts,
+    ));
 
     // Change to the working directory inside the container.
     let cwd_str = cwd.to_string_lossy().to_string();
@@ -250,9 +344,7 @@ fn existing_directory(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub fn detect_denial(exit_code: i32, stderr: &str) -> bool {
     exit_code != 0
-        && (stderr
-            .lines()
-            .any(|line| line.trim_start().starts_with("bwrap:"))
+        && (super::bwrap_setup_failure(stderr).is_some()
             || stderr.contains("Read-only file system"))
 }
 
@@ -283,6 +375,7 @@ mod tests {
             false,
             &crate::sandbox::BwrapMountExtensions::default(),
             &[],
+            &[],
         );
 
         // Should start with bwrap
@@ -303,6 +396,9 @@ mod tests {
         assert!(cmd.contains(&"--unshare-all".to_string()));
         assert!(!cmd.contains(&"--share-net".to_string()));
 
+        // The sandbox dies with the outer bwrap process (#6654).
+        assert!(cmd.contains(&"--die-with-parent".to_string()));
+
         // Should end with the command
         assert_eq!(cmd[cmd.len() - 1], "echo hi");
         assert_eq!(cmd[cmd.len() - 2], "-c");
@@ -321,6 +417,7 @@ mod tests {
             &[],
             false,
             &crate::sandbox::BwrapMountExtensions::default(),
+            &[],
             &[],
         );
 
@@ -355,6 +452,7 @@ mod tests {
             &roots,
             true,
             &crate::sandbox::BwrapMountExtensions::default(),
+            &[],
             &[],
         );
 
@@ -403,7 +501,7 @@ mod tests {
                 PathBuf::from("/dev/does-not-exist"),
             ],
         };
-        let cmd = build_bwrap_command(cwd, "true", &[], &[], false, &extensions, &[]);
+        let cmd = build_bwrap_command(cwd, "true", &[], &[], false, &extensions, &[], &[]);
 
         assert!(has_mount(
             &cmd,
@@ -439,7 +537,16 @@ mod tests {
             read_only_roots: vec![narrowed.clone()],
             device_roots: vec![],
         };
-        let cmd = build_bwrap_command(&workspace, "true", &[], &roots, false, &extensions, &[]);
+        let cmd = build_bwrap_command(
+            &workspace,
+            "true",
+            &[],
+            &roots,
+            false,
+            &extensions,
+            &[],
+            &[],
+        );
 
         let writable_pos = cmd
             .windows(3)
@@ -459,6 +566,49 @@ mod tests {
             narrow_pos > writable_pos,
             "extra ro roots must apply after writable binds so they can narrow them"
         );
+    }
+
+    /// The extension host's form of the deny-list: its Codewhale home masked
+    /// whole, then its own files bound again read-only and its data dir
+    /// writable again, all after the mask; a missing exception is skipped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_home_denied_whole_keeps_its_exceptions_after_the_mask() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("home/extension-host/data")).expect("data dir");
+        std::fs::create_dir_all(dir.path().join("home/secrets")).expect("secrets dir");
+        let home = dir
+            .path()
+            .join("home")
+            .canonicalize()
+            .expect("canonical home");
+        let bundle = home.join("extension-host");
+        let data = bundle.join("data");
+        let cmd = build_bwrap_command(
+            &data,
+            "true",
+            &[],
+            &[WritableRoot::new(data.clone())],
+            false,
+            &crate::sandbox::BwrapMountExtensions::default(),
+            std::slice::from_ref(&home),
+            &[bundle.clone(), home.join("plugins")],
+        );
+        let at = |flag: &str, path: &Path| -> Vec<usize> {
+            cmd.windows(3)
+                .enumerate()
+                .filter(|(_, args)| args[0] == flag && args[1] == path.to_string_lossy())
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let mask = at("--tmpfs", &home);
+        let exception = at("--ro-bind", &bundle);
+        let data_binds = at("--bind", &data);
+        assert_eq!(mask.len(), 1, "{cmd:?}");
+        assert_eq!(exception.len(), 1, "{cmd:?}");
+        assert!(mask[0] < exception[0], "{cmd:?}");
+        assert!(data_binds.last() > Some(&exception[0]), "{cmd:?}");
+        assert!(!cmd.iter().any(|arg| arg.ends_with("/plugins")), "{cmd:?}");
     }
 
     #[cfg(target_os = "linux")]

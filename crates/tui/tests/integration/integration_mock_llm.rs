@@ -77,6 +77,7 @@ fn assistant_thinking(thinking: &str, text: &str) -> Message {
                 thinking: thinking.to_string(),
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
             ContentBlock::Text {
                 text: text.to_string(),
@@ -90,6 +91,7 @@ fn assistant_tool_call(id: &str, name: &str, input: serde_json::Value) -> Messag
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: name.to_string(),
             input,
@@ -103,6 +105,7 @@ fn tool_result_message(tool_use_id: &str, content: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: tool_use_id.to_string(),
             content: content.to_string(),
             is_error: None,

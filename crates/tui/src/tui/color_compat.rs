@@ -67,8 +67,9 @@ pub(crate) struct ColorCompatBackend<W: Write> {
     /// The terminal's own background, when detection measured one
     /// (`BackgroundSource::Osc11` or a resolvable `COLORFGBG` index). This is
     /// the surface a `Color::Reset` cell is really drawn on, so it is what the
-    /// contrast floor reasons against. `None` means "no evidence" and disables
-    /// the floor for unpainted cells rather than guessing.
+    /// contrast floor reasons against. `None` means "no evidence": an
+    /// unpainted cell then keeps the terminal's own ink, and a painted cell is
+    /// left alone rather than guessed at.
     detected_background: Option<ratatui::style::Color>,
 }
 
@@ -116,6 +117,26 @@ impl<W: Write> ColorCompatBackend<W> {
             render_debug: RenderDebugLog::from_env(),
             ascii_safe: self.ascii_safe,
             detected_background: self.detected_background,
+        }
+    }
+
+    /// Immutable frame input from this backend's already negotiated facts.
+    /// Unknown terminal background stays unknown; an explicitly painted pane
+    /// may separately establish its own known ground at the finishing boundary.
+    pub(crate) fn native_ocean_caps(&self) -> codewhale_ratatui::Caps {
+        use codewhale_ratatui::{Caps, color::ColorDepth as NativeDepth, detect::Appearance};
+        Caps {
+            depth: match self.depth {
+                ColorDepth::Monochrome => NativeDepth::Monochrome,
+                ColorDepth::Ansi16 => NativeDepth::Ansi16,
+                ColorDepth::Ansi256 => NativeDepth::Ansi256,
+                ColorDepth::TrueColor => NativeDepth::TrueColor,
+            },
+            ascii: self.ascii_safe,
+            appearance: self
+                .detected_background
+                .and_then(codewhale_ratatui::detect::appearance_for_background)
+                .unwrap_or(Appearance::Unknown),
         }
     }
 
@@ -417,6 +438,10 @@ fn render_debug_line(
 ///   that. The floor guards the auto-detected default path.
 /// - Only text cells are clamped; frame chrome keeps its intended weight.
 ///   See [`palette::symbol_needs_text_contrast`].
+///
+/// A third case has no surface to measure against: an unpainted cell on a
+/// terminal that reported no background keeps the terminal's own ink, because
+/// that is the one colour guaranteed to read on the ground the terminal drew.
 fn enforce_cell_contrast(
     cell: &mut Cell,
     theme_id: ThemeId,
@@ -427,12 +452,15 @@ fn enforce_cell_contrast(
         return;
     }
     let Some(surface) = palette::effective_surface(cell.bg, detected_background) else {
+        if cell.bg == ratatui::style::Color::Reset && cell.fg == palette::TEXT_BODY {
+            cell.fg = ratatui::style::Color::Reset;
+        }
         return;
     };
     cell.fg = palette::enforce_contrast(cell.fg, surface, palette::AA_BODY_CONTRAST);
 }
 
-fn adapt_cell_colors(
+pub(crate) fn adapt_cell_colors(
     cell: &mut Cell,
     depth: ColorDepth,
     palette_mode: PaletteMode,
@@ -464,6 +492,33 @@ fn adapt_cell_colors(
     if depth == ColorDepth::Monochrome {
         cell.underline_color = ratatui::style::Color::Reset;
     }
+}
+
+/// Exact backend-visible proposed ink, reused by native Ocean's guard.
+pub(crate) fn project_ocean_ink(
+    cell: &Cell,
+    water: ratatui::style::Color,
+    depth: codewhale_ratatui::color::ColorDepth,
+    theme: &UiTheme,
+) -> ratatui::style::Color {
+    use codewhale_ratatui::color::ColorDepth as NativeDepth;
+    let depth = match depth {
+        NativeDepth::Monochrome => ColorDepth::Monochrome,
+        NativeDepth::Ansi16 => ColorDepth::Ansi16,
+        NativeDepth::Ansi256 => ColorDepth::Ansi256,
+        NativeDepth::TrueColor => ColorDepth::TrueColor,
+    };
+    let mut proposed = cell.clone();
+    proposed.set_bg(water);
+    adapt_cell_colors(
+        &mut proposed,
+        depth,
+        theme.mode,
+        ThemeId::Underwater,
+        theme,
+        None,
+    );
+    proposed.fg
 }
 
 #[cfg(test)]
@@ -1295,10 +1350,10 @@ mod tests {
         }
     }
 
-    /// No measurement means no intervention: an unpainted cell on a terminal
-    /// we could not query renders exactly as before.
+    /// No measurement and no painted ground means the terminal's own ink is
+    /// the only colour guaranteed to read on the ground it actually drew.
     #[test]
-    fn unknown_background_leaves_unpainted_cells_alone() {
+    fn unknown_background_gives_unpainted_body_text_the_terminal_ink() {
         assert_eq!(
             cell_fg_after_adaptation(
                 "x",
@@ -1308,7 +1363,7 @@ mod tests {
                 ThemeId::System,
                 None,
             ),
-            palette::TEXT_BODY
+            Color::Reset
         );
     }
 
