@@ -33,21 +33,6 @@ const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Truncating tool input could hide the unsafe part, so oversized reviews deny.
 const MAX_REVIEW_CONTEXT_BYTES: usize = 64 * 1024;
 
-/// ── AsBudy 2026-09-18（2026-09-24 复核保留）──────────────────────────────
-/// 守卫（Auto-Review 的审批员）的**输出预算**。官方原值 `384`。
-///
-/// 生产实测（2026-09-18）：推理型模型会把整整 384 个 token 花在**隐藏思考**上
-/// （`finish_reason = length`、`content` 为空），于是约**四分之一**的真实 hold
-/// 变成误拒 —— 客户看到的是「明明安全的操作被拒」。
-/// 依据是官方自己的注释：被截断的判定 *"parses as nothing and fails closed"*
-/// ⇒ **预算不够 = 拒绝**。所以这个值必须给够，它不是一个可以省的额度。
-const REVIEWER_MAX_TOKENS: u32 = 1024;
-
-/// 同一实测带出来的第二处：把守卫的**隐藏思考关掉**（官方原来是 `None`）。
-/// 判定就是一个小 JSON 对象，隐藏思考只会先吃掉输出预算、再把答案截断。
-/// `off` 是客户端层给各服务商文档化的档位拼写；没有文档这组开关的服务商不受影响。
-const REVIEWER_REASONING_EFFORT: &str = "off";
-
 /// The reviewer's answer, with failure modes separated from explicit denials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewerOutcome {
@@ -330,13 +315,8 @@ mod tests {
         let request = mock.last_request().expect("reviewer request");
         assert_eq!(request.tools, None, "guardian requests never expose tools");
         assert_eq!(
-            request.max_tokens, REVIEWER_MAX_TOKENS,
-            "AsBudy: 守卫预算必须给够 —— 384 会把判定截断成拒绝（见常量上的实测）"
-        );
-        assert_eq!(
-            request.reasoning_effort.as_deref(),
-            Some(REVIEWER_REASONING_EFFORT),
-            "AsBudy: 守卫不许把输出预算花在隐藏思考上"
+            request.max_tokens, REVIEWER_MAX_OUTPUT_TOKENS,
+            "guardian output budget must be large enough to finish the verdict"
         );
         let SystemPrompt::Text(system) = request.system.expect("guardian policy") else {
             panic!("guardian system prompt must be text");
