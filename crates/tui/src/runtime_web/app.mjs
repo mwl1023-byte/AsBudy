@@ -1472,11 +1472,21 @@ export function createStreamConnector({
     try {
       ({ stream_ticket: ticket } = await api("/__codewhale/web/stream-ticket", { method: "POST" }));
     } catch (error) {
-      if (!isCurrent()) return;
-      showStatus(error.message);
-      setConnection("error", "Runtime connection failed");
-      if (!waitForOpen && error.status !== 401 && error.status !== 403) reconnect();
-      throw error;
+      // ── AsBudy（2026-10-28 · 升 0.10.2 时实测撞到）────────────────────────────
+      // 我们是**门卫托管**形态：引擎以 `app-server --http` 跑，`state.web` 是 None，
+      // 所以这条 0.10.2 新增的端点直接回 **404**（官方 web 模式才挂它）。
+      // 票是可选的：`eventStreamUrl()` 见票为空就不带 `web_stream_ticket` 参数，
+      // 而门卫转发 `/v1/threads/{id}/events` 时会自己补引擎 token —— 0.10.0 一直这么跑。
+      // ⇒ 404 = 「这台引擎不开 web 票」，降级免票继续；401/403 是真鉴权失败，照旧报错。
+      if (error.status === 404) {
+        ticket = undefined;
+      } else {
+        if (!isCurrent()) return;
+        showStatus(error.message);
+        setConnection("error", "Runtime connection failed");
+        if (!waitForOpen && error.status !== 401 && error.status !== 403) reconnect();
+        throw error;
+      }
     }
     if (!isCurrent() || app.stream !== null) return;
     const stream = new EventSource(eventStreamUrl(threadId, sequence, ticket), { withCredentials: true });
